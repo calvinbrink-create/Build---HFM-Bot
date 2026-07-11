@@ -89,7 +89,7 @@ ruleset_version = "multi_engine_clean_rebuild_v1"
 RULESET_VERSION = ruleset_version
 BUILD_ID = f"{RULESET_VERSION}_{datetime.utcnow().strftime('%Y%m%d%H%M%S')}"
 
-FULL_SCAN_SECONDS = 180
+FULL_SCAN_SECONDS = 5
 PENDING_MONITOR_SECONDS = 0.25
 PENDING_SETUP_TTL_SECONDS = 300
 HOUSEKEEPING_SECONDS = 900
@@ -668,16 +668,15 @@ def metals_spread_gate(symbol, bid, ask, atr_price, score):
     return not hard, adjusted, "metals spread tier penalty" if penalty else "OK", {"decision": "block" if hard else "soft_penalty" if penalty else "allow", "spread": spread, "spread_points": spread, "spread_to_atr": ratio, "spread_atr_soft": soft, "spread_atr_hard": hard_ratio, "spread_atr_extreme": extreme, "max_spread_points": max_points, "penalty": round(penalty, 3)}
 
 
-def _completed_m1_candle_id(df1):
-    bars = _bars(df1)
+def _completed_candle_identity(frame, label: str, timeframe_seconds: int):
+    bars = _bars(frame)
     if bars is None or len(bars) == 0:
         return "", ""
-    closed_at = _latest_bar_dt(bars)
-    if closed_at is not None:
-        # MT5 candle timestamps identify the candle open; the completed M1 candle closes 60s later.
-        closed_at = closed_at + timedelta(seconds=60)
+    opened_at = _latest_bar_dt(bars)
+    if opened_at is not None:
+        closed_at = opened_at + timedelta(seconds=int(timeframe_seconds))
         closed_text = closed_at.isoformat()
-        return closed_text, f"time:{closed_text}"
+        return closed_text, f"{label.upper()}:{closed_text}"
     row = bars.iloc[-1]
     values = []
     for name in ("Open", "High", "Low", "Close"):
@@ -685,7 +684,11 @@ def _completed_m1_candle_id(df1):
             values.append(f"{float(row.get(name, 0.0) or 0.0):.12g}")
         except Exception:
             values.append("0")
-    return "", "ohlc:" + ":".join(values)
+    return "", f"{label.upper()}:OHLC:" + ":".join(values)
+
+
+def _completed_m1_candle_id(df1):
+    return _completed_candle_identity(df1, "M1", 60)
 
 
 def valid_1m_confirmation(df1, direction, engine):
@@ -703,9 +706,6 @@ def valid_1m_confirmation(df1, direction, engine):
     body_frac = body / candle_range
     close_location = (close - low) / candle_range
     min_body_frac = 0.25
-    engine_confirmation_ok = True
-    if _mt5_strategy_engines is not None and callable(getattr(_mt5_strategy_engines, "valid_1m_confirmation", None)):
-        engine_confirmation_ok, _engine_confirmation_reason, _engine_confirmation_score = _mt5_strategy_engines.valid_1m_confirmation(bars, side, engine)
     if side == "BUY":
         side_ok = close > open_ and close >= p["prev_close"]
         location_ok = close_location >= 0.60
@@ -717,7 +717,7 @@ def valid_1m_confirmation(df1, direction, engine):
         ema_ok = close < p["ema8"]
         momentum_ok = p["rsi"] <= 55
     # EMA alignment is diagnostic context, not a replacement for directional candle confirmation.
-    strict_ok = engine_confirmation_ok and body > 0.0 and body_frac >= min_body_frac and side_ok and location_ok
+    strict_ok = body > 0.0 and body_frac >= min_body_frac and side_ok and location_ok
     score = 70.0 + (10.0 if (close > p["ema20"] if side == "BUY" else close < p["ema20"]) else 0.0)
     score += 10.0 if momentum_ok else 0.0
     score += 10.0 if (close_location >= 0.70 if side == "BUY" else close_location <= 0.30) else 0.0
@@ -2701,6 +2701,12 @@ class XM_MT5_Bot:
             "status": "waiting_1m",
             "trigger_timeframe": "5M",
             "waiting_for": "1M_CONFIRMATION",
+            "trigger_candle_id": str(sig.get("m5_trigger_candle_id") or ""),
+            "baseline_m1_candle_id": str(sig.get("baseline_m1_candle_id") or ""),
+            "baseline_m1_closed_at": str(sig.get("baseline_m1_closed_at") or ""),
+            "last_m1_candle_id": str(sig.get("baseline_m1_candle_id") or ""),
+            "last_m1_candle_closed_at": str(sig.get("baseline_m1_closed_at") or ""),
+            "confirmation_requires_post_setup_candle": True,
             "setup_type": str(sig.get("setup_type") or "DIRECTIONAL"),
             "htf_alignment": self._audit_json_safe(sig.get("htf_alignment") or {}),
             "trigger_candle_m5": self._pending_setup_snapshot(sig, "m5"),
@@ -2957,19 +2963,26 @@ class XM_MT5_Bot:
             df1 = self.gateway.rates(canonical, "M1", 41)
             m1_closed_at, m1_candle_id = _completed_m1_candle_id(df1)
             sig["m1_candle_closed_at"] = m1_closed_at
-            if m1_candle_id and str(pending.get("last_m1_candle_id") or "") == m1_candle_id:
+            setup_created_dt = _parse_dt(pending.get("setup_created_at") or pending.get("created_at"))
+            candle_closed_dt = _parse_dt(m1_closed_at)
+            same_candle = bool(m1_candle_id) and str(pending.get("last_m1_candle_id") or "") == m1_candle_id
+            candle_predates_setup = not candle_closed_dt or not setup_created_dt or candle_closed_dt <= setup_created_dt
+            if not m1_candle_id or same_candle:
                 ok, confirm_reason, confirm_score = False, "waiting for new completed 1M candle", 0.0
+            elif candle_predates_setup:
+                pending["last_m1_candle_id"] = m1_candle_id
+                pending["last_m1_candle_closed_at"] = m1_closed_at
+                self._save_state()
+                ok, confirm_reason, confirm_score = False, "waiting for first completed post-setup 1M candle", 0.0
             else:
-                if m1_candle_id:
-                    pending["last_m1_candle_id"] = m1_candle_id
-                    pending["last_m1_candle_closed_at"] = m1_closed_at
-                    try:
-                        _ss.upsert_m1_candles(canonical, df1.tail(40), retention_days=7)
-                    except Exception as exc:
-                        _ss.set_status("m1_candle_persist_error", f"{canonical}: {str(exc)[:180]}")
+                pending["last_m1_candle_id"] = m1_candle_id
+                pending["last_m1_candle_closed_at"] = m1_closed_at
+                try:
+                    _ss.upsert_m1_candles(canonical, df1.tail(40), retention_days=7)
+                except Exception as exc:
+                    _ss.set_status("m1_candle_persist_error", f"{canonical}: {str(exc)[:180]}")
                 ok, confirm_reason, confirm_score = valid_1m_confirmation(df1, direction, str(pending.get("engine") or sig.get("engine") or ""))
-                if m1_candle_id:
-                    self._save_state()
+                self._save_state()
         except Exception as exc:
             ok, confirm_reason, confirm_score = False, f"waiting for 1M confirmation: {str(exc)[:120]}", 0.0
         sig["one_min_confirmation"] = bool(ok)
@@ -2979,7 +2992,7 @@ class XM_MT5_Bot:
         sig["setup_side"] = str(sig.get("setup_side") or pending.get("setup_side") or direction).upper()
         sig["pending_setup_side"] = str(pending.get("side") or pending.get("direction") or direction).upper()
         sig["confirmation_side"] = direction if ok else ""
-        if not ok and confirm_reason == "waiting for new completed 1M candle":
+        if not ok and confirm_reason in {"waiting for new completed 1M candle", "waiting for first completed post-setup 1M candle"}:
             sig["final_status"] = PENDING
             sig["state"] = PENDING
             sig["pending_reason"] = confirm_reason
@@ -3203,7 +3216,8 @@ class XM_MT5_Bot:
         next_loop_status_at = 0.0
         max_loop_ms = 0.0
         poll_interval = max(0.1, float(self.runtime.poll_seconds or 1.0))
-        scan_interval = int(_env_float("MT5_FULL_SCAN_SECONDS", FULL_SCAN_SECONDS, lo=60.0))
+        configured_scan_interval = _env_float("MT5_FULL_SCAN_SECONDS", FULL_SCAN_SECONDS, lo=1.0, hi=300.0)
+        scan_interval = max(1, int(min(configured_scan_interval, FULL_SCAN_SECONDS)))
         pending_monitor_enabled = _env_bool("MT5_PENDING_MONITOR_ENABLE", True)
         pending_monitor_interval = _env_float("MT5_PENDING_MONITOR_SECONDS", PENDING_MONITOR_SECONDS, lo=0.25, hi=1.0)
         housekeeping_interval = _env_float("MT5_HOUSEKEEPING_SECONDS", HOUSEKEEPING_SECONDS, lo=60.0)
@@ -6334,6 +6348,80 @@ class XM_MT5_Bot:
         self._trace_step(sig, "SCORE_CALCULATED", "PASS", "engine score calculated", score_function=sig.get("score_function"), score_before=sig.get("score_before"), score_after=sig.get("score_after"), min_score=sig.get("min_score"))
         return sig
 
+    def _replacement_data_freshness(self, canonical: str, frames: dict) -> tuple[bool, str, str, dict]:
+        now = datetime.utcnow()
+        timeframe_seconds = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
+        max_age_seconds = {"H4": 18000, "H1": 5400, "M15": 1800, "M5": 720, "M1": 180}
+        minimum_bars = {"H4": 60, "H1": 80, "M15": 60, "M5": 40, "M1": 3}
+        evidence = {}
+        problems = []
+        for label, frame in frames.items():
+            bars = _bars(frame)
+            meta = dict(getattr(frame, "attrs", {}).get("bridge_rates") or {}) if frame is not None else {}
+            row = {
+                "bars": int(len(bars)) if bars is not None else 0,
+                "minimum_bars": minimum_bars[label],
+                "bridge_file": meta.get("bridge_file"),
+                "bridge_mtime": meta.get("bridge_mtime"),
+                "bridge_file_age_minutes": meta.get("bridge_file_age_minutes"),
+                "broker_time_offset_seconds": meta.get("broker_time_offset_seconds"),
+                "broker_time_offset_source": meta.get("broker_time_offset_source"),
+                "raw_time": meta.get("last_bar_time_raw"),
+                "normalized_time": meta.get("last_bar_time_normalized"),
+                "receipt_time_utc": meta.get("receipt_time_utc"),
+            }
+            if bars is None or len(bars) < minimum_bars[label]:
+                row["state"] = "DATA_MISSING"
+                problems.append(f"{label} bars {row['bars']} < {minimum_bars[label]}")
+                evidence[label] = row
+                continue
+            latest_open = _latest_bar_dt(bars)
+            if latest_open is None:
+                row["state"] = "DATA_MISSING"
+                problems.append(f"{label} latest timestamp missing")
+                evidence[label] = row
+                continue
+            latest_close = latest_open + timedelta(seconds=timeframe_seconds[label])
+            age_seconds = (now - latest_close).total_seconds()
+            row.update({
+                "latest_completed_open_utc": latest_open.isoformat(),
+                "latest_completed_close_utc": latest_close.isoformat(),
+                "age_seconds": round(age_seconds, 3),
+                "max_age_seconds": max_age_seconds[label],
+            })
+            if age_seconds < -120:
+                row["state"] = "DATA_CLOCK_INVALID"
+                problems.append(f"{label} completed candle is {-age_seconds:.0f}s in the future")
+            elif age_seconds > max_age_seconds[label]:
+                row["state"] = "DATA_STALE"
+                problems.append(f"{label} age {age_seconds:.0f}s > {max_age_seconds[label]}s")
+            else:
+                row["state"] = "FRESH"
+            evidence[label] = row
+        try:
+            _resolved, tick = self.gateway.symbol_tick(canonical)
+            tick_epoch = int(getattr(tick, "time_utc", getattr(tick, "time", 0)) or 0)
+            tick_age = time.time() - tick_epoch if tick_epoch > 0 else float("inf")
+            tick_state = "FRESH" if -5.0 <= tick_age <= 30.0 else "DATA_CLOCK_INVALID" if tick_age < -5.0 else "DATA_STALE"
+            evidence["TICK"] = {
+                "state": tick_state,
+                "time_broker": getattr(tick, "time_broker", None),
+                "time_utc": tick_epoch,
+                "broker_utc_offset_seconds": getattr(tick, "broker_utc_offset_seconds", None),
+                "receipt_time_utc": str(getattr(tick, "receipt_time_utc", "")),
+                "age_seconds": round(tick_age, 3),
+                "max_age_seconds": 30.0,
+            }
+            if tick_state != "FRESH":
+                problems.append(f"TICK {tick_state} age={tick_age:.1f}s")
+        except Exception as exc:
+            evidence["TICK"] = {"state": "DATA_MISSING", "error": str(exc)[:180]}
+            problems.append(f"TICK unavailable: {str(exc)[:120]}")
+        if problems:
+            state = "DATA_MISSING" if any("missing" in item.lower() or "unavailable" in item.lower() for item in problems) else "DATA_STALE"
+            return False, state, "; ".join(problems), evidence
+        return True, "FRESH", "all H4/H1/M15/M5/M1 and tick inputs are fresh", evidence
+
     def _strategy_v1_frame(self, frame, label: str, completed_only: bool = False):
         if frame is None:
             return None
@@ -6362,6 +6450,49 @@ class XM_MT5_Bot:
         asset = str(cfg.get("asset_class") or "").lower()
         if asset not in {"forex", "index", "metal"}:
             return False
+        raw_frames = {"H4": h4, "H1": h1, "M15": m15, "M5": m5, "M1": m1}
+        freshness_ok, data_state, freshness_reason, freshness = self._replacement_data_freshness(canonical, raw_frames)
+        if not freshness_ok:
+            engine_name = {
+                "forex": "FOREX_TREND_PULLBACK",
+                "index": "INDEX_SESSION_BREAKOUT",
+                "metal": "METAL_VOLATILITY_TREND",
+            }[asset]
+            sig = {
+                "symbol": canonical,
+                "market": market,
+                "asset_class": asset,
+                "engine": engine_name,
+                "strategy": engine_name,
+                "direction": None,
+                "generated_at": datetime.utcnow().isoformat(),
+                "final_status": NOT_QUALIFIED,
+                "state": NOT_QUALIFIED,
+                "not_qualified": True,
+                "block_reason": f"{data_state} {freshness_reason}",
+                "data_state": data_state,
+                "timeframe_freshness": freshness,
+                "replacement_strategy_v1": True,
+                "decision_trace_id": self._new_decision_trace_id(canonical),
+                "_decision_trace": [],
+            }
+            self._upsert_signal(canonical, market, sig, 0.0, 0.0, sig["block_reason"], False, _score_details_from_signal(sig, market), group)
+            self._audit_decision({
+                "event": data_state,
+                "decision": "not_qualified",
+                "symbol": canonical,
+                "engine": engine_name,
+                "reason": freshness_reason,
+                "freshness": freshness,
+            })
+            print(f"[MT5_DATA_FRESHNESS] symbol={canonical} state={data_state} reason={freshness_reason}", flush=True)
+            return True
+        m5_closed_at, m5_trigger_id = _completed_candle_identity(m5, "M5", 300)
+        if not m5_trigger_id:
+            raise RuntimeError(f"fresh M5 data has no immutable candle identity for {canonical}")
+        self.state.setdefault("last_scanned_m5_candles", {})[canonical] = m5_trigger_id
+        self._save_state()
+        _ss.set_status(f"last_m5_scan_{canonical}", f"NEW_COMPLETED_M5 {m5_trigger_id}")
         frames = {
             "H4": self._strategy_v1_frame(h4, "H4", completed_only=True),
             "H1": self._strategy_v1_frame(h1, "H1", completed_only=True),
@@ -6426,6 +6557,7 @@ class XM_MT5_Bot:
             "adx_function": "strategy_architecture_v1.adx_proxy",
             "spread_function": "strategy_architecture_v1.geometry",
             "replacement_strategy_v1": True,
+            "timeframe_freshness": freshness,
             "replacement_decision": dict(decision.__dict__) if hasattr(decision, "__dict__") else {},
             "generated_at": datetime.utcnow().isoformat(),
             "source_loop_name": "strategy_v1_live",
@@ -6441,6 +6573,32 @@ class XM_MT5_Bot:
             "block_reason": "",
             "pending_reason": "",
         }
+        trigger_candle = m5_frame.candles[-1] if m5_frame and m5_frame.candles else None
+        if trigger_candle is not None:
+            sig.update({
+                "m5_time": trigger_candle.timestamp,
+                "m5_open": trigger_candle.open,
+                "m5_high": trigger_candle.high,
+                "m5_low": trigger_candle.low,
+                "m5_close": trigger_candle.close,
+                "m5_trigger_candle_id": m5_trigger_id,
+                "m5_candle_closed_at": m5_closed_at,
+            })
+        for frame_label in ("H4", "H1", "M15"):
+            frame = frames.get(frame_label)
+            candle = frame.candles[-1] if frame and frame.candles else None
+            if candle is not None:
+                prefix = frame_label.lower()
+                sig.update({
+                    f"{prefix}_time": candle.timestamp,
+                    f"{prefix}_open": candle.open,
+                    f"{prefix}_high": candle.high,
+                    f"{prefix}_low": candle.low,
+                    f"{prefix}_close": candle.close,
+                })
+        baseline_m1_closed_at, baseline_m1_candle_id = _completed_m1_candle_id(m1)
+        sig["baseline_m1_closed_at"] = baseline_m1_closed_at
+        sig["baseline_m1_candle_id"] = baseline_m1_candle_id
         self._audit_decision({
             "event": "STRATEGY_V1_DECISION",
             "decision": "pass" if decision.state == "PASS" else "not_qualified",
@@ -6515,6 +6673,16 @@ class XM_MT5_Bot:
             market = market if market in {"index_cfd", "index_cfd_eu"} else self._market_for_symbol(canonical)
         elif cfg.get("asset_class") == "metal":
             market = "metal"
+        try:
+            m5_probe = self.gateway.rates(canonical, "M5", 3)
+            _m5_closed_at, m5_probe_id = _completed_candle_identity(m5_probe, "M5", 300)
+            last_m5_id = str(self.state.setdefault("last_scanned_m5_candles", {}).get(canonical) or "")
+            if m5_probe_id and m5_probe_id == last_m5_id:
+                _ss.set_status(f"last_m5_scan_{canonical}", f"NO_NEW_M5_CANDLE {m5_probe_id}")
+                return
+        except Exception:
+            # The full load below records a precise DATA_MISSING result.
+            pass
         try:
             h4 = self.gateway.rates(canonical, "H4", max(80, self.runtime.history_bars // 4))
             h1 = self.gateway.rates(canonical, "H1", max(120, self.runtime.history_bars // 2))

@@ -2,9 +2,9 @@
 
 input string SymbolsCSV = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,USDZAR,XAUUSD,XAGUSD,BTCUSD,ETHUSD,NAS100,US30,GER40,UK100";
 input string SymbolsFile = "cipherfx\\symbols.txt";
-input int ExportBars = 30000;
+input int ExportBars = 220;
 input int TimerSeconds = 1;
-input int TimerMilliseconds = 100;
+input int TimerMilliseconds = 250;
 input int SlippagePoints = 20;
 input int MaxRateSymbolsPerCycle = 25;
 input bool ExportExtraTimeframes = true;
@@ -16,7 +16,7 @@ input int MaxPyramidTrades = 10;
 input int MaxPyramidTradesPerSignal = 10;
 input bool AllowSameCandlePyramids = false;
 input int MaxTradesPerDay = 60;
-input bool StopTradingAfterDailyTarget = true;
+input bool StopTradingAfterDailyTarget = false;
 input bool StopTradingAfterDailyLossLimit = true;
 input bool UseNetProfitTarget = false;
 input int ExportLogSeconds = 60;
@@ -25,8 +25,12 @@ string BRIDGE_DIR = "cipherfx";
 string COMMANDS_DIR = "cipherfx\\commands";
 string RESULTS_DIR = "cipherfx\\results";
 int RateCursor = 0;
-string LastRateExportSymbols[];
-datetime LastRateExportM15[];
+string LastRateExportKeys[];
+datetime LastRateExportBars[];
+ulong LastStaticExportMs = 0;
+ulong LastAccountExportMs = 0;
+ulong LastPositionExportMs = 0;
+ulong LastDealExportMs = 0;
 string ActiveRiskSymbol = "";
 ulong ActiveRiskMagic = 0;
 string ActiveRiskComment = "";
@@ -68,7 +72,7 @@ void OnDeinit(const int reason)
 
 void OnTick()
 {
-   RunBridge();
+   // The 250 ms timer owns bridge cadence; ticks must not duplicate full exports.
 }
 
 void OnTimer()
@@ -79,10 +83,23 @@ void OnTimer()
 void RunBridge()
 {
    ProcessCommands();
-   ExportAccount();
-   ExportPositions();
-   ExportOrders();
-   ExportDeals();
+   ulong nowMs = GetTickCount64();
+   if(LastAccountExportMs == 0 || (nowMs - LastAccountExportMs) >= 1000)
+   {
+      ExportAccount();
+      LastAccountExportMs = nowMs;
+   }
+   if(LastPositionExportMs == 0 || (nowMs - LastPositionExportMs) >= 500)
+   {
+      ExportPositions();
+      ExportOrders();
+      LastPositionExportMs = nowMs;
+   }
+   if(LastDealExportMs == 0 || (nowMs - LastDealExportMs) >= 3000)
+   {
+      ExportDeals();
+      LastDealExportMs = nowMs;
+   }
    ExportSymbols();
    UpdateRiskComment(LastTradingBlocked, LastTradeBlockReason, LastPyramidCount);
    ProcessCommands();
@@ -122,6 +139,13 @@ datetime BrokerDayStart()
    stamp.min = 0;
    stamp.sec = 0;
    return StructToTime(stamp);
+}
+
+int BrokerUtcOffsetSeconds()
+{
+   int raw_offset = (int)(TimeCurrent() - TimeGMT());
+   // TimeCurrent and TimeGMT can straddle a second; normalize to whole minutes.
+   return (int)MathRound((double)raw_offset / 60.0) * 60;
 }
 
 int EffectiveMaxPyramidTrades()
@@ -507,6 +531,10 @@ void ExportAccount()
    FileWrite(handle, "terminal_connected=" + (TerminalInfoInteger(TERMINAL_CONNECTED) ? "1" : "0"));
    FileWrite(handle, "trade_allowed=" + (TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) ? "1" : "0"));
    FileWrite(handle, "account_trade_allowed=" + (AccountInfoInteger(ACCOUNT_TRADE_ALLOWED) ? "1" : "0"));
+   FileWrite(handle, "broker_time_epoch=" + IntegerToString((int)TimeCurrent()));
+   FileWrite(handle, "utc_time_epoch=" + IntegerToString((int)TimeGMT()));
+   FileWrite(handle, "broker_utc_offset_seconds=" + IntegerToString(BrokerUtcOffsetSeconds()));
+   FileWrite(handle, "export_receipt_local_epoch=" + IntegerToString((int)TimeLocal()));
    FileClose(handle);
    AtomicReplaceFile(temp_path, final_path);
 }
@@ -517,7 +545,7 @@ void ExportPositions()
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "ticket", "symbol", "direction", "volume", "price_open", "price_current", "sl", "tp", "profit", "time");
+   FileWrite(handle, "ticket", "symbol", "direction", "volume", "price_open", "price_current", "sl", "tp", "profit", "time_broker", "time_utc", "broker_utc_offset_seconds");
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
@@ -534,7 +562,9 @@ void ExportPositions()
          DoubleToString(PositionGetDouble(POSITION_SL), 8),
          DoubleToString(PositionGetDouble(POSITION_TP), 8),
          DoubleToString(PositionGetDouble(POSITION_PROFIT), 2),
-         IntegerToString((int)PositionGetInteger(POSITION_TIME))
+         IntegerToString((int)PositionGetInteger(POSITION_TIME)),
+         IntegerToString((int)PositionGetInteger(POSITION_TIME) - BrokerUtcOffsetSeconds()),
+         IntegerToString(BrokerUtcOffsetSeconds())
       );
    }
    FileClose(handle);
@@ -547,7 +577,7 @@ void ExportOrders()
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "ticket", "symbol", "order_type", "side", "volume", "price_open", "sl", "tp", "state", "time_setup");
+   FileWrite(handle, "ticket", "symbol", "order_type", "side", "volume", "price_open", "sl", "tp", "state", "time_setup_broker", "time_setup_utc", "broker_utc_offset_seconds");
    for(int i = 0; i < OrdersTotal(); i++)
    {
       ulong ticket = OrderGetTicket(i);
@@ -566,7 +596,9 @@ void ExportOrders()
          DoubleToString(OrderGetDouble(ORDER_SL), 8),
          DoubleToString(OrderGetDouble(ORDER_TP), 8),
          EnumToString((ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE)),
-         IntegerToString((int)OrderGetInteger(ORDER_TIME_SETUP))
+         IntegerToString((int)OrderGetInteger(ORDER_TIME_SETUP)),
+         IntegerToString((int)OrderGetInteger(ORDER_TIME_SETUP) - BrokerUtcOffsetSeconds()),
+         IntegerToString(BrokerUtcOffsetSeconds())
       );
    }
    FileClose(handle);
@@ -582,7 +614,7 @@ void ExportDeals()
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "deal", "position_id", "symbol", "price", "profit", "swap", "commission", "net_profit", "time");
+   FileWrite(handle, "deal", "position_id", "symbol", "price", "profit", "swap", "commission", "net_profit", "time_broker", "time_utc", "broker_utc_offset_seconds");
    int total = HistoryDealsTotal();
    for(int i = 0; i < total; i++)
    {
@@ -602,7 +634,9 @@ void ExportDeals()
          DoubleToString(swap, 2),
          DoubleToString(commission, 2),
          DoubleToString(net_profit, 2),
-         IntegerToString((int)HistoryDealGetInteger(deal, DEAL_TIME))
+         IntegerToString((int)HistoryDealGetInteger(deal, DEAL_TIME)),
+         IntegerToString((int)HistoryDealGetInteger(deal, DEAL_TIME) - BrokerUtcOffsetSeconds()),
+         IntegerToString(BrokerUtcOffsetSeconds())
       );
    }
    FileClose(handle);
@@ -664,48 +698,54 @@ void SelectConfiguredSymbols(string &symbols[])
       SymbolSelect(symbols[i], true);
 }
 
-int RateExportIndex(string symbol)
+string RateExportKey(string symbol, string label)
 {
-   int total = ArraySize(LastRateExportSymbols);
-   string wanted = Upper(symbol);
+   return Upper(symbol) + "|" + Upper(label);
+}
+
+int RateExportIndex(string symbol, string label)
+{
+   int total = ArraySize(LastRateExportKeys);
+   string wanted = RateExportKey(symbol, label);
    for(int i = 0; i < total; i++)
    {
-      if(Upper(LastRateExportSymbols[i]) == wanted)
+      if(LastRateExportKeys[i] == wanted)
          return i;
    }
    return -1;
 }
 
-bool ShouldExportM15Rates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
+bool ShouldExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
 {
-   if(label != "M15")
-      return true;
    datetime current_bar = iTime(symbol, timeframe, 0);
    string file_name = BRIDGE_DIR + "\\rates_" + symbol + "_" + label + ".csv";
-   int idx = RateExportIndex(symbol);
-   if(idx < 0)
+   int idx = RateExportIndex(symbol, label);
+   if(idx < 0 || !FileIsExist(file_name))
       return true;
-   if(!FileIsExist(file_name))
-      return true;
-   return current_bar > 0 && LastRateExportM15[idx] != current_bar;
+   return current_bar > 0 && LastRateExportBars[idx] != current_bar;
 }
 
-void RememberM15RateExport(string symbol, ENUM_TIMEFRAMES timeframe, string label)
+void RememberRateExport(string symbol, ENUM_TIMEFRAMES timeframe, string label)
 {
-   if(label != "M15")
-      return;
    datetime current_bar = iTime(symbol, timeframe, 0);
-   int idx = RateExportIndex(symbol);
+   int idx = RateExportIndex(symbol, label);
    if(idx < 0)
    {
-      int total = ArraySize(LastRateExportSymbols);
-      ArrayResize(LastRateExportSymbols, total + 1);
-      ArrayResize(LastRateExportM15, total + 1);
-      LastRateExportSymbols[total] = symbol;
-      LastRateExportM15[total] = current_bar;
+      int total = ArraySize(LastRateExportKeys);
+      ArrayResize(LastRateExportKeys, total + 1);
+      ArrayResize(LastRateExportBars, total + 1);
+      LastRateExportKeys[total] = RateExportKey(symbol, label);
+      LastRateExportBars[total] = current_bar;
       return;
    }
-   LastRateExportM15[idx] = current_bar;
+   LastRateExportBars[idx] = current_bar;
+}
+
+bool ExportRatesIfChanged(string symbol, ENUM_TIMEFRAMES timeframe, string label)
+{
+   if(!ShouldExportRates(symbol, timeframe, label))
+      return true;
+   return ExportRates(symbol, timeframe, label);
 }
 
 void ExportSymbols()
@@ -715,7 +755,9 @@ void ExportSymbols()
 
    string symbols_final_path = BRIDGE_DIR + "\\symbols.csv";
    string symbols_temp_path = symbols_final_path + ".tmp";
-   int allHandle = FileOpen(symbols_temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   ulong nowMs = GetTickCount64();
+   bool exportStatic = LastStaticExportMs == 0 || (nowMs - LastStaticExportMs) >= 60000;
+   int allHandle = exportStatic ? FileOpen(symbols_temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',') : INVALID_HANDLE;
    if(allHandle != INVALID_HANDLE)
       FileWrite(
          allHandle,
@@ -724,7 +766,7 @@ void ExportSymbols()
          "tick_value", "tick_value_profit", "tick_value_loss", "tick_size",
          "stops_level", "trade_mode", "filling_mode", "currency_profit"
       );
-   int totalAll = SymbolsTotal(false);
+   int totalAll = exportStatic ? SymbolsTotal(false) : 0;
    for(int idx = 0; idx < totalAll; idx++)
    {
       string allSymbol = SymbolName(idx, false);
@@ -759,6 +801,7 @@ void ExportSymbols()
    {
       FileClose(allHandle);
       AtomicReplaceFile(symbols_temp_path, symbols_final_path);
+      LastStaticExportMs = nowMs;
    }
 
    int totalConfigured = ArraySize(configuredSymbols);
@@ -779,24 +822,19 @@ void ExportSymbols()
          continue;
       }
       bool tickOk = ExportTick(visibleSymbol);
-      string m15Status = "SKIP";
-      if(ShouldExportM15Rates(visibleSymbol, PERIOD_M15, "M15"))
-      {
-         bool m15Ok = ExportRates(visibleSymbol, PERIOD_M15, "M15");
-         m15Status = m15Ok ? "OK" : "FAIL";
-      }
-      bool m1Ok = ExportRates(visibleSymbol, PERIOD_M1, "M1");
-      bool m5Ok = ExportRates(visibleSymbol, PERIOD_M5, "M5");
+      bool m15Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M15, "M15");
+      bool m1Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M1, "M1");
+      bool m5Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M5, "M5");
       if(logCycle)
-         PrintFormat("CipherFX bridge export symbol=%s visible=1 tick=%s M1=%s M5=%s M15=%s broker_time=%s local_time=%s", visibleSymbol, tickOk ? "OK" : "FAIL", m1Ok ? "OK" : "FAIL", m5Ok ? "OK" : "FAIL", m15Status, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS));
+         PrintFormat("CipherFX bridge export symbol=%s visible=1 tick=%s M1=%s M5=%s M15=%s broker_time=%s local_time=%s", visibleSymbol, tickOk ? "OK" : "FAIL", m1Ok ? "OK" : "FAIL", m5Ok ? "OK" : "FAIL", m15Ok ? "OK" : "FAIL", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS));
       if(ExportExtraTimeframes)
       {
-         ExportRates(visibleSymbol, PERIOD_M30, "M30");
-         ExportRates(visibleSymbol, PERIOD_H1, "H1");
-         ExportRates(visibleSymbol, PERIOD_H4, "H4");
-         ExportRates(visibleSymbol, PERIOD_D1, "D1");
-         ExportRates(visibleSymbol, PERIOD_W1, "W1");
-         ExportRates(visibleSymbol, PERIOD_MN1, "MN");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_M30, "M30");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_H1, "H1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_H4, "H4");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_D1, "D1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_W1, "W1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_MN1, "MN");
       }
       exported++;
    }
@@ -812,7 +850,10 @@ bool ExportTick(string symbol)
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_TXT | FILE_ANSI);
    if(handle == INVALID_HANDLE) return false;
-   FileWrite(handle, "time=" + IntegerToString((int)tick.time));
+   FileWrite(handle, "time_broker=" + IntegerToString((int)tick.time));
+   FileWrite(handle, "time_utc=" + IntegerToString((int)tick.time - BrokerUtcOffsetSeconds()));
+   FileWrite(handle, "broker_utc_offset_seconds=" + IntegerToString(BrokerUtcOffsetSeconds()));
+   FileWrite(handle, "export_receipt_local_epoch=" + IntegerToString((int)TimeLocal()));
    FileWrite(handle, "bid=" + DoubleToString(tick.bid, 8));
    FileWrite(handle, "ask=" + DoubleToString(tick.ask, 8));
    FileWrite(handle, "last=" + DoubleToString(tick.last, 8));
@@ -849,7 +890,7 @@ bool ExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
    FileClose(handle);
    if(!AtomicReplaceFile(temp_path, final_path))
       return false;
-   RememberM15RateExport(symbol, timeframe, label);
+   RememberRateExport(symbol, timeframe, label);
    return true;
 }
 

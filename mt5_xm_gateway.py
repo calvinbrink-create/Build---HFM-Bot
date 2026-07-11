@@ -73,6 +73,7 @@ class MT5Gateway:
         self.mt5 = None
         self.mode = "bridge"
         self._last_account_payload: dict[str, str] = {}
+        self._broker_offset_cache = 0
 
     def connect(self) -> None:
         if self.config.execution_mode in {"native", "auto"}:
@@ -126,6 +127,41 @@ class MT5Gateway:
         except Exception:
             pass
 
+    def broker_utc_offset_seconds(self) -> int:
+        if self.mode == "native":
+            return 0
+        payload = self._read_key_values(self.config.bridge_dir / "account.txt")
+        raw = payload.get("broker_utc_offset_seconds")
+        try:
+            value = int(float(raw)) if raw not in (None, "") else 0
+        except Exception:
+            value = 0
+        if abs(value) <= 14 * 3600 and value != 0:
+            self._broker_offset_cache = value
+        return int(self._broker_offset_cache)
+
+    def _bridge_utc_epoch(self, payload, utc_key: str, broker_key: str, legacy_key: str = "") -> int:
+        try:
+            value = int(float(payload.get(utc_key, 0) or 0))
+            if value > 0:
+                return value
+        except Exception:
+            pass
+        raw_key = broker_key if payload.get(broker_key) not in (None, "") else legacy_key
+        try:
+            broker_epoch = int(float(payload.get(raw_key, 0) or 0))
+        except Exception:
+            broker_epoch = 0
+        if broker_epoch <= 0:
+            return 0
+        offset = self.broker_utc_offset_seconds()
+        if not offset and broker_epoch - int(time.time()) > 120:
+            inferred_hours = int(round((broker_epoch - time.time()) / 3600.0))
+            if 0 < abs(inferred_hours) <= 14:
+                offset = inferred_hours * 3600
+                self._broker_offset_cache = offset
+        return broker_epoch - offset
+
     def shutdown(self) -> None:
         if self.mt5 is not None:
             try:
@@ -176,6 +212,10 @@ class MT5Gateway:
             terminal_connected=payload.get("terminal_connected", "1") in {"1", "true", "True"},
             trade_allowed=payload.get("trade_allowed", "1") in {"1", "true", "True"},
             account_trade_allowed=payload.get("account_trade_allowed", "1") in {"1", "true", "True"},
+            broker_time_epoch=int(float(payload.get("broker_time_epoch", "0") or 0)),
+            utc_time_epoch=int(float(payload.get("utc_time_epoch", "0") or 0)),
+            broker_utc_offset_seconds=self.broker_utc_offset_seconds(),
+            receipt_time_utc=datetime.now(timezone.utc),
         )
 
     def rates(self, symbol: str, timeframe, count: int) -> pd.DataFrame:
@@ -244,11 +284,16 @@ class MT5Gateway:
             return resolved, tick
         resolved = self.ensure_symbol(symbol)
         payload = self._read_key_values(self.config.bridge_dir / f"tick_{resolved}.txt")
+        time_utc = self._bridge_utc_epoch(payload, "time_utc", "time_broker", "time")
         return resolved, SimpleNamespace(
             bid=float(payload.get("bid", "0") or 0.0),
             ask=float(payload.get("ask", "0") or 0.0),
             last=float(payload.get("last", "0") or 0.0),
-            time=int(payload.get("time", "0") or 0),
+            time=time_utc,
+            time_utc=time_utc,
+            time_broker=int(float(payload.get("time_broker", payload.get("time", "0")) or 0)),
+            broker_utc_offset_seconds=self.broker_utc_offset_seconds(),
+            receipt_time_utc=datetime.now(timezone.utc),
         )
 
     def positions(self) -> list[MT5PositionView]:
@@ -289,7 +334,7 @@ class MT5Gateway:
                     sl=float(row.get("sl", 0.0) or 0.0),
                     tp=float(row.get("tp", 0.0) or 0.0),
                     profit=float(row.get("profit", 0.0) or 0.0),
-                    time=datetime.fromtimestamp(int(row.get("time", 0) or 0), tz=timezone.utc),
+                    time=datetime.fromtimestamp(self._bridge_utc_epoch(row, "time_utc", "time_broker", "time"), tz=timezone.utc),
                 )
             )
         return positions
@@ -336,7 +381,7 @@ class MT5Gateway:
                     sl=float(row.get("sl", 0.0) or 0.0),
                     tp=float(row.get("tp", 0.0) or 0.0),
                     state=str(row.get("state", "")),
-                    time_setup=datetime.fromtimestamp(int(row.get("time_setup", 0) or 0), tz=timezone.utc),
+                    time_setup=datetime.fromtimestamp(self._bridge_utc_epoch(row, "time_setup_utc", "time_setup_broker", "time_setup"), tz=timezone.utc),
                 )
             )
         return orders
@@ -703,6 +748,9 @@ class MT5Gateway:
                     swap=swap,
                     commission=commission,
                     net_profit=net_profit,
+                    time_utc=self._bridge_utc_epoch(row, "time_utc", "time_broker", "time"),
+                    time_broker=int(number(row, "time_broker", number(row, "time"))),
+                    broker_utc_offset_seconds=int(number(row, "broker_utc_offset_seconds", self.broker_utc_offset_seconds())),
                 )
             )
         return out
@@ -882,13 +930,16 @@ class MT5Gateway:
         now = pd.Timestamp.now(tz="UTC")
         latest_raw = valid.iloc[-1]
         raw_age_minutes = (now - latest_raw).total_seconds() / 60.0
-        offset_seconds = 0
+        offset_seconds = self.broker_utc_offset_seconds()
+        offset_source = "account_export" if offset_seconds else "none"
         future_seconds = (latest_raw - now).total_seconds()
-        if future_seconds > 120:
+        if not offset_seconds and future_seconds > 120:
             offset_hours = int(round(future_seconds / 3600.0))
             if offset_hours != 0 and abs(offset_hours) <= 14:
                 offset_seconds = offset_hours * 3600
-                parsed = parsed - pd.to_timedelta(offset_seconds, unit="s")
+                offset_source = "future_timestamp_inference"
+        if offset_seconds:
+            parsed = parsed - pd.to_timedelta(offset_seconds, unit="s")
         normalized_valid = pd.Series(parsed).dropna()
         latest_normalized = normalized_valid.iloc[-1] if not normalized_valid.empty else latest_raw
         age_minutes = (now - latest_normalized).total_seconds() / 60.0
@@ -897,7 +948,9 @@ class MT5Gateway:
             "last_bar_time_normalized": latest_normalized.isoformat(),
             "timestamp_normalized": bool(offset_seconds),
             "broker_time_offset_seconds": int(offset_seconds),
+            "broker_time_offset_source": offset_source,
             "vps_time": now.isoformat(),
+            "receipt_time_utc": datetime.now(timezone.utc).isoformat(),
             "age_minutes": age_minutes,
             "raw_age_minutes": raw_age_minutes,
         })

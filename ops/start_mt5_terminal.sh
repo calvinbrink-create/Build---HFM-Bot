@@ -27,6 +27,7 @@ EXPERTS_DIR="${MT5_HOME}/MQL5/Experts"
 BRIDGE_SOURCE="${EXPERTS_DIR}/CipherFxBridge.mq5"
 BRIDGE_BINARY="${EXPERTS_DIR}/CipherFxBridge.ex5"
 BRIDGE_COMPILE_LOG="${EXPERTS_DIR}/CipherFxBridge.log"
+METAEDITOR_LOG="${MT5_HOME}/logs/metaeditor.log"
 mkdir -p "$BRIDGE_PROFILE_DIR"
 # Keep the bridge profile empty so the startup Expert can always open its chart.
 # The old Default profile can accumulate enough charts to hit MT5's open-chart limit.
@@ -95,18 +96,16 @@ compile_rc=$?
 set -e
 sleep 2
 
-if [ "$compile_rc" -ne 0 ]; then
-  echo "ERROR: MetaEditor exited with status $compile_rc" >&2
+if [ ! -s "$METAEDITOR_LOG" ] || [ "$(stat -c %Y "$METAEDITOR_LOG")" -lt "$compile_started_epoch" ]; then
+  echo "ERROR: MetaEditor did not update its compiler log (rc=$compile_rc): $METAEDITOR_LOG" >&2
+  cat "$CACHE_DIR/mt5-compile.log" >&2
   exit 70
 fi
-if [ ! -s "$BRIDGE_COMPILE_LOG" ]; then
-  echo "ERROR: MQL compiler did not create its result log: $BRIDGE_COMPILE_LOG" >&2
-  exit 71
-fi
-compile_summary="$(iconv -f UTF-16LE -t UTF-8 "$BRIDGE_COMPILE_LOG")"
-if ! grep -Fq "Result: 0 errors, 0 warnings" <<<"$compile_summary"; then
-  echo "ERROR: MQL compile log does not prove a clean build: $BRIDGE_COMPILE_LOG" >&2
-  printf '%s\n' "$compile_summary" >&2
+compile_summary="$(iconv -f UTF-16LE -t UTF-8 "$METAEDITOR_LOG")"
+compile_result="$(grep -F "Compile" <<<"$compile_summary" | grep -F "CipherFxBridge.mq5" | tail -1)"
+if ! grep -Fq "0 errors, 0 warnings" <<<"$compile_result"; then
+  echo "ERROR: latest MQL compile result is not clean (rc=$compile_rc)" >&2
+  printf '%s\n' "$compile_result" >&2
   exit 71
 fi
 if [ ! -s "$BRIDGE_BINARY" ] || [ "$(stat -c %Y "$BRIDGE_BINARY")" -lt "$compile_started_epoch" ]; then
