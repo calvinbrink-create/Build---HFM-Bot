@@ -83,9 +83,14 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
 
   const rendered = await page.evaluate(() => ({
     scoreRows: document.querySelectorAll(".scanner-row").length,
-    blockRows: document.querySelectorAll(".scanner-block").length,
+    blockRows: document.querySelectorAll(".reason-summary-row, .scanner-event-row").length,
     metricCards: document.querySelectorAll(".scanner-card").length,
+    marketSessions: document.querySelectorAll(".scanner-session").length,
+    openSessions: document.querySelectorAll(".scanner-session.open").length,
+    closedSessions: document.querySelectorAll(".scanner-session.closed").length,
     text: document.querySelector(".scanner-workspace")?.innerText || "",
+    marketBadges: document.querySelectorAll(".scanner-state").length,
+    duplicateClosureBanners: document.querySelectorAll(".market-closed-inline").length,
     horizontalOverflow: document.documentElement.scrollWidth > document.documentElement.clientWidth + 1,
   }));
   const currentRows = scannerPayload.current_signals?.length || scannerPayload.recent_events?.length || 0;
@@ -96,7 +101,13 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
   if (rendered.scoreRows < 1) throw new Error(`${name}: no score rows rendered`);
   if (rendered.blockRows < 1) throw new Error(`${name}: no historical rows rendered`);
   if (rendered.metricCards < 6) throw new Error(`${name}: scanner metrics did not render`);
-  for (const expected of ["Score Scan", "Current Score And Gate", "Blocks and no-trade reasons", "MARKETS CLOSED"]) {
+  if (rendered.marketSessions !== 4) throw new Error(`${name}: expected four market sessions`);
+  if (rendered.openSessions + rendered.closedSessions !== 4) throw new Error(`${name}: market session status is incomplete`);
+  if (rendered.marketBadges !== 1) throw new Error(`${name}: expected one market state badge`);
+  if (rendered.duplicateClosureBanners !== 0) throw new Error(`${name}: duplicate market closure banner rendered`);
+  const expectedLabels = ["Cipher FX Scoring Metric V1", "Current Scores", "Latest No-Trade Detail", "US / New York", "UK / London", "Sydney", "Asia / Tokyo"];
+  if (auditPayload.market?.weekend_closed) expectedLabels.push("MARKETS CLOSED");
+  for (const expected of expectedLabels) {
     if (!rendered.text.includes(expected)) throw new Error(`${name}: missing visible text: ${expected}`);
   }
   if (apiFailures.length) throw new Error(`${name}: API failures: ${apiFailures.join(", ")}`);
@@ -104,6 +115,23 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
 
   const screenshot = path.join(ARTIFACTS, `dashboard-${name}.png`);
   await page.screenshot({ path: screenshot, fullPage: true });
+  let marketHoursScreenshot = "";
+  if (!mobile) {
+    const marketHoursButton = page.locator(".side-tab").filter({ hasText: "Market Hours" });
+    if (await marketHoursButton.count() !== 1) throw new Error(`${name}: market hours navigation is not unique`);
+    await marketHoursButton.click();
+    await page.locator(".market-hours-workspace").waitFor({ state: "visible", timeout: 15000 });
+    const marketHoursView = await page.evaluate(() => ({
+      badges: document.querySelectorAll(".market-hours-state").length,
+      banners: document.querySelectorAll(".market-closed-banner").length,
+      sessions: document.querySelectorAll(".market-session-row").length,
+    }));
+    if (marketHoursView.badges !== 1) throw new Error(`${name}: market hours must have one state badge`);
+    if (marketHoursView.banners !== 0) throw new Error(`${name}: market hours contains a duplicate closure banner`);
+    if (marketHoursView.sessions !== 4) throw new Error(`${name}: market hours must list four sessions`);
+    marketHoursScreenshot = path.join(ARTIFACTS, "dashboard-market-hours-desktop.png");
+    await page.screenshot({ path: marketHoursScreenshot, fullPage: true });
+  }
   await context.close();
   return {
     viewport: name,
@@ -114,9 +142,9 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
     metric_cards: rendered.metricCards,
     horizontal_overflow: rendered.horizontalOverflow,
     screenshot,
+    market_hours_screenshot: marketHoursScreenshot,
   };
 }
-
 fs.mkdirSync(ARTIFACTS, { recursive: true });
 const token = await dashboardToken();
 const browser = await chromium.launch({ headless: true });

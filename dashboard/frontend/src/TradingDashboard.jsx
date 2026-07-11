@@ -1134,20 +1134,23 @@ export function TradingDashboard() {
     const rows = (audit?.scanner_rows?.length ? audit.scanner_rows : scannerRecentRows).slice(0, compact ? 10 : 18);
     const counts = audit?.counts || {};
     const reasonCounts = audit?.reason_counts || [];
-    const tradeItems = [...(audit?.trades || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 20 : 120);
-    const blockItems = [...(audit?.blocks || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 20 : 120);
+    const tradeItems = [...(audit?.trades || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 6 : 12);
+    const blockItems = [...(audit?.blocks || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 10 : 18);
+    const market = marketHours || audit?.market || {};
+    const sessions = market.sessions || [];
     const marketClosed = Boolean(marketHours?.weekend_closed || audit?.market?.weekend_closed);
     const currentGate = marketClosed ? "MARKETS CLOSED" : (scannerState || "Scanning");
     return (
       <div className={"scanner-workspace" + (compact ? " mobile-scanner" : "")}>
         <div className="workspace-header scanner-header">
-          <div><h3>Score Scan</h3><span>{audit?.score_source || "quality_v2"} - {audit?.window?.label || "Live decision audit"} - {compactCount(scannerSummary.tracked_symbols || liveSymbols.length)} MT5 symbols</span></div>
+          <div><h3>Score Scan</h3><span>Cipher FX Scoring Metric V1 - {audit?.window?.label || "Live decision audit"} - {compactCount(scannerSummary.tracked_symbols || liveSymbols.length)} MT5 symbols</span></div>
           <div className={"scanner-state " + (marketClosed ? "blocked" : Number(scannerSummary.current_actionable || 0) > 0 ? "active" : "")}><Activity size={16} /><strong>{currentGate}</strong></div>
         </div>
-        {marketClosed && <div className="market-closed-inline"><Clock3 size={16} /><div><strong>MARKETS CLOSED - WEEKEND</strong><span>New scan decisions are blocked until the next broker session. The audit below remains available.</span></div></div>}
+        <div className="scanner-session-strip" aria-label="Global market sessions">
+          {sessions.map((session) => <div className={"scanner-session " + (session.open ? "open" : "closed")} key={session.id}><span className="market-status-dot" /><div><strong>{session.label}</strong><em>{session.open ? "OPEN" : "CLOSED"} · {session.hours_sast}</em></div></div>)}
+        </div>
         <div className="scanner-metrics">
-          <div className="scanner-card"><span>Score model</span><strong>quality_v2</strong><em>100-point diagnostic</em></div>
-          <div className="scanner-card"><span>Current gate</span><strong>{currentGate}</strong><em>{audit?.market?.global_reason || "execution status"}</em></div>
+          <div className="scanner-card score-model-card"><span>Scoring metric</span><strong>Cipher FX Scoring Metric V1</strong><em>100-point decision model</em></div>
           <div className="scanner-card"><span>Audit window</span><strong>{compactCount((audit?.blocks || []).length)}</strong><em>{compactCount((audit?.trades || []).length)} trade events</em></div>
           <div className="scanner-card"><span>Setups created</span><strong>{compactCount(counts.SETUP_CREATED || 0)}</strong><em>{compactCount(counts.SETUP_CONFIRMED_FRESH || 0)} fresh confirmations</em></div>
           <div className="scanner-card"><span>Orders filled</span><strong className={(counts.ORDER_FILLED || 0) > 0 ? "pos" : ""}>{compactCount(counts.ORDER_FILLED || 0)}</strong><em>{compactCount(counts.ORDER_SENT || 0)} sent - {compactCount(counts.ORDER_REJECTED || 0)} rejected</em></div>
@@ -1156,19 +1159,19 @@ export function TradingDashboard() {
         </div>
         <div className="scanner-split">
           <div className="scanner-list">
-            <div className="scanner-section-title"><strong>Current Score And Gate</strong><span>H4 / H1 / M15 / M5 / M1</span></div>
+            <div className="scanner-section-title"><strong>Current Scores</strong><span>H4 / H1 / M15 / M5 / M1</span></div>
             {rows.length ? rows.map((row, index) => {
               const symbol = row.symbol || row.sym || "MT5";
               const id = symbol + "-" + (row.ts || index);
               const score = Number(row.score ?? row.score_metric?.total ?? 0);
-              const statusLabel = marketClosed ? "WEEKEND CLOSED" : row.gate_ok ? "PASS" : (row.final_status || "NOT QUALIFIED");
-              const reason = marketClosed ? "MARKETS_CLOSED_WEEKEND" : (row.reason || row.gate || row.status || "No block reason recorded");
+              const statusLabel = row.gate_ok ? "PASS" : (row.final_status || "NOT QUALIFIED");
+              const reason = row.reason || row.gate || row.status || "No block reason recorded";
               const context = "H4 " + (row.h4_bias || "-") + " " + (row.h4_score ?? "-") + " - H1 " + (row.h1_bias || "-") + " " + (row.h1_score ?? "-") + " - M15 " + (row.m15_bias || "-") + " " + (row.m15_score ?? "-") + " - M5 " + (row.m5_trigger_side || "-") + " - M1 " + (row.m1_status || "-");
               return (
                 <React.Fragment key={id}>
                   <button type="button" className={"scanner-row" + (row.gate_ok && !marketClosed ? " ok" : " blocked")} onClick={() => setScannerExpanded((current) => current === id ? null : id)}>
                     <div className="scanner-row-main"><strong>{symbol} <span>{row.side || "WAIT"}</span></strong><em>{row.engine || "engine pending"} - {row.setup_type || "setup pending"}</em><small>{context}</small></div>
-                    <div className="scanner-row-score"><strong>{score ? score.toFixed(0) : "--"}</strong><span>{row.score_band || "quality_v2"}</span><em className={row.gate_ok && !marketClosed ? "pos" : "neg"}>{statusLabel}</em></div>
+                    <div className="scanner-row-score"><strong>{score ? score.toFixed(0) : "--"}</strong><span>{row.score_band || "Cipher FX V1"}</span><em className={row.gate_ok && !marketClosed ? "pos" : "neg"}>{statusLabel}</em></div>
                   </button>
                   {scannerExpanded === id && <div className="scanner-detail"><div className="scan-detail-grid"><span>H4 <b>{row.h4_bias || "-"} {row.h4_score ?? "-"}</b></span><span>H1 <b>{row.h1_bias || "-"} {row.h1_score ?? "-"}</b></span><span>M15 <b>{row.m15_bias || "-"} {row.m15_score ?? "-"}</b></span><span>M5 trigger <b>{row.m5_trigger_side || "-"}</b></span><span>M1 confirmation <b>{row.m1_status || "-"}</b></span><span>setup <b>{row.setup_type || "-"}</b></span></div><div className="scanner-detail-reason"><b>{statusLabel}</b> - {reason}</div>{Object.keys(row.score_metric?.components || {}).length > 0 && <div className="scanner-components">{Object.entries(row.score_metric.components).map(([key, value]) => <span key={key}>{key.replaceAll("_", " ")} <b>{Number(value).toFixed(1)}</b></span>)}</div>}</div>}
                 </React.Fragment>
@@ -1177,11 +1180,11 @@ export function TradingDashboard() {
           </div>
           <div className="scanner-side">
             <div className="scanner-section-title"><strong>Block Reasons</strong><span>Audit window</span></div>
-            <div className="scanner-blocks">{reasonCounts.length ? reasonCounts.slice(0, 10).map((row) => <div className="scanner-block" key={row.reason}><strong>{row.reason}</strong><span>{compactCount(row.count)} event(s)</span></div>) : <div className="empty-state">No recorded blocks.</div>}</div>
-            <div className="scanner-section-title"><strong>Trades after 21:00 SAST</strong><span>{compactCount(tradeItems.length)} events shown</span></div>
-            <div className="scanner-blocks audit-scroll">{tradeItems.length ? tradeItems.map((row, index) => <div className="scanner-block" key={row.event + "-" + row.ts + "-" + index}><strong>{row.symbol || "MT5"} <span>TRADE</span></strong><span>{row.event} - {row.reason || row.raw_status || "recorded"}</span><em>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</em></div>) : <div className="empty-state">No trade events in the window.</div>}</div>
-            <div className="scanner-section-title"><strong>Blocks and no-trade reasons</strong><span>{compactCount((audit?.blocks || []).length)} recorded</span></div>
-            <div className="scanner-blocks audit-scroll">{blockItems.length ? blockItems.map((row, index) => <div className="scanner-block" key={row.event + "-" + row.ts + "-" + index}><strong>{row.symbol || "MT5"} <span>{row.reason_group || row.event}</span></strong><span>{row.reason || row.event}</span><em>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</em></div>) : <div className="empty-state">No block events in the window.</div>}</div>
+            <div className="reason-summary-grid">{reasonCounts.length ? reasonCounts.slice(0, 8).map((row) => <div className="reason-summary-row" key={row.reason}><strong>{row.reason.replaceAll("_", " ")}</strong><span>{compactCount(row.count)}</span></div>) : <div className="empty-state">No recorded blocks.</div>}</div>
+            <div className="scanner-section-title"><strong>Trade Events</strong><span>Since 21:00 SAST · {compactCount(tradeItems.length)} shown</span></div>
+            <div className="scanner-event-list">{tradeItems.length ? tradeItems.map((row, index) => <div className="scanner-event-row" key={row.event + "-" + row.ts + "-" + index}><div><strong>{row.symbol || "MT5"}</strong><span>{row.event}</span><time>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</time></div><p>{row.reason || row.raw_status || "Recorded trade event"}</p></div>) : <div className="empty-state">No trade events in the window.</div>}</div>
+            <div className="scanner-section-title"><strong>Latest No-Trade Detail</strong><span>{compactCount((audit?.blocks || []).length)} total</span></div>
+            <div className="scanner-event-list">{blockItems.length ? blockItems.map((row, index) => <div className="scanner-event-row" key={row.event + "-" + row.ts + "-" + index}><div><strong>{row.symbol || "MT5"}</strong><span>{(row.reason_group || row.event || "AUDIT").replaceAll("_", " ")}</span><time>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</time></div><p>{row.reason || row.event}</p></div>) : <div className="empty-state">No block events in the window.</div>}</div>
           </div>
         </div>
       </div>
@@ -1190,10 +1193,10 @@ export function TradingDashboard() {
   function renderMarketHoursWorkspace() {
     const market = marketHours || audit?.market || {};
     const sessions = market.sessions || [];
+    const anyMarketOpen = market.global_status === "OPEN";
     return (
       <div className="market-hours-workspace">
-        <div className="workspace-header"><div><h3>Market Hours</h3><span>Live session status - SAST</span></div><div className={"market-hours-state " + (market.weekend_closed ? "closed" : "open")}><span className="market-status-dot" />{market.weekend_closed ? "WEEKEND CLOSED" : ((market.global_status || "CLOSED") + " NOW")}</div></div>
-        <div className={"market-closed-banner " + (market.weekend_closed ? "closed" : "open")}><Clock3 size={18} /><div><strong>{market.weekend_closed ? "MARKETS CLOSED - WEEKEND" : "MARKET SESSION STATUS"}</strong><span>{market.weekend_closed ? "No new MT5 trades are expected until the broker reopens. This is the current block reason." : "Session status is calculated from local exchange hours and the VPS clock."}</span></div><b>{market.global_reason || "LIVE"}</b></div>
+        <div className="workspace-header"><div><h3>Market Hours</h3><span>Live session status - SAST</span></div><div className={"market-hours-state " + (anyMarketOpen ? "open" : "closed")}><span className="market-status-dot" />{anyMarketOpen ? "MARKETS OPEN" : "MARKETS CLOSED"}</div></div>
         <div className="market-session-grid">{sessions.map((session) => <div className={"market-session-row " + (session.open ? "open" : "closed")} key={session.id}><span className="market-status-dot" /><div><strong>{session.label}</strong><em>{session.region}</em></div><span className="market-session-hours">{session.hours_sast}</span><span className="market-session-status">{session.open ? "OPEN" : "CLOSED"}<small>{session.open ? "live" : session.reason}</small></span><span className="market-next-open">Next: {session.next_open_sast}</span></div>)}</div>
         <div className="market-hours-foot">Current VPS time: {formatDateTimeLabel(market.now_sast)} - Schedule adjusts for regional daylight time and is displayed in SAST.</div>
       </div>

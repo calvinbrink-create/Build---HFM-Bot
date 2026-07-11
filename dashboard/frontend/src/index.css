@@ -2614,3 +2614,232 @@ button {
   .scan-detail-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 .audit-scroll { max-height: 340px; overflow-y: auto; padding-right: 3px; }
+/* Compact scanner presentation */
+.scanner-workspace {
+  gap: 8px;
+  padding: 12px;
+}
+
+.scanner-session-strip {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+
+.scanner-session {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  min-height: 38px;
+  padding: 7px 9px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(14, 18, 24, .88);
+}
+
+.scanner-session div {
+  min-width: 0;
+}
+
+.scanner-session strong,
+.scanner-session em {
+  display: block;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.scanner-session strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.scanner-session em {
+  margin-top: 2px;
+  color: #ff7b88;
+  font-size: 9px;
+  font-style: normal;
+  font-weight: 700;
+}
+
+.scanner-session.open {
+  border-color: rgba(67, 209, 125, .28);
+  background: rgba(67, 209, 125, .05);
+}
+
+.scanner-session.open .market-status-dot {
+  background: #43d17d;
+  box-shadow: 0 0 0 3px rgba(67, 209, 125, .12);
+}
+
+.scanner-session.open em {
+  color: #80e5a0;
+}
+
+.scanner-metrics {
+  gap: 6px;
+}
+
+.scanner-card {
+  min-height: 68px;
+  padding: 8px 9px;
+  border-radius: 6px;
+}
+
+.scanner-card strong {
+  margin: 3px 0 1px;
+  font-size: 15px;
+}
+
+.score-model-card strong {
+  min-height: 28px;
+  overflow: visible;
+  white-space: normal;
+  font-size: 12px;
+  line-height: 1.2;
+}
+
+.scanner-split {
+  grid-template-columns: minmax(0, 1.2fr) minmax(330px, .8fr);
+  gap: 10px;
+}
+
+.scanner-list,
+.scanner-side {
+  gap: 7px;
+}
+
+.scanner-side {
+  overflow-y: auto;
+  padding-right: 3px;
+}
+
+.scanner-section-title {
+  min-height: 24px;
+}
+
+.reason-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.reason-summary-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(15, 18, 24, .78);
+}
+
+.reason-summary-row strong {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  font-weight: 600;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.reason-summary-row span {
+  flex: 0 0 auto;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+}
+
+.scanner-event-list {
+  display: flex;
+  flex: 0 0 auto;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.scanner-event-row {
+  min-width: 0;
+  padding: 7px 8px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: rgba(15, 18, 24, .72);
+}
+
+.scanner-event-row > div {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 7px;
+}
+
+.scanner-event-row strong {
+  color: var(--text);
+  font-size: 11px;
+}
+
+.scanner-event-row span,
+.scanner-event-row time {
+  overflow: hidden;
+  color: var(--muted);
+  font-size: 9px;
+  text-overflow: ellipsis;
+  text-transform: capitalize;
+  white-space: nowrap;
+}
+
+.scanner-event-row time {
+  text-align: right;
+  text-transform: none;
+}
+
+.scanner-event-row p {
+  margin: 3px 0 0;
+  overflow: hidden;
+  color: #aeb7c5;
+  font-size: 10px;
+  line-height: 1.3;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mobile-scanner .scanner-session-strip {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mobile-scanner .scanner-session {
+  min-height: 42px;
+}
+
+.mobile-scanner .scanner-card {
+  min-height: 72px;
+}
+
+.mobile-scanner .scanner-side {
+  gap: 8px;
+  overflow: visible;
+  padding-right: 0;
+}
+
+.mobile-scanner .reason-summary-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.mobile-scanner .scanner-section-title {
+  flex-direction: row;
+  align-items: center;
+}
+
+.mobile-scanner .scanner-event-row p {
+  white-space: normal;
+}
+
+@media (max-width: 380px) {
+  .mobile-scanner .scanner-session-strip,
+  .mobile-scanner .reason-summary-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
