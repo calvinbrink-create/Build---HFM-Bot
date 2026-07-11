@@ -23,6 +23,10 @@ mkdir -p "$BRIDGE_DIR/commands" "$BRIDGE_DIR/results"
 MT5_HOME="${MT5_PREFIX}/drive_c/Program Files/MetaTrader 5"
 CHARTS_DIR="${MT5_HOME}/MQL5/Profiles/Charts"
 BRIDGE_PROFILE_DIR="${CHARTS_DIR}/${BRIDGE_PROFILE}"
+EXPERTS_DIR="${MT5_HOME}/MQL5/Experts"
+BRIDGE_SOURCE="${EXPERTS_DIR}/CipherFxBridge.mq5"
+BRIDGE_BINARY="${EXPERTS_DIR}/CipherFxBridge.ex5"
+BRIDGE_COMPILE_LOG="${EXPERTS_DIR}/CipherFxBridge.log"
 mkdir -p "$BRIDGE_PROFILE_DIR"
 # Keep the bridge profile empty so the startup Expert can always open its chart.
 # The old Default profile can accumulate enough charts to hit MT5's open-chart limit.
@@ -40,7 +44,11 @@ if [ "$MT5_FORCE_LOGIN" = "1" ]; then
 fi
 
 if [ -f "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" ]; then
-  cp "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$(dirname "$BRIDGE_DIR")/../Experts/CipherFxBridge.mq5"
+  install -m 0644 "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"
+fi
+if [ ! -s "$BRIDGE_SOURCE" ] || ! cmp -s "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"; then
+  echo "ERROR: deployed MQL source does not match the authoritative source" >&2
+  exit 69
 fi
 
 cat >"$STARTUP_INI" <<EOF
@@ -66,6 +74,7 @@ Expert=CipherFxBridge.ex5
 Symbol=${STARTUP_SYMBOL}
 Period=M15
 EOF
+chmod 0600 "$STARTUP_INI"
 
 if ! pgrep -f "Xvfb ${DISPLAY_NUM}" >/dev/null 2>&1; then
   nohup Xvfb "${DISPLAY_NUM}" -screen 0 1440x900x24 >"$CACHE_DIR/xvfb.log" 2>&1 &
@@ -75,11 +84,36 @@ fi
 export DISPLAY="${DISPLAY_NUM}"
 export WINEPREFIX="${MT5_PREFIX}"
 
+compile_started_epoch="$(date +%s)"
+rm -f "$BRIDGE_COMPILE_LOG"
+set +e
 (
   cd "$MT5_HOME"
   wine "$MT5_HOME/MetaEditor64.exe" /compile:"MQL5\\Experts\\CipherFxBridge.mq5" /log
-) >"$CACHE_DIR/mt5-compile.log" 2>&1 || true
-sleep 8
+) >"$CACHE_DIR/mt5-compile.log" 2>&1
+compile_rc=$?
+set -e
+sleep 2
+
+if [ "$compile_rc" -ne 0 ]; then
+  echo "ERROR: MetaEditor exited with status $compile_rc" >&2
+  exit 70
+fi
+if [ ! -s "$BRIDGE_COMPILE_LOG" ]; then
+  echo "ERROR: MQL compiler did not create its result log: $BRIDGE_COMPILE_LOG" >&2
+  exit 71
+fi
+compile_summary="$(iconv -f UTF-16LE -t UTF-8 "$BRIDGE_COMPILE_LOG")"
+if ! grep -Fq "Result: 0 errors, 0 warnings" <<<"$compile_summary"; then
+  echo "ERROR: MQL compile log does not prove a clean build: $BRIDGE_COMPILE_LOG" >&2
+  printf '%s\n' "$compile_summary" >&2
+  exit 71
+fi
+if [ ! -s "$BRIDGE_BINARY" ] || [ "$(stat -c %Y "$BRIDGE_BINARY")" -lt "$compile_started_epoch" ]; then
+  echo "ERROR: compiled EX5 is missing, empty, or stale: $BRIDGE_BINARY" >&2
+  exit 72
+fi
+echo "MQL_COMPILE_OK ex5_sha256=$(sha256sum "$BRIDGE_BINARY" | awk '{print $1}')"
 
 while IFS= read -r pid; do
   [ -n "$pid" ] || continue
