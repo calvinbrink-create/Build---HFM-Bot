@@ -26,6 +26,7 @@
 /dashboard/frontend/node_modules/
 /dashboard/frontend/.next/
 /dashboard/frontend/dist/
+/dashboard/frontend/node_modules
 /dashboard/*.tgz
 /"/
 *.env
