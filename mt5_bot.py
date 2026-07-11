@@ -16,15 +16,16 @@ import pandas as pd
 from dashboard.backend import state_store as _ss
 from mt5_xm_config import MT5RuntimeConfig
 from mt5_xm_gateway import MT5Gateway, MT5PositionView, MT5SymbolSpec
-from scalping_bot_v4 import (
+from mt5_shared_utils import (
+    ACTIVE_PROBABILITY_STRATEGIES,
     CFG,
     _compute_stop_distance,
     _global_trading_enabled,
     _gross_pnl_usd,
     _rr_for_market,
     _score_details_from_signal,
-    evaluate_probability,
     execution_ok,
+    get_usdzar,
     in_trade_window,
 )
 
@@ -62,18 +63,6 @@ try:
     import mt5_systematic_engine as _mt5_systematic_engine
 except Exception:
     _mt5_systematic_engine = None
-
-try:
-    from scalping_bot_v4 import ACTIVE_PROBABILITY_STRATEGIES  # type: ignore
-except Exception:
-    ACTIVE_PROBABILITY_STRATEGIES = {"MOMENTUM", "PULLBACK", "MEAN_REV", "BB_SQUEEZE"}
-
-try:
-    from scalping_bot_v4 import get_usdzar  # type: ignore
-except Exception:
-    def get_usdzar() -> float:
-        return float(getattr(CFG, "usd_to_zar", 18.0))
-
 
 GROUP_MARKET = {
     "forex": "forex",
@@ -489,12 +478,7 @@ def _trigger_points(trigger_name, points):
 
 
 def _legacy_probability_score(symbol, market, m5):
-    try:
-        sig = evaluate_probability(m5, sym=symbol, market=market)
-        if isinstance(sig, dict):
-            return float(sig.get("score") or 0.0), sig
-    except Exception:
-        pass
+    # The legacy probability engine is retired from the live MT5 build.
     return 0.0, {}
 
 
@@ -1354,6 +1338,10 @@ class SymbolHealthManager:
 
 class XM_MT5_Bot:
     def __init__(self, runtime: MT5RuntimeConfig):
+        if _strategy_v1 is None or not callable(getattr(_strategy_v1, "evaluate", None)):
+            raise RuntimeError("replacement strategy engine unavailable; refusing legacy fallback")
+        if not _env_bool("MT5_REPLACEMENT_STRATEGY_V1_LIVE", True):
+            raise RuntimeError("MT5_REPLACEMENT_STRATEGY_V1_LIVE must remain enabled; legacy fallback is retired")
         self.runtime = runtime
         self._stop_requested = False
         self.gateway = MT5Gateway(runtime)
@@ -6544,9 +6532,11 @@ class XM_MT5_Bot:
             _ss.upsert_candles(canonical, m5.tail(120))
         except Exception:
             pass
-        if _env_bool("MT5_REPLACEMENT_STRATEGY_V1_LIVE", False):
-            if self._scan_symbol_replacement_v1(canonical, group, market, strategy_equity, cfg, h4, h1, m15, m5, m1):
-                return
+        if self._scan_symbol_replacement_v1(canonical, group, market, strategy_equity, cfg, h4, h1, m15, m5, m1):
+            return
+        raise RuntimeError(
+            f"replacement strategy has no route for {canonical}/{cfg.get('asset_class')}; legacy fallback is retired"
+        )
         if m5 is None or len(m5) == 0:
             reason = "no M5 bars"
             trace_stub = {"decision_trace_id": self._new_decision_trace_id(canonical), "_decision_trace": [], "generated_at": datetime.utcnow().isoformat(), "source_loop_name": source_loop_name, "ruleset_version": RULESET_VERSION, "build_id": BUILD_ID, "scanner_process_started_at": self.scanner_process_started_at, "state": BLOCKED, "final_status": BLOCKED, "direction_source": f"{engine}_M5_TRIGGER" if engine else "NO_ENGINE", "evaluate_probability_master_gate": False, "row_source": "current", "conditions": {"group": group, "hard_pre_pending_blocker": "no bars"}}
