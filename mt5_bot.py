@@ -733,12 +733,15 @@ def valid_1m_confirmation(df1, direction, engine):
 
 
 def tick_execution_check(symbol, engine, bid, ask, signal_price, atr_price, score):
-    if engine == FOREX_ENGINE:
+    engine_key = str(engine or "").upper()
+    if engine_key == FOREX_ENGINE or engine_key.startswith("FOREX_"):
         ok, adjusted, reason, meta = forex_spread_gate(symbol, bid, ask, atr_price, score)
-    elif engine == INDEX_ENGINE:
+    elif engine_key == INDEX_ENGINE or engine_key.startswith("INDEX_"):
         ok, adjusted, reason, meta = index_spread_gate(symbol, bid, ask, atr_price, score)
-    else:
+    elif engine_key == METALS_ENGINE or engine_key.startswith(("METAL_", "METALS_")):
         ok, adjusted, reason, meta = metals_spread_gate(symbol, bid, ask, atr_price, score)
+    else:
+        return False, f"unknown engine at tick execution: {engine or '<missing>'}", {"engine": engine_key}
     mid = (float(bid) + float(ask)) / 2.0 if float(bid) > 0 and float(ask) > 0 else 0.0
     slippage_atr = abs(mid - float(signal_price or mid)) / float(atr_price) if mid > 0 and float(atr_price or 0.0) > 0 else 0.0
     meta.update({"mid": mid, "adjusted_score": adjusted, "slippage_atr": slippage_atr})
@@ -926,11 +929,17 @@ class CostModel:
         contract_size = float(spec.get("contract_size") or 1.0) if isinstance(spec, dict) else 1.0
         commission_per_lot = _env_float("MT5_COMMISSION_PER_LOT_USD", 0.0, lo=0.0)
         volume = max(float(volume or 0.0), 0.0)
-        spread_cost = abs(spread_price) * contract_size * volume
-        slippage_estimate = abs(spread_price) * 0.5 * contract_size * volume
-        commission_estimate = commission_per_lot * volume
         target_distance = abs(float(tp or 0.0) - price)
-        target_value = target_distance * contract_size * volume
+        broker_profit_per_lot = float((risk_meta or {}).get("profit_per_lot") or 0.0)
+        target_value = broker_profit_per_lot * volume
+        calculation_source = "broker_geometry"
+        if target_value <= 0:
+            target_value = target_distance * contract_size * volume
+            calculation_source = "contract_fallback"
+        spread_ratio = abs(spread_price) / target_distance if target_distance > 0 else 999.0
+        spread_cost = target_value * spread_ratio if target_value > 0 else 0.0
+        slippage_estimate = target_value * spread_ratio * 0.5 if target_value > 0 else 0.0
+        commission_estimate = commission_per_lot * volume
         total_cost = spread_cost + slippage_estimate + commission_estimate
         cost_to_target = total_cost / target_value if target_value > 0 else 999.0
         strict_threshold = _env_float("MT5_COST_TO_TARGET_BLOCK", 0.30, lo=0.0, hi=2.0)
@@ -984,6 +993,7 @@ class CostModel:
         details = {
             "stage": stage_name,
             "cost_to_target_stage": cost_stage,
+            "calculation_source": calculation_source,
             "spread_cost": round(spread_cost, 6),
             "slippage_estimate": round(slippage_estimate, 6),
             "commission_estimate": round(commission_estimate, 6),
@@ -1021,7 +1031,7 @@ class CostModel:
                 "reason": reason,
             })
             _ss.set_status("last_cost_to_target_block", f"{symbol}: {reason}")
-        return decision not in {"block", "quality_filter"}, reason, adjusted, details
+        return decision != "block", reason, adjusted, details
 
 
 class AggressiveSizingEngine:
@@ -1073,10 +1083,11 @@ class AggressiveSizingEngine:
             return 0.0
         return max(0.0, float(projected))
 
-    def _margin_lot_cap(self, spec: MT5SymbolSpec, price: float, direction: str) -> tuple[float, dict]:
+    def _margin_lot_cap(self, spec: MT5SymbolSpec, price: float, direction: str, margin_per_lot: float | None = None) -> tuple[float, dict]:
         try:
             acct = self.bot.gateway.account_info()
-            margin_per_lot = self.bot.gateway.order_calc_margin(spec.symbol, direction, 1.0, price)
+            if margin_per_lot is None:
+                margin_per_lot = self.bot.gateway.order_calc_margin(spec.symbol, direction, 1.0, price)
         except Exception as exc:
             return 0.0, {"margin_error": str(exc)[:160], "source": "OrderCalcMargin"}
         free_margin = float(getattr(acct, "free_margin", 0.0) or 0.0)
@@ -1094,7 +1105,7 @@ class AggressiveSizingEngine:
             return base_volume, {"enabled": False, "reason": "aggressive scalp mode inactive"}
         target_profit = self.target_profit_usd(canonical, sig)
         direction = str((sig or {}).get("direction") or "").upper()
-        profit_per_lot = self._profit_per_lot_at_target(spec, price, tp, direction)
+        profit_per_lot = float(base_meta.get("profit_per_lot") or self._profit_per_lot_at_target(spec, price, tp, direction))
         if profit_per_lot <= 0:
             return 0.0, {"enabled": True, "reason": "broker target profit unavailable", "target_profit_usd": target_profit}
         required_lot = target_profit / profit_per_lot
@@ -1104,7 +1115,7 @@ class AggressiveSizingEngine:
         max_lot = self.bot._max_lot_for_symbol(canonical, market)
         if max_lot <= 0:
             max_lot = float(spec.volume_max or required_lot)
-        margin_cap, margin_meta = self._margin_lot_cap(spec, price, direction)
+        margin_cap, margin_meta = self._margin_lot_cap(spec, price, direction, float(base_meta.get("margin_per_lot") or 0.0) or None)
         volume_cap = min(float(spec.volume_max or required_lot), max_lot, max_by_risk, margin_cap)
         base_margin_cap_volume = float(base_meta.get("volume_by_cap") or 0.0)
         if base_margin_cap_volume > 0:
@@ -3061,7 +3072,11 @@ class XM_MT5_Bot:
             "confirmation_detection_latency_ms": sig.get("confirmation_detection_latency_ms"),
             "total_setup_to_confirmation_ms": sig.get("total_setup_to_confirmation_ms"),
         })
-        exhaustion_ok, exhaustion_reason, exhaustion_meta = self._index_exhaustion_allows_entry(canonical, market, sig)
+        if bool(sig.get("replacement_strategy_v1")):
+            exhaustion_ok, exhaustion_reason = True, "replacement exhaustion qualified before SETUP_CREATED"
+            exhaustion_meta = dict((sig.get("_mt5_thresholds") or {}).get("index_exhaustion_pre_setup") or {})
+        else:
+            exhaustion_ok, exhaustion_reason, exhaustion_meta = self._index_exhaustion_allows_entry(canonical, market, sig)
         if not exhaustion_ok:
             reason = f"NOT_QUALIFIED index exhaustion {exhaustion_reason}"
             self._mark_not_qualified(sig, reason, "EXHAUSTION_QUALITY")
@@ -5835,7 +5850,11 @@ class XM_MT5_Bot:
             profile_ok, profile_reason = self._symbol_profile_gate_allows_entry(canonical, market, sig)
         if not profile_ok:
             return finish(False, f"NOT_QUALIFIED profile gate {profile_reason}")
-        exhaustion_ok, exhaustion_reason, exhaustion_meta = self._index_exhaustion_allows_entry(canonical, market, sig)
+        if bool((sig or {}).get("replacement_strategy_v1") or ((sig or {}).get("pending_setup") or {}).get("replacement_strategy_v1")):
+            exhaustion_ok, exhaustion_reason = True, "replacement exhaustion qualified before SETUP_CREATED"
+            exhaustion_meta = dict((sig.get("_mt5_thresholds") or {}).get("index_exhaustion_pre_setup") or {})
+        else:
+            exhaustion_ok, exhaustion_reason, exhaustion_meta = self._index_exhaustion_allows_entry(canonical, market, sig)
         if not exhaustion_ok:
             sig.setdefault("_mt5_thresholds", {})["index_exhaustion"] = exhaustion_meta
             return finish(False, f"NOT_QUALIFIED index exhaustion {exhaustion_reason}")
@@ -6299,9 +6318,16 @@ class XM_MT5_Bot:
         if asset_class and not sig.get("asset_class"):
             sig["asset_class"] = asset_class
 
+        engine_key = engine.upper()
+        spread_engine = (
+            _mt5_strategy_engines.FOREX_ENGINE if engine_key.startswith("FOREX_")
+            else _mt5_strategy_engines.INDEX_ENGINE if engine_key.startswith("INDEX_")
+            else _mt5_strategy_engines.METALS_ENGINE if engine_key.startswith(("METAL_", "METALS_"))
+            else engine
+        ) if _mt5_strategy_engines is not None else engine
         if (
             _mt5_strategy_engines is not None
-            and engine in {
+            and spread_engine in {
                 _mt5_strategy_engines.FOREX_ENGINE,
                 _mt5_strategy_engines.INDEX_ENGINE,
                 _mt5_strategy_engines.METALS_ENGINE,
@@ -6310,7 +6336,7 @@ class XM_MT5_Bot:
             score_before = float(sig.get("score") or 0.0)
             spread_ok, adjusted_score, spread_reason, spread_meta = _mt5_strategy_engines.spread_gate_for_engine(
                 canonical,
-                engine,
+                spread_engine,
                 bid,
                 ask,
                 atr,
@@ -6349,20 +6375,20 @@ class XM_MT5_Bot:
             conditions["MT5 spread gate"] = str(spread_meta.get("decision") or "")
             conditions["MT5 spread/ATR"] = bool(spread_ok)
             conditions["MT5 spread/ATR ratio"] = round(spread_atr, 4)
-            if engine == _mt5_strategy_engines.FOREX_ENGINE:
+            if spread_engine == _mt5_strategy_engines.FOREX_ENGINE:
                 conditions["MT5 spread pips"] = round(float(spread_meta.get("spread_pips") or 0.0), 2)
                 conditions["MT5 max spread pips"] = round(float(spread_meta.get("max_spread_pips") or 0.0), 2)
             else:
                 conditions["MT5 spread points"] = round(float(spread_meta.get("spread_points") or 0.0), 2)
                 conditions["MT5 max spread points"] = round(float(spread_meta.get("max_spread_points") or 0.0), 2)
             conditions["MT5 spread/ATR limit"] = round(float(spread_meta.get("max_spread_atr_ratio") or 0.0), 4)
-            if adjusted_score != score_before:
+            if adjusted_score != score_before and not bool(sig.get("replacement_strategy_v1")):
                 sig["score_before_spread"] = score_before
                 sig["score"] = float(adjusted_score)
                 sig["score_after_spread"] = float(adjusted_score)
                 conditions["MT5 spread score penalty"] = f"{score_before:.0f}->{adjusted_score:.0f}"
             min_score = float(sig.get("min_score") or 0.0)
-            if spread_ok and min_score > 0 and adjusted_score < min_score:
+            if spread_ok and min_score > 0 and adjusted_score < min_score and not bool(sig.get("replacement_strategy_v1")):
                 spread_ok = False
                 spread_meta["decision"] = "block_after_soft_penalty"
                 spread_snapshot["decision"] = "block_after_soft_penalty"
@@ -6530,6 +6556,16 @@ class XM_MT5_Bot:
         price = float(sig.get("price") or 0.0)
         spread_snapshot = dict(sig.get("_mt5_spread_signal") or {})
         spread_price = float(spread_snapshot.get("spread") or sig.get("spread_signal") or 0.0)
+        if bool(sig.get("replacement_strategy_v1")):
+            self._audit_decision({
+                "event": "CENTRAL_COST_MODEL_AUTHORITATIVE",
+                "decision": "PASS",
+                "symbol": self._canonical_from_resolved(sym),
+                "market": market,
+                "reason": "replacement pipeline uses broker-aware central CostModel; duplicate systematic cost veto skipped",
+            })
+            return True, "central broker-aware cost model authoritative"
+
         spec = (risk_meta or {}).get("spec") or {}
         contract_size = float(spec.get("contract_size") or 1.0) if isinstance(spec, dict) else 1.0
         planned_risk = float((risk_meta or {}).get("planned_risk") or 0.0)
@@ -7018,6 +7054,47 @@ class XM_MT5_Bot:
                 flush=True,
             )
             return True
+        spread_ok, spread_reason = self._spread_allows_entry(canonical, market, sig, price, atr_value)
+        if not spread_ok:
+            reason = f"STRATEGY_V1_NOT_QUALIFIED spread {spread_reason}"
+            self._mark_not_qualified(sig, reason, "STRATEGY_V1_PRE_SETUP_SAFETY")
+            self._upsert_signal(canonical, market, sig, price, atr_value, reason, False, details, group)
+            self.analytics_engine.record("NOT_QUALIFIED", canonical, sig["engine"], sig["strategy"], sig["score"], reason, sig)
+            return True
+        pre_sl = price - decision.stop_distance if decision.side == "BUY" else price + decision.stop_distance
+        pre_tp = price + decision.target_distance if decision.side == "BUY" else price - decision.target_distance
+        cost_ok, cost_reason, adjusted_score, cost_details = self.cost_model.check(
+            canonical, market, sig, 1.0, pre_sl, pre_tp, {}, stage="scan"
+        )
+        sig["score"] = float(adjusted_score)
+        sig["score_after"] = float(adjusted_score)
+        if not cost_ok:
+            reason = f"STRATEGY_V1_NOT_QUALIFIED {cost_reason}"
+            self._mark_not_qualified(sig, reason, "STRATEGY_V1_PRE_SETUP_SAFETY")
+            self._upsert_signal(canonical, market, sig, price, atr_value, reason, False, details, group)
+            self.analytics_engine.record("NOT_QUALIFIED", canonical, sig["engine"], sig["strategy"], sig["score"], reason, sig)
+            self._audit_decision({
+                "event": "EXTREME_COST_NOT_QUALIFIED", "decision": "NOT_QUALIFIED",
+                "symbol": canonical, "side": decision.side, "reason": cost_reason,
+                "stage": "PRE_SETUP", "details": cost_details,
+            })
+            return True
+
+        if asset == "index":
+            exhaustion_ok, exhaustion_reason, exhaustion_meta = self._index_exhaustion_allows_entry(canonical, market, sig)
+            sig.setdefault("_mt5_thresholds", {})["index_exhaustion_pre_setup"] = exhaustion_meta
+            if not exhaustion_ok:
+                reason = f"STRATEGY_V1_NOT_QUALIFIED index exhaustion {exhaustion_reason}"
+                self._mark_not_qualified(sig, reason, "STRATEGY_V1_PRE_SETUP_QUALITY")
+                self._upsert_signal(canonical, market, sig, price, atr_value, reason, False, details, group)
+                self.analytics_engine.record("NOT_QUALIFIED", canonical, sig["engine"], sig["strategy"], sig["score"], reason, sig)
+                self._audit_decision({
+                    "event": "INDEX_EXHAUSTION_NOT_QUALIFIED", "decision": "NOT_QUALIFIED",
+                    "symbol": canonical, "side": decision.side, "reason": exhaustion_reason,
+                    "stage": "PRE_SETUP", "details": exhaustion_meta,
+                })
+                return True
+
         sig["final_status"] = PENDING
         sig["state"] = PENDING
         created, reason = self.create_pending_setup(canonical, str(decision.side), sig["engine"], sig["strategy"], decision.score, sig)
@@ -7870,17 +7947,28 @@ class XM_MT5_Bot:
         if two_engine_risk_usd is not None and two_engine_risk_usd > 0:
             risk_budget = min(risk_budget, float(two_engine_risk_usd))
             sig.setdefault("_mt5_thresholds", {}).setdefault("risk", {})["two_engine_risk_usd"] = round(float(two_engine_risk_usd), 2)
-        loss_per_lot = self._loss_per_lot(spec, price, stop_d, str(sig.get("direction") or "").upper())
-        if loss_per_lot <= 0:
-            return 0.0, "SIZE BLOCK: broker tick value unavailable", {"spec": spec.__dict__}
-        volume_by_risk = risk_budget / loss_per_lot
         direction = str(sig.get("direction") or "").upper()
+        configured_rr = (get_symbol_config(canonical) or {}).get("tp_r")
+        rr = self._entry_rr_for_symbol(canonical, market, sig, configured_rr=configured_rr)
+        stop_price = price - stop_d if direction == "BUY" else price + stop_d
+        target_price = price + stop_d * rr if direction == "BUY" else price - stop_d * rr
         try:
-            margin_per_lot = self.gateway.order_calc_margin(spec.symbol, direction, 1.0, price)
+            per_lot_geometry = self.gateway.order_calc_trade_geometry(
+                spec.symbol, direction, 1.0, price, stop_price, target_price
+            )
+            loss_per_lot = float(per_lot_geometry.get("sl_loss_usd") or 0.0)
+            profit_per_lot = float(per_lot_geometry.get("tp_profit_usd") or 0.0)
+            margin_per_lot = float(per_lot_geometry.get("margin_usd") or 0.0)
             acct = self.gateway.account_info()
             free_margin = float(getattr(acct, "free_margin", 0.0) or 0.0)
         except Exception as exc:
-            return 0.0, f"SIZE BLOCK: broker margin calculation unavailable: {str(exc)[:140]}", {"spec": spec.__dict__}
+            return 0.0, f"SIZE BLOCK: broker geometry unavailable: {str(exc)[:140]}", {"spec": spec.__dict__}
+        if loss_per_lot <= 0 or profit_per_lot <= 0 or margin_per_lot <= 0:
+            return 0.0, f"SIZE BLOCK: invalid broker geometry {per_lot_geometry}", {"spec": spec.__dict__}
+        sig["_broker_geometry_per_lot"] = {
+            **per_lot_geometry, "entry": price, "sl": stop_price, "tp": target_price, "rr": rr,
+        }
+        volume_by_risk = risk_budget / loss_per_lot
         margin_fraction = _env_float("MT5_MAX_MARGIN_FRACTION", 0.80, lo=0.10, hi=0.95)
         volume_by_margin = (free_margin * margin_fraction / margin_per_lot) if free_margin > 0 and margin_per_lot > 0 else 0.0
         volume_by_cap = volume_by_margin
@@ -7919,13 +8007,14 @@ class XM_MT5_Bot:
                 )
         aggressive_details = {}
         if self._aggressive_scalp_effective():
-            sl = price - stop_d if str(sig.get("direction") or "").upper() == "BUY" else price + stop_d
-            rr = self._entry_rr_for_symbol(canonical, market, sig, configured_rr=(get_symbol_config(canonical) or {}).get("tp_r"))
-            tp = price + (stop_d * rr) if str(sig.get("direction") or "").upper() == "BUY" else price - (stop_d * rr)
+            sl = stop_price
+            tp = target_price
             volume, aggressive_details = self.aggressive_sizing_engine.plan(canonical, market, sig, spec, price, sl, tp, strategy_equity, volume, {
                 "risk_budget": risk_budget,
                 "risk_pct": risk_pct,
                 "loss_per_lot": loss_per_lot,
+                "profit_per_lot": profit_per_lot,
+                "margin_per_lot": margin_per_lot,
                 "volume_by_risk": volume_by_risk,
                 "margin_fraction": margin_fraction,
                 "volume_by_cap": volume_by_cap,
@@ -7971,6 +8060,7 @@ class XM_MT5_Bot:
                 "risk_pct": risk_pct,
                 "loss_per_lot": loss_per_lot,
                 "volume_by_risk": volume_by_risk,
+                "profit_per_lot": profit_per_lot,
                 "margin_fraction": margin_fraction,
                 "volume_by_cap": volume_by_cap,
                 "max_lot": max_lot,
