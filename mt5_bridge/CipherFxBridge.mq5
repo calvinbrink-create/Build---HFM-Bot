@@ -916,6 +916,8 @@ void ProcessSingleCommand(string file_name)
    string ticket = "";
    string volume = "";
    string price = "";
+   string open_price = "";
+   string close_price = "";
    string sl = "";
    string tp = "";
    string comment = "";
@@ -939,6 +941,8 @@ void ProcessSingleCommand(string file_name)
       else if(key == "ticket") ticket = value;
       else if(key == "volume") volume = value;
       else if(key == "price") price = value;
+      else if(key == "open_price") open_price = value;
+      else if(key == "close_price") close_price = value;
       else if(key == "sl") sl = value;
       else if(key == "tp") tp = value;
       else if(key == "comment") comment = value;
@@ -953,6 +957,8 @@ void ProcessSingleCommand(string file_name)
    ulong order_ticket = 0;
    ulong deal_ticket = 0;
    double fill_price = 0.0;
+   double calc_value = 0.0;
+   string calc_name = "";
 
    if(action == "OPEN")
       ok = ExecuteOpen(symbol, direction, volume, sl, tp, comment, magic, order_ticket, deal_ticket, fill_price, message);
@@ -966,10 +972,20 @@ void ProcessSingleCommand(string file_name)
       ok = ExecuteCancelOrder(ticket, magic, order_ticket, deal_ticket, fill_price, message);
    else if(action == "SYMBOL_ENABLE")
       ok = ExecuteSymbolToggle(symbol, enabled, message);
+   else if(action == "ORDER_CALC_PROFIT")
+   {
+      calc_name = "profit";
+      ok = ExecuteOrderCalcProfit(symbol, direction, volume, open_price, close_price, calc_value, message);
+   }
+   else if(action == "ORDER_CALC_MARGIN")
+   {
+      calc_name = "margin";
+      ok = ExecuteOrderCalcMargin(symbol, direction, volume, open_price, calc_value, message);
+   }
    else
       message = "Unsupported action: " + action;
 
-   WriteResult(request_id, ok, message, order_ticket, deal_ticket, fill_price);
+   WriteResult(request_id, ok, message, order_ticket, deal_ticket, fill_price, calc_name, calc_value);
    FileDelete(COMMANDS_DIR + "\\" + file_name);
 }
 
@@ -1315,6 +1331,69 @@ bool ExecuteCancelOrder(string ticket, string magic, ulong &order_ticket, ulong 
    return true;
 }
 
+bool ExecuteOrderCalcProfit(string symbol, string direction, string volume, string open_price, string close_price, double &value, string &message)
+{
+   if(!SymbolSelect(symbol, true))
+   {
+      message = "SymbolSelect failed for " + symbol;
+      return false;
+   }
+   string dir = Upper(direction);
+   if(dir != "BUY" && dir != "SELL")
+   {
+      message = "Unsupported direction: " + direction;
+      return false;
+   }
+   double lot = StringToDouble(volume);
+   double entry = StringToDouble(open_price);
+   double exit_price = StringToDouble(close_price);
+   if(lot <= 0.0 || entry <= 0.0 || exit_price <= 0.0)
+   {
+      message = "invalid ORDER_CALC_PROFIT geometry";
+      return false;
+   }
+   ENUM_ORDER_TYPE order_type = dir == "BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   ResetLastError();
+   if(!OrderCalcProfit(order_type, symbol, lot, entry, exit_price, value))
+   {
+      message = "OrderCalcProfit failed: " + IntegerToString(GetLastError());
+      return false;
+   }
+   message = "broker OrderCalcProfit";
+   return true;
+}
+
+bool ExecuteOrderCalcMargin(string symbol, string direction, string volume, string open_price, double &value, string &message)
+{
+   if(!SymbolSelect(symbol, true))
+   {
+      message = "SymbolSelect failed for " + symbol;
+      return false;
+   }
+   string dir = Upper(direction);
+   if(dir != "BUY" && dir != "SELL")
+   {
+      message = "Unsupported direction: " + direction;
+      return false;
+   }
+   double lot = StringToDouble(volume);
+   double entry = StringToDouble(open_price);
+   if(lot <= 0.0 || entry <= 0.0)
+   {
+      message = "invalid ORDER_CALC_MARGIN geometry";
+      return false;
+   }
+   ENUM_ORDER_TYPE order_type = dir == "BUY" ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   ResetLastError();
+   if(!OrderCalcMargin(order_type, symbol, lot, entry, value))
+   {
+      message = "OrderCalcMargin failed: " + IntegerToString(GetLastError());
+      return false;
+   }
+   message = "broker OrderCalcMargin";
+   return true;
+}
+
 bool ExecuteSymbolToggle(string symbol, string enabled, string &message)
 {
    bool visible = (enabled == "1");
@@ -1327,10 +1406,12 @@ bool ExecuteSymbolToggle(string symbol, string enabled, string &message)
    return true;
 }
 
-void WriteResult(string request_id, bool ok, string message, ulong order_ticket, ulong deal_ticket, double fill_price)
+void WriteResult(string request_id, bool ok, string message, ulong order_ticket, ulong deal_ticket, double fill_price, string calc_name, double calc_value)
 {
    if(request_id == "") return;
-   int handle = FileOpen(RESULTS_DIR + "\\result_" + request_id + ".txt", FILE_WRITE | FILE_TXT | FILE_ANSI);
+   string final_path = RESULTS_DIR + "\\result_" + request_id + ".txt";
+   string temp_path = final_path + ".tmp";
+   int handle = FileOpen(temp_path, FILE_WRITE | FILE_TXT | FILE_ANSI);
    if(handle == INVALID_HANDLE) return;
    FileWrite(handle, "status=" + (ok ? "OK" : "ERROR"));
    FileWrite(handle, "message=" + message);
@@ -1338,5 +1419,9 @@ void WriteResult(string request_id, bool ok, string message, ulong order_ticket,
    FileWrite(handle, "order=" + (string)order_ticket);
    FileWrite(handle, "deal=" + (string)deal_ticket);
    FileWrite(handle, "price=" + DoubleToString(fill_price, 8));
+   FileWrite(handle, "value_name=" + calc_name);
+   FileWrite(handle, "value=" + DoubleToString(calc_value, 8));
+   FileWrite(handle, "currency=" + AccountInfoString(ACCOUNT_CURRENCY));
    FileClose(handle);
+   AtomicReplaceFile(temp_path, final_path);
 }

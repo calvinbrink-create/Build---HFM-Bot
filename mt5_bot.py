@@ -1057,60 +1057,58 @@ class AggressiveSizingEngine:
             return _env_float("MT5_TIER_B_MIN_NET_PROFIT_USD", 8.0, lo=0.0)
         return _env_float("MT5_TIER_C_MIN_NET_PROFIT_USD", 5.0, lo=0.0)
 
-    def _profit_per_lot_at_target(self, spec: MT5SymbolSpec, entry: float, target: float) -> float:
-        move = abs(float(target or 0.0) - float(entry or 0.0))
-        if move <= 0:
+    def _profit_per_lot_at_target(self, spec: MT5SymbolSpec, entry: float, target: float, direction: str) -> float:
+        if float(entry or 0.0) <= 0 or float(target or 0.0) <= 0:
             return 0.0
-        tick_size = float(spec.tick_size or spec.point or 0.0)
-        tick_value = float(spec.tick_value_profit or spec.tick_value or spec.tick_value_loss or 0.0)
-        if tick_size > 0 and tick_value > 0:
-            return move / tick_size * tick_value
-        contract_size = float(spec.contract_size or 0.0)
-        if contract_size <= 0:
+        try:
+            projected = self.bot.gateway.order_calc_profit(spec.symbol, direction, 1.0, entry, target)
+        except Exception as exc:
+            self.bot._audit_decision({
+                "event": "BROKER_CALC_UNAVAILABLE",
+                "decision": "block",
+                "symbol": spec.symbol,
+                "calculation": "OrderCalcProfit",
+                "reason": str(exc)[:180],
+            })
             return 0.0
-        profit = move * contract_size
-        if str(spec.symbol or "").upper().endswith("JPY") and target > 0:
-            profit = profit / target
-        return profit
+        return max(0.0, float(projected))
 
-    def _margin_lot_cap(self, spec: MT5SymbolSpec, price: float) -> tuple[float, dict]:
+    def _margin_lot_cap(self, spec: MT5SymbolSpec, price: float, direction: str) -> tuple[float, dict]:
         try:
             acct = self.bot.gateway.account_info()
+            margin_per_lot = self.bot.gateway.order_calc_margin(spec.symbol, direction, 1.0, price)
         except Exception as exc:
-            return float(spec.volume_max or 0.0), {"margin_error": str(exc)[:160]}
+            return 0.0, {"margin_error": str(exc)[:160], "source": "OrderCalcMargin"}
         free_margin = float(getattr(acct, "free_margin", 0.0) or 0.0)
-        leverage = float(getattr(acct, "leverage", 0.0) or 0.0)
-        contract_size = float(spec.contract_size or 1.0)
-        notional_per_lot = max(float(price or 0.0) * contract_size, 0.0)
-        if free_margin <= 0 or leverage <= 0 or notional_per_lot <= 0:
-            return float(spec.volume_max or 0.0), {"free_margin": free_margin, "leverage": leverage, "margin_per_lot": 0.0}
-        margin_per_lot = notional_per_lot / leverage
+        if free_margin <= 0 or margin_per_lot <= 0:
+            return 0.0, {"free_margin": free_margin, "margin_per_lot": margin_per_lot, "source": "OrderCalcMargin"}
         max_fraction = _env_float("MT5_AGGRESSIVE_MAX_MARGIN_FRACTION", 0.35, lo=0.01, hi=0.95)
         reserve_fraction = _env_float("MT5_MARGIN_RESERVE_FRACTION", 0.20, lo=0.0, hi=0.95)
         usable_margin = max(0.0, free_margin * max_fraction - free_margin * reserve_fraction)
-        cap = usable_margin / margin_per_lot if margin_per_lot > 0 else float(spec.volume_max or 0.0)
-        return max(0.0, cap), {"free_margin": free_margin, "leverage": leverage, "margin_per_lot": margin_per_lot, "usable_margin": usable_margin, "max_margin_fraction": max_fraction, "reserve_fraction": reserve_fraction}
+        cap = usable_margin / margin_per_lot
+        return max(0.0, cap), {"free_margin": free_margin, "margin_per_lot": margin_per_lot, "usable_margin": usable_margin, "max_margin_fraction": max_fraction, "reserve_fraction": reserve_fraction, "source": "OrderCalcMargin"}
 
     def plan(self, symbol: str, market: str, sig: dict, spec: MT5SymbolSpec, price: float, sl: float, tp: float, strategy_equity: float, base_volume: float, base_meta: dict) -> tuple[float, dict]:
         canonical = canonical_symbol(symbol).upper()
         if not self.bot._aggressive_scalp_effective():
             return base_volume, {"enabled": False, "reason": "aggressive scalp mode inactive"}
         target_profit = self.target_profit_usd(canonical, sig)
-        profit_per_lot = self._profit_per_lot_at_target(spec, price, tp)
+        direction = str((sig or {}).get("direction") or "").upper()
+        profit_per_lot = self._profit_per_lot_at_target(spec, price, tp, direction)
         if profit_per_lot <= 0:
-            return base_volume, {"enabled": True, "reason": "target profit per lot unavailable", "target_profit_usd": target_profit}
+            return 0.0, {"enabled": True, "reason": "broker target profit unavailable", "target_profit_usd": target_profit}
         required_lot = target_profit / profit_per_lot
-        loss_per_lot = float(base_meta.get("loss_per_lot") or self.bot._loss_per_lot(spec, price, abs(price - sl)))
+        loss_per_lot = float(base_meta.get("loss_per_lot") or self.bot._loss_per_lot(spec, price, abs(price - sl), direction))
         max_trade_risk = self.bot._max_trade_risk_limit_for_symbol(canonical, market)
         max_by_risk = max_trade_risk / loss_per_lot if loss_per_lot > 0 and max_trade_risk > 0 else float(spec.volume_max or required_lot)
         max_lot = self.bot._max_lot_for_symbol(canonical, market)
         if max_lot <= 0:
             max_lot = float(spec.volume_max or required_lot)
-        margin_cap, margin_meta = self._margin_lot_cap(spec, price)
+        margin_cap, margin_meta = self._margin_lot_cap(spec, price, direction)
         volume_cap = min(float(spec.volume_max or required_lot), max_lot, max_by_risk, margin_cap)
-        notional_cap_volume = float(base_meta.get("volume_by_cap") or 0.0)
-        if notional_cap_volume > 0:
-            volume_cap = min(volume_cap, notional_cap_volume)
+        base_margin_cap_volume = float(base_meta.get("volume_by_cap") or 0.0)
+        if base_margin_cap_volume > 0:
+            volume_cap = min(volume_cap, base_margin_cap_volume)
         pyramid_cap = self.bot._pyramid_addon_volume_cap(canonical, str((sig or {}).get("direction") or ""))
         if pyramid_cap is not None:
             volume_cap = min(volume_cap, pyramid_cap)
@@ -1145,7 +1143,7 @@ class AggressiveSizingEngine:
             return True, "OK", {"enabled": False}
         spec_data = (risk_meta or {}).get("spec") or {}
         spec = MT5SymbolSpec(**spec_data) if isinstance(spec_data, dict) else self.bot.gateway.symbol_info(canonical)
-        profit_per_lot = self._profit_per_lot_at_target(spec, price, tp)
+        profit_per_lot = self._profit_per_lot_at_target(spec, price, tp, str((sig or {}).get("direction") or "").upper())
         expected_gross = profit_per_lot * max(float(volume or 0.0), 0.0)
         total_cost = float((cost_details or {}).get("total_cost") or 0.0)
         expected_net = expected_gross - total_cost
@@ -3035,6 +3033,9 @@ class XM_MT5_Bot:
             self._remove_pending_setup(pending_key, pending, "cancelled", "NOT_QUALIFIED", reason, sig)
             self.analytics_engine.record("NOT_QUALIFIED", canonical, str(pending.get("engine") or ""), str(pending.get("strategy") or ""), float(pending.get("score") or 0.0), reason, sig)
             return False, reason
+        confirmed_entry_price = float(fresh_meta.get("current_price") or sig.get("price") or pending.get("price") or 0.0)
+        sig["entry_price_at_confirmation"] = confirmed_entry_price
+        sig["price"] = confirmed_entry_price
         self._audit_decision({
             "event": "SETUP_CONFIRMED_FRESH", "decision": "allow", "scope": "setup",
             "symbol": canonical, "side": direction, "setup_id": pending.get("setup_id"),
@@ -5559,6 +5560,77 @@ class XM_MT5_Bot:
         if not policy_ok:
             return finish(False, f"NOT_QUALIFIED engine policy {policy_reason}")
 
+        try:
+            broker_geometry = self.gateway.order_calc_trade_geometry(
+                canonical, direction, qty, price, sl, tp
+            )
+            broker_sl_loss = float(broker_geometry.get("sl_loss_usd") or 0.0)
+            broker_tp_profit = float(broker_geometry.get("tp_profit_usd") or 0.0)
+            broker_margin = float(broker_geometry.get("margin_usd") or 0.0)
+            account = self.gateway.account_info()
+            free_margin = float(getattr(account, "free_margin", 0.0) or 0.0)
+        except Exception as exc:
+            self._audit_decision({
+                "event": "BROKER_CALC_MISMATCH",
+                "decision": "BLOCK",
+                "symbol": canonical,
+                "direction": direction,
+                "reason": f"broker geometry unavailable: {str(exc)[:180]}",
+            })
+            return finish(False, f"broker geometry unavailable: {str(exc)[:180]}")
+
+        intended_rr = self._entry_rr_for_symbol(
+            canonical,
+            market,
+            sig,
+            configured_rr=(get_symbol_config(canonical) or {}).get("tp_r"),
+        )
+        broker_rr = broker_tp_profit / broker_sl_loss if broker_sl_loss > 0 else 0.0
+        geometry_meta = {
+            **broker_geometry,
+            "broker_rr": round(broker_rr, 6),
+            "intended_rr": round(float(intended_rr), 6),
+            "free_margin_usd": round(free_margin, 2),
+        }
+        sig.setdefault("_mt5_thresholds", {})["broker_geometry"] = geometry_meta
+        if broker_sl_loss <= 0 or broker_tp_profit <= 0 or broker_margin <= 0:
+            return finish(False, f"broker geometry invalid: {geometry_meta}")
+        if free_margin <= 0 or broker_margin > free_margin:
+            return finish(False, f"broker margin insufficient: required={broker_margin:.2f} free={free_margin:.2f}")
+        rr_tolerance = _env_float("MT5_BROKER_RR_TOLERANCE_PCT", 10.0, lo=1.0, hi=25.0) / 100.0
+        if intended_rr > 0 and abs(broker_rr - intended_rr) / intended_rr > rr_tolerance:
+            self._audit_decision({
+                "event": "BROKER_CALC_MISMATCH",
+                "decision": "BLOCK",
+                "symbol": canonical,
+                "direction": direction,
+                "reason": "effective broker RR differs from intended RR",
+                "broker_geometry": geometry_meta,
+            })
+            return finish(False, f"broker RR mismatch: actual={broker_rr:.3f} intended={intended_rr:.3f}")
+        planned_risk = float((risk_meta or {}).get("planned_risk") or 0.0)
+        if planned_risk > 0 and abs(broker_sl_loss - planned_risk) / planned_risk > 0.10:
+            self._audit_decision({
+                "event": "BROKER_CALC_MISMATCH",
+                "decision": "BLOCK",
+                "symbol": canonical,
+                "direction": direction,
+                "reason": "sizing risk differs from final broker loss",
+                "planned_risk_usd": planned_risk,
+                "broker_geometry": geometry_meta,
+            })
+            return finish(False, f"broker risk mismatch: actual={broker_sl_loss:.2f} planned={planned_risk:.2f}")
+        if isinstance(risk_meta, dict):
+            risk_meta["planned_risk"] = broker_sl_loss
+            risk_meta["broker_geometry"] = geometry_meta
+        self._audit_decision({
+            "event": "BROKER_GEOMETRY_VALIDATED",
+            "decision": "PASS",
+            "symbol": canonical,
+            "direction": direction,
+            "broker_geometry": geometry_meta,
+        })
+
         checks = [
             self._new_entries_allowed("execution_gate", canonical, sig),
             self._strategy_allows_entry(sig),
@@ -7501,15 +7573,21 @@ class XM_MT5_Bot:
         if two_engine_risk_usd is not None and two_engine_risk_usd > 0:
             risk_budget = min(risk_budget, float(two_engine_risk_usd))
             sig.setdefault("_mt5_thresholds", {}).setdefault("risk", {})["two_engine_risk_usd"] = round(float(two_engine_risk_usd), 2)
-        loss_per_lot = self._loss_per_lot(spec, price, stop_d)
+        loss_per_lot = self._loss_per_lot(spec, price, stop_d, str(sig.get("direction") or "").upper())
         if loss_per_lot <= 0:
             return 0.0, "SIZE BLOCK: broker tick value unavailable", {"spec": spec.__dict__}
         volume_by_risk = risk_budget / loss_per_lot
-        notional_per_lot = max(price * float(spec.contract_size or 1.0), 0.0)
-        position_cap_pct = self._position_cap_pct_for_symbol(canonical, market)
-        notional_cap = strategy_equity * position_cap_pct
-        volume_by_cap = (notional_cap / notional_per_lot) if notional_per_lot > 0 else float(spec.volume_max)
-        raw_volume = min(volume_by_risk, volume_by_cap, float(spec.volume_max or volume_by_risk))
+        direction = str(sig.get("direction") or "").upper()
+        try:
+            margin_per_lot = self.gateway.order_calc_margin(spec.symbol, direction, 1.0, price)
+            acct = self.gateway.account_info()
+            free_margin = float(getattr(acct, "free_margin", 0.0) or 0.0)
+        except Exception as exc:
+            return 0.0, f"SIZE BLOCK: broker margin calculation unavailable: {str(exc)[:140]}", {"spec": spec.__dict__}
+        margin_fraction = _env_float("MT5_MAX_MARGIN_FRACTION", 0.80, lo=0.10, hi=0.95)
+        volume_by_margin = (free_margin * margin_fraction / margin_per_lot) if free_margin > 0 and margin_per_lot > 0 else 0.0
+        volume_by_cap = volume_by_margin
+        raw_volume = min(volume_by_risk, volume_by_margin, float(spec.volume_max or volume_by_risk))
         max_lot = self._max_lot_for_symbol(sym, market)
         if max_lot > 0:
             raw_volume = min(raw_volume, max_lot)
@@ -7535,7 +7613,7 @@ class XM_MT5_Bot:
                         "risk_pct": risk_pct,
                         "loss_per_lot": loss_per_lot,
                         "volume_by_risk": volume_by_risk,
-                        "position_cap_pct": position_cap_pct,
+                        "margin_fraction": margin_fraction,
                         "volume_by_cap": volume_by_cap,
                         "minimum_lot_risk": minimum_risk,
                         "max_trade_risk": max_trade_risk,
@@ -7552,7 +7630,7 @@ class XM_MT5_Bot:
                 "risk_pct": risk_pct,
                 "loss_per_lot": loss_per_lot,
                 "volume_by_risk": volume_by_risk,
-                "position_cap_pct": position_cap_pct,
+                "margin_fraction": margin_fraction,
                 "volume_by_cap": volume_by_cap,
                 "max_lot": max_lot,
                 "spec": spec.__dict__,
@@ -7578,7 +7656,7 @@ class XM_MT5_Bot:
                     "risk_pct": risk_pct,
                     "loss_per_lot": loss_per_lot,
                     "volume_by_risk": volume_by_risk,
-                    "position_cap_pct": position_cap_pct,
+                    "margin_fraction": margin_fraction,
                     "volume_by_cap": volume_by_cap,
                     "max_lot": max_lot,
                     "planned_risk": planned_risk,
@@ -7596,31 +7674,36 @@ class XM_MT5_Bot:
                 "risk_pct": risk_pct,
                 "loss_per_lot": loss_per_lot,
                 "volume_by_risk": volume_by_risk,
-                "position_cap_pct": position_cap_pct,
+                "margin_fraction": margin_fraction,
                 "volume_by_cap": volume_by_cap,
                 "max_lot": max_lot,
                 "planned_risk": planned_risk,
                 "max_trade_risk": max_trade_risk,
                 "aggressive_sizing": aggressive_details,
                 "target_profit_shortfall": sig.get("target_profit_shortfall"),
-                "notional_per_lot": notional_per_lot,
-                "notional_cap": notional_cap,
+                "margin_per_lot": margin_per_lot,
+                "usable_margin": free_margin * margin_fraction,
                 "spec": spec.__dict__,
             },
         )
 
-    def _loss_per_lot(self, spec: MT5SymbolSpec, price: float, stop_d: float) -> float:
-        tick_size = float(spec.tick_size or spec.point or 0.0)
-        tick_value = float(spec.tick_value_loss or spec.tick_value or spec.tick_value_profit or 0.0)
-        if tick_size > 0 and tick_value > 0:
-            return abs(stop_d / tick_size) * tick_value
-        contract_size = float(spec.contract_size or 0.0)
-        if contract_size <= 0:
+    def _loss_per_lot(self, spec: MT5SymbolSpec, price: float, stop_d: float, direction: str = "BUY") -> float:
+        side = str(direction or "").upper()
+        if side not in {"BUY", "SELL"} or price <= 0 or stop_d <= 0:
             return 0.0
-        loss = abs(stop_d) * contract_size
-        if spec.symbol.upper().endswith("JPY") and price > 0:
-            loss = loss / price
-        return loss
+        stop_price = price - stop_d if side == "BUY" else price + stop_d
+        try:
+            projected = self.gateway.order_calc_profit(spec.symbol, side, 1.0, price, stop_price)
+        except Exception as exc:
+            self._audit_decision({
+                "event": "BROKER_CALC_UNAVAILABLE",
+                "decision": "block",
+                "symbol": spec.symbol,
+                "calculation": "OrderCalcProfit_SL",
+                "reason": str(exc)[:180],
+            })
+            return 0.0
+        return abs(float(projected))
 
     def _trade_result_r(self, realized: float, entry: float, sl: float, qty: float, market: str, risk_meta: dict | None = None) -> float | None:
         planned_risk = float((risk_meta or {}).get("planned_risk") or 0.0) if isinstance(risk_meta, dict) else 0.0
@@ -7628,7 +7711,7 @@ class XM_MT5_Bot:
             try:
                 spec = self.gateway.symbol_info(self._canonical_from_resolved(str((risk_meta or {}).get("symbol") or ""))) if isinstance(risk_meta, dict) and risk_meta.get("symbol") else None
                 if spec is not None:
-                    planned_risk = self._loss_per_lot(spec, entry, abs(entry - sl)) * qty
+                    planned_risk = self._loss_per_lot(spec, entry, abs(entry - sl), str((risk_meta or {}).get("direction") or "BUY")) * qty
             except Exception:
                 planned_risk = 0.0
         if planned_risk <= 0:

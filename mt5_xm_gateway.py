@@ -296,6 +296,102 @@ class MT5Gateway:
             receipt_time_utc=datetime.now(timezone.utc),
         )
 
+    def order_calc_profit(self, symbol: str, direction: str, volume: float, open_price: float, close_price: float) -> float:
+        resolved = self.ensure_symbol(symbol)
+        side = str(direction or "").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid direction for OrderCalcProfit: {direction}")
+        if self.mode == "native":
+            assert self.mt5 is not None
+            order_type = self.mt5.ORDER_TYPE_BUY if side == "BUY" else self.mt5.ORDER_TYPE_SELL
+            value = self.mt5.order_calc_profit(order_type, resolved, float(volume), float(open_price), float(close_price))
+            if value is None:
+                raise RuntimeError(f"MT5 order_calc_profit failed: {self.mt5.last_error()}")
+            return float(value)
+        request_id = f"{time.time_ns()}_calc_profit_{resolved}"
+        self._write_command(request_id, {
+            "action": "ORDER_CALC_PROFIT",
+            "symbol": resolved,
+            "direction": side,
+            "volume": f"{float(volume):.8f}",
+            "open_price": f"{float(open_price):.10f}",
+            "close_price": f"{float(close_price):.10f}",
+        })
+        return float(self._await_result(request_id).value)
+
+    def order_calc_margin(self, symbol: str, direction: str, volume: float, open_price: float) -> float:
+        resolved = self.ensure_symbol(symbol)
+        side = str(direction or "").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid direction for OrderCalcMargin: {direction}")
+        if self.mode == "native":
+            assert self.mt5 is not None
+            order_type = self.mt5.ORDER_TYPE_BUY if side == "BUY" else self.mt5.ORDER_TYPE_SELL
+            value = self.mt5.order_calc_margin(order_type, resolved, float(volume), float(open_price))
+            if value is None:
+                raise RuntimeError(f"MT5 order_calc_margin failed: {self.mt5.last_error()}")
+            return float(value)
+        request_id = f"{time.time_ns()}_calc_margin_{resolved}"
+        self._write_command(request_id, {
+            "action": "ORDER_CALC_MARGIN",
+            "symbol": resolved,
+            "direction": side,
+            "volume": f"{float(volume):.8f}",
+            "open_price": f"{float(open_price):.10f}",
+        })
+        return float(self._await_result(request_id).value)
+
+    def order_calc_trade_geometry(
+        self,
+        symbol: str,
+        direction: str,
+        volume: float,
+        entry: float,
+        sl: float,
+        tp: float,
+    ) -> dict[str, float | str]:
+        resolved = self.ensure_symbol(symbol)
+        side = str(direction or "").upper()
+        if side not in {"BUY", "SELL"}:
+            raise ValueError(f"invalid direction for broker geometry: {direction}")
+        if min(float(volume), float(entry), float(sl), float(tp)) <= 0:
+            raise ValueError("broker geometry requires positive volume, entry, SL, and TP")
+        if self.mode == "native":
+            sl_value = self.order_calc_profit(resolved, side, volume, entry, sl)
+            tp_value = self.order_calc_profit(resolved, side, volume, entry, tp)
+            margin_value = self.order_calc_margin(resolved, side, volume, entry)
+            return {
+                "sl_loss_usd": abs(float(sl_value)),
+                "tp_profit_usd": float(tp_value),
+                "margin_usd": float(margin_value),
+                "currency": "",
+            }
+
+        batch_id = time.time_ns()
+        requests = {
+            "sl": f"{batch_id}_geometry_sl_{resolved}",
+            "tp": f"{batch_id}_geometry_tp_{resolved}",
+            "margin": f"{batch_id}_geometry_margin_{resolved}",
+        }
+        common = {
+            "symbol": resolved,
+            "direction": side,
+            "volume": f"{float(volume):.8f}",
+            "open_price": f"{float(entry):.10f}",
+        }
+        self._write_command(requests["sl"], {**common, "action": "ORDER_CALC_PROFIT", "close_price": f"{float(sl):.10f}"})
+        self._write_command(requests["tp"], {**common, "action": "ORDER_CALC_PROFIT", "close_price": f"{float(tp):.10f}"})
+        self._write_command(requests["margin"], {**common, "action": "ORDER_CALC_MARGIN"})
+        sl_result = self._await_result(requests["sl"])
+        tp_result = self._await_result(requests["tp"])
+        margin_result = self._await_result(requests["margin"])
+        return {
+            "sl_loss_usd": abs(float(sl_result.value)),
+            "tp_profit_usd": float(tp_result.value),
+            "margin_usd": float(margin_result.value),
+            "currency": sl_result.currency or tp_result.currency or margin_result.currency,
+        }
+
     def positions(self) -> list[MT5PositionView]:
         if self.mode == "native":
             assert self.mt5 is not None
@@ -876,7 +972,10 @@ class MT5Gateway:
 
     def _write_command(self, request_id: str, payload: dict[str, str]) -> None:
         lines = [f"request_id={request_id}"] + [f"{key}={value}" for key, value in payload.items()]
-        (self.config.commands_dir / f"command_{request_id}.txt").write_text("\n".join(lines) + "\n")
+        final_path = self.config.commands_dir / f"command_{request_id}.txt"
+        staging_path = self.config.commands_dir / f"pending_{request_id}.part"
+        staging_path.write_text("\n".join(lines) + "\n")
+        staging_path.replace(final_path)
 
     def _await_result(self, request_id: str) -> _BridgeResult:
         result_path = self.config.results_dir / f"result_{request_id}.txt"
@@ -885,6 +984,13 @@ class MT5Gateway:
             if result_path.exists():
                 payload = self._read_key_values(result_path)
                 status = payload.get("status", "").upper()
+                if not status:
+                    time.sleep(0.025)
+                    continue
+                try:
+                    result_path.unlink()
+                except OSError:
+                    pass
                 if status != "OK":
                     raise RuntimeError(payload.get("message", f"MT5 bridge request failed: {request_id}"))
                 return _BridgeResult(
@@ -892,8 +998,12 @@ class MT5Gateway:
                     order=int(payload.get("order", "0") or 0),
                     deal=int(payload.get("deal", "0") or 0),
                     price=float(payload.get("price", "0") or 0.0),
+                    value_name=str(payload.get("value_name", "")),
+                    value=float(payload.get("value", "0") or 0.0),
+                    currency=str(payload.get("currency", "")),
+                    message=str(payload.get("message", "")),
                 )
-            time.sleep(1)
+            time.sleep(0.05)
         raise RuntimeError(f"Timed out waiting for MT5 bridge result: {request_id}")
 
     def _bridge_file_meta(self, path: Path) -> dict[str, object]:
