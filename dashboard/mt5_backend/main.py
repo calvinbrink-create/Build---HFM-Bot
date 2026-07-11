@@ -1097,12 +1097,12 @@ def health():
     }
 
 
-    campaigns = _campaign_snapshot()
-    active_campaigns = [row for row in campaigns if row.get("status") == "active"]
 @app.get("/api/status", dependencies=[Depends(_session_user)])
 def status():
     activity = _activity()
     fx = _usd_zar_rate()
+    campaigns = _campaign_snapshot()
+    active_campaigns = [row for row in campaigns if row.get("status") == "active"]
     return {
         "broker_backend": "mt5",
         "broker_name": activity["broker_name"],

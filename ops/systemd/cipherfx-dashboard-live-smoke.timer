@@ -1,0 +1,12 @@
+[Unit]
+Description=Run Cipher FX rendered dashboard smoke test every 15 minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=30s
+Persistent=true
+Unit=cipherfx-dashboard-live-smoke.service
+
+[Install]
+WantedBy=timers.target

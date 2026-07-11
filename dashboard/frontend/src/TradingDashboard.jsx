@@ -563,8 +563,14 @@ export function TradingDashboard() {
         setApiError("");
         const sessionToken = await ensureToken();
         const [nextStatus, nextTerminal, nextSymbols, nextTrades, nextOrders, nextScanner, nextAudit, nextMarketHours] = await Promise.all([
-          h("GET", "/status", null, sessionToken),
-          h("GET", "/terminal", null, sessionToken),
+          h("GET", "/status", null, sessionToken).catch((error) => {
+            setApiError(describeApiError(error, "Status feed unavailable"));
+            return null;
+          }),
+          h("GET", "/terminal", null, sessionToken).catch((error) => {
+            setApiError(describeApiError(error, "Terminal feed unavailable"));
+            return null;
+          }),
           h("GET", "/symbols", null, sessionToken).catch(() => []),
           h("GET", "/trades?limit=100&include_history=true", null, sessionToken).catch(() => []),
           h("GET", "/orders", null, sessionToken).catch(() => []),

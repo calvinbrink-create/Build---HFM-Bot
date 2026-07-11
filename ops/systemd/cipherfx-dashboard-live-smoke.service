@@ -1,0 +1,14 @@
+[Unit]
+Description=Cipher FX rendered dashboard smoke test
+After=network-online.target nginx.service scalpbot-dashboard-mt5.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/cipherfx_mt5/dashboard/frontend
+Environment=PLAYWRIGHT_HOST_PLATFORM_OVERRIDE=ubuntu24.04-x64
+ExecStart=/usr/bin/npm run test:live-dashboard
+Nice=10
+IOSchedulingClass=idle
+TimeoutStartSec=120

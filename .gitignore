@@ -33,3 +33,4 @@
 *.ini
 *.key
 *.pem
+/audit_artifacts/
