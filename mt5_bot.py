@@ -4831,7 +4831,7 @@ class XM_MT5_Bot:
         acct = self.gateway.account_info()
         self._assert_expected_account(acct)
         if not _global_trading_enabled():
-            reason = "global trading lock active"
+            reason = "MARKETS_CLOSED_WEEKEND" if datetime.now().weekday() >= 5 else "market session closed"
             _ss.set_status("halt", reason)
             self._log_global_scan_block(reason)
             _ss.set_status("last_scan", datetime.now().isoformat())
