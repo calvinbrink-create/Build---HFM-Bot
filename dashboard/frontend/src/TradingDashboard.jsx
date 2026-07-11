@@ -1145,6 +1145,7 @@ export function TradingDashboard() {
           <div className="scanner-card"><span>Audit window</span><strong>{compactCount((audit?.blocks || []).length)}</strong><em>{compactCount((audit?.trades || []).length)} trade events</em></div>
           <div className="scanner-card"><span>Setups created</span><strong>{compactCount(counts.SETUP_CREATED || 0)}</strong><em>{compactCount(counts.SETUP_CONFIRMED_FRESH || 0)} fresh confirmations</em></div>
           <div className="scanner-card"><span>Orders filled</span><strong className={(counts.ORDER_FILLED || 0) > 0 ? "pos" : ""}>{compactCount(counts.ORDER_FILLED || 0)}</strong><em>{compactCount(counts.ORDER_SENT || 0)} sent - {compactCount(counts.ORDER_REJECTED || 0)} rejected</em></div>
+          <div className="scanner-card"><span>Profit campaigns</span><strong className={Number(status?.active_campaign_count || 0) > 0 ? "pos" : ""}>{compactCount(status?.active_campaign_count || 0)}</strong><em>up to {status?.max_pyramid_levels || 10} legs - {status?.campaign_monitor_seconds || 0.5}s monitor</em></div>
           <div className="scanner-card"><span>Scan heartbeat</span><strong>{formatAgeLabel(status?.last_scan || scannerSummary.latest_signal_at)}</strong><em>{formatDateTimeLabel(status?.last_scan || scannerSummary.latest_signal_at) || "Audit live"}</em></div>
         </div>
         <div className="scanner-split">

@@ -7054,6 +7054,14 @@ class XM_MT5_Bot:
                 flush=True,
             )
             return True
+        profile_ok, profile_reason = self._symbol_profile_gate_allows_entry(canonical, market, sig)
+        if not profile_ok:
+            reason = f"STRATEGY_V1_NOT_QUALIFIED profile {profile_reason}"
+            self._mark_not_qualified(sig, reason, "STRATEGY_V1_PRE_SETUP_QUALITY")
+            self._upsert_signal(canonical, market, sig, price, atr_value, reason, False, details, group)
+            self.analytics_engine.record("NOT_QUALIFIED", canonical, sig["engine"], sig["strategy"], sig["score"], reason, sig)
+            return True
+
         spread_ok, spread_reason = self._spread_allows_entry(canonical, market, sig, price, atr_value)
         if not spread_ok:
             reason = f"STRATEGY_V1_NOT_QUALIFIED spread {spread_reason}"

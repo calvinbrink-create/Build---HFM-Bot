@@ -189,6 +189,26 @@ def _visible_symbols_path() -> Path:
     return _bridge_dir() / "visible_symbols.json"
 
 
+def _campaign_snapshot() -> list[dict]:
+    path = Path(os.getenv("MT5_STATE_FILE", str(ROOT_DIR / "state" / "mt5_runtime_state.json")))
+    try:
+        payload = json.loads(path.read_text())
+    except Exception:
+        return []
+    campaigns = payload.get("campaigns") if isinstance(payload, dict) else {}
+    if not isinstance(campaigns, dict):
+        return []
+    rows = []
+    for key, value in campaigns.items():
+        if not isinstance(value, dict):
+            continue
+        row = dict(value)
+        row["key"] = key
+        rows.append(row)
+    return sorted(rows, key=lambda row: str(row.get("updated_at") or row.get("created_at") or ""), reverse=True)
+
+
+
 def _read_kv(path: Path) -> dict:
     out = {}
     try:
@@ -896,6 +916,10 @@ _AUDIT_EVENTS = {
     "COST_TO_TARGET_BLOCKED", "PROFILE_GATE_BLOCKED", "INDEX_EXHAUSTION_BLOCKED",
     "execution_gate", "scan_block_reason", "ORDER_SENT", "ORDER_FILLED",
     "ORDER_REJECTED", "order_rejected_recorded",
+    "INDEX_EXHAUSTION_NOT_QUALIFIED", "EXTREME_COST_NOT_QUALIFIED",
+    "BROKER_GEOMETRY_VALIDATED", "BROKER_CALC_MISMATCH", "symbol_profile_gate", "spread_gate",
+    "CENTRAL_COST_MODEL_AUTHORITATIVE", "PYRAMID_ADD_FILLED", "PYRAMID_ADD_SKIPPED",
+    "CAMPAIGN_BASKET_CLOSE_SENT",
 }
 
 def _audit_dt(value):
@@ -1073,6 +1097,8 @@ def health():
     }
 
 
+    campaigns = _campaign_snapshot()
+    active_campaigns = [row for row in campaigns if row.get("status") == "active"]
 @app.get("/api/status", dependencies=[Depends(_session_user)])
 def status():
     activity = _activity()
@@ -1095,6 +1121,11 @@ def status():
         "mt5_trade_allowed": db.read_status("mt5_trade_allowed"),
         "dry_run": os.getenv("MT5_DRY_RUN", "0") in {"1", "true", "True", "yes", "on"},
         "poll_seconds": db.read_status("poll_seconds") or os.getenv("MT5_POLL_SECONDS", "1"),
+        "max_pyramid_levels": int(float(os.getenv("MT5_PYRAMID_MAX_LEVELS", "10") or 10)),
+        "allow_pyramiding": os.getenv("MT5_ALLOW_PYRAMIDING", "1") in {"1", "true", "True", "yes", "on"},
+        "campaign_monitor_seconds": db.read_status("campaign_monitor_seconds") or os.getenv("MT5_CAMPAIGN_MONITOR_SECONDS", "0.50"),
+        "active_campaign_count": len(active_campaigns),
+        "campaigns": campaigns[:30],
         "scan_seconds": db.read_status("scan_seconds") or os.getenv("MT5_SCAN_SECONDS", "890"),
         "max_open_trades": db.read_status("max_open_trades") or os.getenv("MT5_MAX_OPEN_TRADES", "30"),
         "max_daily_trades": db.read_status("max_daily_trades") or os.getenv("MT5_MAX_DAILY_TRADES", "30"),
