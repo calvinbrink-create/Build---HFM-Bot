@@ -857,7 +857,7 @@ class PortfolioRiskManager:
         canonical = canonical_symbol(self.bot._canonical_from_resolved(symbol)).upper()
         engine = str(sig.get("engine") or get_engine_for_symbol(canonical))
         try:
-            realized_today = float(_ss.read_todays_pnl() or 0.0)
+            realized_today = float(self.bot._broker_day_realized_pnl())
         except Exception:
             realized_today = 0.0
         daily_limit = float(self.bot._daily_loss_limit_used())
@@ -1400,7 +1400,10 @@ class XM_MT5_Bot:
             return {"open_trades": {}, "closed_tickets": []}
 
     def _save_state(self) -> None:
-        self.state_file.write_text(json.dumps(self.state, indent=2, default=str))
+        self.state_file.parent.mkdir(parents=True, exist_ok=True)
+        staging = self.state_file.with_suffix(self.state_file.suffix + ".tmp")
+        staging.write_text(json.dumps(self.state, indent=2, default=str))
+        staging.replace(self.state_file)
 
     @property
     def open_trades(self) -> dict:
@@ -1433,6 +1436,10 @@ class XM_MT5_Bot:
     @property
     def pending_setups(self) -> dict:
         return self.state.setdefault("pending_setups", {})
+
+    @property
+    def campaigns(self) -> dict:
+        return self.state.setdefault("campaigns", {})
 
     def _pending_setup_ttl_seconds(self, symbol: str = "", market: str = "", engine: str = "") -> int:
         # Pending setups have fixed, short execution windows by asset class.
@@ -2220,6 +2227,12 @@ class XM_MT5_Bot:
         return float(rr)
 
     def _management_rr_for_position(self, canonical: str, market: str, direction: str, meta: dict | None = None) -> float:
+        risk_meta = (meta or {}).get("risk_meta") if isinstance(meta, dict) else None
+        broker_geometry = risk_meta.get("broker_geometry") if isinstance(risk_meta, dict) else None
+        if isinstance(broker_geometry, dict):
+            intended_rr = float(broker_geometry.get("intended_rr") or 0.0)
+            if intended_rr > 0:
+                return intended_rr
         rr_sig = {
             "engine": get_engine_for_symbol(canonical),
             "mode": str((meta or {}).get("sig_mode") or "mt5"),
@@ -2228,6 +2241,9 @@ class XM_MT5_Bot:
         trade_audit = (meta or {}).get("trade_audit") if isinstance(meta, dict) else None
         if isinstance(trade_audit, dict):
             rr_sig.update(trade_audit)
+            rr_sig["replacement_strategy_v1"] = bool(
+                trade_audit.get("replacement_strategy_v1") or trade_audit.get("ruleset_version") == "strategy_architecture_v1"
+            )
         return self._entry_rr_for_symbol(canonical, market, rr_sig)
 
     def _is_priority_symbol(self, sym: str) -> bool:
@@ -3076,7 +3092,7 @@ class XM_MT5_Bot:
         if _mt5_strategy_engines.get_symbol_config(canonical) is None:
             return None
         try:
-            realized_today = float(_ss.read_todays_pnl() or 0.0)
+            realized_today = float(self._broker_day_realized_pnl())
         except Exception:
             realized_today = 0.0
         try:
@@ -3212,6 +3228,7 @@ class XM_MT5_Bot:
         next_housekeeping_at = 0.0
         next_heartbeat_at = 0.0
         next_close_reconcile_at = 0.0
+        next_campaign_at = 0.0
         next_deal_reconcile_at = 0.0
         next_position_sync_at = 0.0
         next_loop_status_at = 0.0
@@ -3225,6 +3242,7 @@ class XM_MT5_Bot:
         heartbeat_interval = _env_float("MT5_HEARTBEAT_SECONDS", 1.0, lo=0.2)
         close_reconcile_interval = _env_float("MT5_CLOSE_RECONCILE_SECONDS", 0.5, lo=0.1)
         deal_reconcile_interval = _env_float("MT5_DEAL_RECONCILE_SECONDS", 3.0, lo=0.5)
+        campaign_interval = _env_float("MT5_CAMPAIGN_MONITOR_SECONDS", 0.50, lo=0.25, hi=2.0)
         _ss.set_status("poll_seconds", poll_interval)
         _ss.set_status("scan_seconds", scan_interval)
         _ss.set_status("full_scan_aligned_to_m15", align_full_scan)
@@ -3238,6 +3256,7 @@ class XM_MT5_Bot:
         _ss.set_status("heartbeat_seconds", heartbeat_interval)
         _ss.set_status("close_reconcile_seconds", close_reconcile_interval)
         _ss.set_status("deal_reconcile_seconds", deal_reconcile_interval)
+        _ss.set_status("campaign_monitor_seconds", campaign_interval)
         live_tickets = []
         try:
             while not self._stop_requested:
@@ -3262,6 +3281,10 @@ class XM_MT5_Bot:
                 if now_monotonic >= next_close_reconcile_at:
                     self._reconcile_closed_positions(live_tickets, reconcile_history=False)
                     next_close_reconcile_at = time.monotonic() + close_reconcile_interval
+                if now_monotonic >= next_campaign_at:
+                    self._campaign_cycle()
+                    next_campaign_at = time.monotonic() + campaign_interval
+                    _ss.set_status("last_campaign_cycle", datetime.utcnow().isoformat())
                 now_monotonic = time.monotonic()
                 if now_monotonic >= next_deal_reconcile_at:
                     self._reconcile_mt5_deal_history(live_tickets)
@@ -3990,7 +4013,7 @@ class XM_MT5_Bot:
         min_dist = max(float(getattr(spec, "stops_level", 0) or 0) * point, point)
 
         if _env_bool("MT5_SCALP_CLOSE_ENABLE", True):
-            close_r = self._scalp_r_for_symbol("MT5_SCALP_CLOSE_R", canonical, market, 0.85)
+            close_r = self._management_rr_for_position(canonical, market, direction, meta)
             min_profit = _env_float("MT5_SCALP_CLOSE_MIN_PROFIT_USD", 0.0, lo=0.0)
             if close_r > 0 and current_r >= close_r and float(pos.profit or 0.0) >= min_profit:
                 self._close_position_for_profit(pos, canonical, f"scalp close r={current_r:.2f} >= {close_r:.2f}")
@@ -4856,12 +4879,18 @@ class XM_MT5_Bot:
             self._finish_scan_stats("full")
             _ss.set_status("last_scan", datetime.now().isoformat())
 
+    def _broker_day_realized_pnl(self) -> float:
+        try:
+            return float(_ss.read_broker_day_pnl() or 0.0)
+        except Exception:
+            return float(_ss.read_todays_pnl() or 0.0)
+
     def _daily_risk_allows_entry(self) -> bool:
         if _env_bool("MT5_EA_CONTROLS_DAILY_RISK", False):
             _ss.set_status("daily_loss_limit_usd", "EA input")
             return True
         try:
-            realized_today = float(_ss.read_todays_pnl() or 0.0)
+            realized_today = self._broker_day_realized_pnl()
         except Exception:
             realized_today = 0.0
         try:
@@ -4904,11 +4933,13 @@ class XM_MT5_Bot:
         if count >= limit:
             self._audit_decision({
                 "event": "daily_trade_count_gate",
-                "decision": "observe_only",
+                "decision": "block",
                 "daily_trade_count": count,
                 "max_daily_trades": limit,
-                "reason": "daily trade limit is observe-only in simplified hard-block architecture",
+                "count_semantics": "accepted bot entries in current broker day; adopted/manual and rejected rows excluded",
+                "reason": "accepted-entry daily trade limit reached",
             })
+            return False
         return True
 
     def _today_closed_trades(self, limit: int = 250) -> list[dict]:
@@ -5313,6 +5344,272 @@ class XM_MT5_Bot:
         if current_r < required_r:
             return False, f"pyramid level {next_level} requires basket >= {required_r:.2f}R ({current_r:.2f}R now)"
         return True, f"pyramid level {next_level} allowed basket={current_r:.2f}R pnl={basket_pnl:.2f}"
+
+    def _campaign_key(self, symbol: str, direction: str) -> str:
+        canonical = self._canonical_from_resolved(symbol).upper()
+        return f"{canonical}:{str(direction or '').upper()}"
+
+    def _campaign_alignment_allows_add(self, canonical: str, direction: str) -> tuple[bool, str, dict]:
+        try:
+            h1 = self._strategy_v1_frame(self.gateway.rates(canonical, "H1", 90), "H1", completed_only=True)
+            m15 = self._strategy_v1_frame(self.gateway.rates(canonical, "M15", 70), "M15", completed_only=True)
+            h1_side, h1_score = _strategy_v1.context(h1)
+            m15_side, m15_score = _strategy_v1.context(m15)
+        except Exception as exc:
+            return False, f"campaign HTF context unavailable: {str(exc)[:140]}", {}
+        details = {
+            "h1_side": h1_side,
+            "h1_score": round(float(h1_score), 2),
+            "m15_side": m15_side,
+            "m15_score": round(float(m15_score), 2),
+        }
+        if h1_side != direction:
+            return False, f"campaign H1 no longer supports {direction}", details
+        if m15_side not in {direction, "FLAT"}:
+            return False, f"campaign M15 opposes {direction}", details
+        return True, "campaign HTF alignment valid", details
+
+    def _campaign_cycle(self) -> None:
+        if not self._pyramiding_enabled():
+            return
+        try:
+            positions = list(self.gateway.positions())
+        except Exception as exc:
+            _ss.set_status("last_campaign_error", f"positions unavailable: {str(exc)[:160]}")
+            return
+
+        grouped: dict[tuple[str, str], list[MT5PositionView]] = {}
+        symbol_directions: dict[str, set[str]] = {}
+        for pos in positions:
+            canonical = self._canonical_from_resolved(pos.symbol).upper()
+            direction = str(pos.direction or "").upper()
+            if canonical not in self.symbol_markets or direction not in {"BUY", "SELL"}:
+                continue
+            grouped.setdefault((canonical, direction), []).append(pos)
+            symbol_directions.setdefault(canonical, set()).add(direction)
+
+        active_keys = {self._campaign_key(symbol, side) for symbol, side in grouped}
+        now_iso = datetime.utcnow().isoformat()
+        for key, campaign in list(self.campaigns.items()):
+            if isinstance(campaign, dict) and key not in active_keys and campaign.get("status") == "active":
+                campaign["status"] = "closed"
+                campaign["closed_at"] = now_iso
+
+        for (canonical, direction), legs in grouped.items():
+            owned = []
+            for pos in legs:
+                meta = self.open_trades.get(str(pos.ticket), {})
+                risk_meta = meta.get("risk_meta") if isinstance(meta, dict) and isinstance(meta.get("risk_meta"), dict) else {}
+                trade_id = str(meta.get("trade_id") or "") if isinstance(meta, dict) else ""
+                if trade_id and not trade_id.startswith("mt5_adopted_") and not risk_meta.get("adopted"):
+                    owned.append((pos, meta))
+            if not owned:
+                continue
+
+            key = self._campaign_key(canonical, direction)
+            campaign = self.campaigns.setdefault(key, {
+                "campaign_id": str(owned[0][1].get("parent_trade_id") or owned[0][1].get("trade_id") or f"campaign_{canonical}_{int(time.time())}"),
+                "symbol": canonical,
+                "direction": direction,
+                "engine": str((owned[0][1].get("trade_audit") or {}).get("engine") or get_engine_for_symbol(canonical)),
+                "strategy": str((owned[0][1].get("trade_audit") or {}).get("strategy") or ""),
+                "created_at": str(owned[0][1].get("opened_at") or now_iso),
+                "accepted_legs": len(owned),
+                "status": "active",
+            })
+            campaign["status"] = "active"
+            campaign["active_tickets"] = [str(pos.ticket) for pos, _meta in owned]
+            campaign["accepted_legs"] = max(int(campaign.get("accepted_legs") or 0), len(owned))
+            campaign["basket_profit_usd"] = round(sum(float(pos.profit or 0.0) for pos, _meta in owned), 2)
+            campaign["basket_risk_usd"] = round(sum(
+                abs(float(((meta.get("risk_meta") or {}).get("planned_risk") or 0.0)))
+                for _pos, meta in owned
+            ), 2)
+            campaign["updated_at"] = now_iso
+
+            peak_profit = max(float(campaign.get("peak_profit_usd") or 0.0), float(campaign["basket_profit_usd"]))
+            campaign["peak_profit_usd"] = round(peak_profit, 2)
+            basket_risk_now = float(campaign.get("basket_risk_usd") or 0.0)
+            basket_profit_now = float(campaign.get("basket_profit_usd") or 0.0)
+            if basket_risk_now > 0:
+                basket_target_r = self._entry_rr_for_symbol(
+                    canonical, self._market_for_symbol(canonical), {}, configured_rr=(get_symbol_config(canonical) or {}).get("tp_r")
+                )
+                basket_target_usd = basket_risk_now * basket_target_r
+                basket_stop_usd = -basket_risk_now
+                lock_trigger_r = _env_float("MT5_CAMPAIGN_LOCK_TRIGGER_R", 0.75, lo=0.10, hi=5.0)
+                lock_giveback_r = _env_float("MT5_CAMPAIGN_LOCK_GIVEBACK_R", 0.40, lo=0.05, hi=2.0)
+                minimum_lock_r = _env_float("MT5_CAMPAIGN_MIN_LOCK_R", 0.20, lo=0.0, hi=2.0)
+                peak_r = peak_profit / basket_risk_now
+                lock_floor_r = max(0.0, min(peak_r, max(minimum_lock_r, peak_r - lock_giveback_r))) if peak_r >= lock_trigger_r else 0.0
+                lock_floor_usd = lock_floor_r * basket_risk_now
+                campaign.update({
+                    "basket_stop_usd": round(basket_stop_usd, 2),
+                    "basket_target_usd": round(basket_target_usd, 2),
+                    "profit_lock_floor_usd": round(lock_floor_usd, 2),
+                    "peak_r": round(peak_r, 4),
+                })
+                close_reason = ""
+                close_mode = ""
+                if basket_profit_now <= basket_stop_usd:
+                    close_reason = f"campaign basket stop reached {basket_profit_now:.2f} <= {basket_stop_usd:.2f}"
+                    close_mode = "risk"
+                elif basket_profit_now >= basket_target_usd:
+                    close_reason = f"campaign basket target reached {basket_profit_now:.2f} >= {basket_target_usd:.2f}"
+                    close_mode = "profit"
+                elif lock_floor_usd > 0 and basket_profit_now <= lock_floor_usd:
+                    close_reason = f"campaign profit lock reached {basket_profit_now:.2f} <= {lock_floor_usd:.2f}"
+                    close_mode = "profit"
+                if close_reason:
+                    closed = 0
+                    for pos, _meta in owned:
+                        ok = (
+                            self._close_position_for_profit(pos, canonical, close_reason)
+                            if close_mode == "profit"
+                            else self._close_position_for_risk(pos, canonical, close_reason)
+                        )
+                        closed += int(bool(ok))
+                    campaign["last_observation"] = f"CAMPAIGN_BASKET_CLOSE_SENT {closed}/{len(owned)} {close_reason}"
+                    campaign["close_requested_at"] = datetime.utcnow().isoformat()
+                    self._audit_decision({
+                        "event": "CAMPAIGN_BASKET_CLOSE_SENT", "decision": "PASS" if closed else "ERROR",
+                        "symbol": canonical, "direction": direction, "campaign_id": campaign.get("campaign_id"),
+                        "closed_positions": closed, "position_count": len(owned), "reason": close_reason,
+                    })
+                    continue
+
+            max_levels = _env_int("MT5_PYRAMID_MAX_LEVELS", 10, lo=1, hi=10)
+            level = int(campaign.get("accepted_legs") or len(owned))
+            if level >= max_levels or len(symbol_directions.get(canonical, set())) != 1:
+                continue
+            if not self._entry_window_open(self._market_for_symbol(canonical)):
+                continue
+            if not self._daily_risk_allows_entry() or not self._daily_trade_count_allows_entry():
+                continue
+            if self._open_position_count() >= self._effective_max_open_trades():
+                continue
+
+            basket_profit = float(campaign.get("basket_profit_usd") or 0.0)
+            basket_risk = float(campaign.get("basket_risk_usd") or 0.0)
+            if basket_profit <= 0 or basket_risk <= 0:
+                continue
+            basket_r = basket_profit / basket_risk
+            first_trigger = _env_float("MT5_PYRAMID_MIN_ADD_R", 0.10, lo=0.01, hi=2.0)
+            step_r = _env_float("MT5_PYRAMID_STEP_R", 0.10, lo=0.01, hi=1.0)
+            required_r = first_trigger + max(0, level - 1) * step_r
+            campaign["basket_r"] = round(basket_r, 4)
+            campaign["next_add_required_r"] = round(required_r, 4)
+            if basket_r < required_r:
+                continue
+
+            cooldown = _env_float("MT5_PYRAMID_ADD_COOLDOWN_SECONDS", 1.0, lo=0.25, hi=30.0)
+            last_add = _parse_dt(campaign.get("last_add_at"))
+            if last_add and (datetime.utcnow() - last_add).total_seconds() < cooldown:
+                continue
+            weighted_entry = sum(float(pos.price_open) * float(pos.volume) for pos, _meta in owned) / max(
+                sum(float(pos.volume) for pos, _meta in owned), 1e-12
+            )
+            try:
+                _resolved, tick = self.gateway.symbol_tick(canonical)
+                bid = float(getattr(tick, "bid", 0.0) or 0.0)
+                ask = float(getattr(tick, "ask", 0.0) or 0.0)
+            except Exception:
+                continue
+            price = ask if direction == "BUY" else bid
+            if price <= 0 or (direction == "BUY" and price <= weighted_entry) or (direction == "SELL" and price >= weighted_entry):
+                continue
+            last_add_price = float(campaign.get("last_add_price") or weighted_entry)
+            if (direction == "BUY" and price <= last_add_price) or (direction == "SELL" and price >= last_add_price):
+                continue
+
+            aligned, alignment_reason, alignment = self._campaign_alignment_allows_add(canonical, direction)
+            campaign["alignment"] = alignment
+            if not aligned:
+                campaign["last_observation"] = alignment_reason
+                continue
+
+            market = self._market_for_symbol(canonical)
+            cfg = get_symbol_config(canonical) or {}
+            atr = self._recent_atr(canonical)
+            if atr <= 0:
+                continue
+            stop_d = self._cap_stop_distance_for_symbol(
+                canonical, market, atr * float(cfg.get("atr_stop_mult") or 1.3), {}
+            )
+            rr = self._entry_rr_for_symbol(canonical, market, {}, configured_rr=cfg.get("tp_r"))
+            sl = price - stop_d if direction == "BUY" else price + stop_d
+            tp = price + stop_d * rr if direction == "BUY" else price - stop_d * rr
+            engine = str(campaign.get("engine") or get_engine_for_symbol(canonical))
+            strategy = str(campaign.get("strategy") or engine)
+            sig = {
+                "symbol": canonical, "market": market, "asset_class": str(cfg.get("asset_class") or ""),
+                "engine": engine, "strategy": strategy, "mode": "PROFIT_PYRAMID",
+                "setup_type": "PROFIT_PYRAMID", "population": "profit_pyramid",
+                "direction": direction, "price": price, "atr": atr, "score": 100.0,
+                "min_score": 0.0, "replacement_strategy_v1": True,
+                "one_min_confirmation": True, "execution_1m_score": 100.0,
+                "raw_signal_side": direction, "setup_side": direction,
+                "pending_setup_side": direction, "confirmation_side": direction,
+                "final_order_side": direction,
+                "generated_at": now_iso, "setup_created_at": now_iso,
+                "confirmation_detected_at": now_iso, "source_loop_name": "campaign_cycle",
+                "campaign_id": campaign.get("campaign_id"), "pyramid_level": level + 1,
+                "conditions": {"profitable_basket": True, "basket_r": basket_r, "required_r": required_r},
+            }
+            try:
+                acct = self.gateway.account_info()
+                volume, size_reason, risk_meta = self._mt5_volume_for_trade(
+                    canonical, market, price, stop_d, self._strategy_equity(acct), sig
+                )
+                if volume <= 0:
+                    raise RuntimeError(size_reason)
+                campaign_risk_cap = _env_float("MT5_MAX_CAMPAIGN_RISK_USD", 1000.0, lo=1.0, hi=1000.0)
+                planned_risk = float((risk_meta or {}).get("planned_risk") or 0.0)
+                if basket_risk + planned_risk > campaign_risk_cap:
+                    raise RuntimeError(
+                        f"campaign risk cap reached ({basket_risk + planned_risk:.2f}/{campaign_risk_cap:.2f})"
+                    )
+                cost_ok, cost_reason, _adjusted, cost_details = self.cost_model.check(
+                    canonical, market, sig, volume, sl, tp, risk_meta, stage="pre_order"
+                )
+                if not cost_ok:
+                    raise RuntimeError(cost_reason)
+                risk_ok, risk_reason = self.portfolio_risk_manager.check(canonical, market, sig)
+                if not risk_ok:
+                    raise RuntimeError(risk_reason)
+                entry_ok, entry_reason = self._execution_gate_allows_entry(
+                    canonical, market, sig, volume, sl, tp, risk_meta
+                )
+                if not entry_ok:
+                    raise RuntimeError(entry_reason)
+                quality_ok, quality_reason, _quality = self.execution_quality_engine.pre_order_check(
+                    canonical, market, sig, volume, sl, tp
+                )
+                if not quality_ok:
+                    raise RuntimeError(quality_reason)
+                result = self._place_trade(canonical, market, sig, volume, sl, tp, risk_meta)
+                accepted, result_reason, _details = self.execution_quality_engine.confirm_order_result(canonical, sig, result)
+                if not accepted:
+                    raise RuntimeError(result_reason)
+                campaign["accepted_legs"] = level + 1
+                campaign["last_add_at"] = datetime.utcnow().isoformat()
+                campaign["last_add_price"] = price
+                campaign["last_add_volume"] = volume
+                campaign["last_observation"] = f"PYRAMID_ADD_FILLED level={level + 1}"
+                self._audit_decision({
+                    "event": "PYRAMID_ADD_FILLED", "decision": "PASS", "symbol": canonical,
+                    "direction": direction, "campaign_id": campaign.get("campaign_id"),
+                    "pyramid_level": level + 1, "basket_r": basket_r, "volume": volume,
+                })
+            except Exception as exc:
+                campaign["last_observation"] = f"PYRAMID_ADD_SKIPPED {str(exc)[:180]}"
+                campaign["last_attempt_at"] = datetime.utcnow().isoformat()
+                self._audit_decision({
+                    "event": "PYRAMID_ADD_SKIPPED", "decision": "observe", "symbol": canonical,
+                    "direction": direction, "campaign_id": campaign.get("campaign_id"),
+                    "pyramid_level": level + 1, "reason": str(exc)[:180],
+                })
+        self._save_state()
 
     def _duplicate_order_allows_entry(self, sym: str, direction: str) -> tuple[bool, str]:
         canonical = self._canonical_from_resolved(sym)
@@ -6272,7 +6569,7 @@ class XM_MT5_Bot:
             return False, f"cannot confirm portfolio exposure: {str(exc)[:120]}"
         closed_trades = self._today_closed_trades()
         try:
-            realized_today = float(_ss.read_todays_pnl() or 0.0)
+            realized_today = float(self._broker_day_realized_pnl())
         except Exception:
             realized_today = 0.0
         allowed, reason, details = self.systematic.portfolio.can_trade(
@@ -7012,8 +7309,8 @@ class XM_MT5_Bot:
             self.analytics_engine.record(BLOCKED, canonical, engine, str(sig.get("strategy") or ""), float(sig.get("score") or 0.0), reason, sig)
             print(f"[MT5_ENGINE_SCAN] ruleset_version={RULESET_VERSION} symbol={canonical} engine={engine} state={BLOCKED} reason={reason} direction_source={sig.get('direction_source')} evaluate_probability_master_gate=false pending_created=0", flush=True)
             return
-        if self._open_position_count() >= self.runtime.max_open_trades:
-            reason = f"max open trades hard-stop reached ({self.runtime.max_open_trades})"
+        if self._open_position_count() >= self._effective_max_open_trades():
+            reason = f"max open trades hard-stop reached ({self._effective_max_open_trades()})"
             self._mark_blocked(sig, "PORTFOLIO_RISK_GATE_APPLIED", reason)
             self._upsert_signal(canonical, market, sig, price, atr, reason, False, details, group)
             self.analytics_engine.record(BLOCKED, canonical, engine, str(sig.get("strategy") or ""), float(sig.get("score") or 0.0), reason, sig)

@@ -14,7 +14,8 @@ input double DailyProfitTargetUSD = 1000.00;
 input double DailyLossLimitUSD = 1000.00;
 input int MaxPyramidTrades = 10;
 input int MaxPyramidTradesPerSignal = 10;
-input bool AllowSameCandlePyramids = false;
+input bool AllowSameCandlePyramids = true;
+input int MaxOpenTradesTotal = 30;
 input int MaxTradesPerDay = 60;
 input bool StopTradingAfterDailyTarget = false;
 input bool StopTradingAfterDailyLossLimit = true;
@@ -376,6 +377,12 @@ bool CanOpenNewTrade(string symbol, string direction, double volume, double pric
    if(!AccountInfoInteger(ACCOUNT_TRADE_ALLOWED))
    {
       reason = "account trading disabled";
+      LogTradeBlockReason(reason);
+      return false;
+   }
+   if(PositionsTotal() >= MathMax(1, MaxOpenTradesTotal))
+   {
+      reason = "MaxOpenTradesTotal reached (" + IntegerToString(PositionsTotal()) + "/" + IntegerToString(MaxOpenTradesTotal) + ")";
       LogTradeBlockReason(reason);
       return false;
    }

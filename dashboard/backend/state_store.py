@@ -151,6 +151,22 @@ def trading_today() -> str:
     now = datetime.now(tz) if tz else datetime.now()
     return now.date().isoformat()
 
+def broker_trading_today() -> str:
+    offset = timedelta(hours=_mt5_server_utc_offset_hours())
+    return (datetime.now(timezone.utc) + offset).date().isoformat()
+
+
+def broker_trade_date_for(ts_value=None, fallback=None) -> str:
+    dt = _parse_dt(ts_value) or _parse_dt(fallback)
+    if dt is None:
+        return broker_trading_today()
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    else:
+        dt = dt.astimezone(timezone.utc)
+    return (dt + timedelta(hours=_mt5_server_utc_offset_hours())).date().isoformat()
+
+
 
 def _empty_date_detail() -> dict:
     return {
@@ -1247,6 +1263,23 @@ def read_todays_pnl():
     realized_sum = sum(r["realized"] for r in closed if r["realized"] is not None)
     return round(realized_sum, 2)
 
+def read_broker_day_pnl():
+    """Sum realized P&L by MT5 broker close day, matching the EA reset boundary."""
+    today = broker_trading_today()
+    conn = get_conn()
+    rows = conn.execute(
+        "SELECT realized, closed_at, trade_date FROM trades WHERE closed_at IS NOT NULL"
+    ).fetchall()
+    conn.close()
+    total = sum(
+        float(row["realized"])
+        for row in rows
+        if row["realized"] is not None
+        and broker_trade_date_for(row["closed_at"], fallback=row["trade_date"]) == today
+    )
+    return round(total, 2)
+
+
 
 def trading_month_range(today_value: str | None = None) -> tuple[str, str]:
     if today_value:
@@ -1434,8 +1467,8 @@ def _runtime_open_trade_ids():
 
 
 def read_todays_trade_count():
-    """Count real bot-opened entries today, excluding rejected/cancelled/duplicate/stale rows."""
-    today = trading_today()
+    """Count accepted bot entries in the current MT5 broker day."""
+    today = broker_trading_today()
     runtime_open_trade_ids = _runtime_open_trade_ids()
     conn = get_conn()
     rows = conn.execute(
@@ -1459,7 +1492,7 @@ def read_todays_trade_count():
             and trade_id not in runtime_open_trade_ids
         ):
             continue
-        if trade_date_for(row["opened_at"], fallback=row["trade_date"]) == today:
+        if broker_trade_date_for(row["opened_at"], fallback=row["trade_date"]) == today:
             count += 1
     return count
 
