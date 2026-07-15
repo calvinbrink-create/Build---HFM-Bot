@@ -79,10 +79,11 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
   if (await scannerButton.count() !== 1) throw new Error(`${name}: scanner navigation is not unique`);
   await scannerButton.click();
   await page.locator(".scanner-workspace").waitFor({ state: "visible", timeout: 15000 });
-  await page.locator(".scanner-row").first().waitFor({ state: "visible", timeout: 15000 });
+  await page.locator(".scanner-story-row").first().waitFor({ state: "visible", timeout: 15000 });
 
   const rendered = await page.evaluate(() => ({
-    scoreRows: document.querySelectorAll(".scanner-row").length,
+    storyRows: document.querySelectorAll(".scanner-story-row").length,
+    stageTracks: document.querySelectorAll(".scanner-stage-track").length,
     blockRows: document.querySelectorAll(".reason-summary-row, .scanner-event-row").length,
     metricCards: document.querySelectorAll(".scanner-card").length,
     marketSessions: document.querySelectorAll(".scanner-session").length,
@@ -98,20 +99,37 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
 
   if (currentRows < 1) throw new Error(`${name}: scanner API returned no current rows`);
   if (historicalRows < 1) throw new Error(`${name}: audit API returned no historical block rows`);
-  if (rendered.scoreRows < 1) throw new Error(`${name}: no score rows rendered`);
+  if (rendered.storyRows < 1) throw new Error(`${name}: no scan stories rendered`);
+  if (rendered.stageTracks !== rendered.storyRows) throw new Error(`${name}: each scan story must have one timeframe path`);
   if (rendered.blockRows < 1) throw new Error(`${name}: no historical rows rendered`);
-  if (rendered.metricCards < 6) throw new Error(`${name}: scanner metrics did not render`);
+  if (rendered.metricCards !== 4) throw new Error(`${name}: expected four compact scanner metrics`);
   if (rendered.marketSessions !== 4) throw new Error(`${name}: expected four market sessions`);
   if (rendered.openSessions + rendered.closedSessions !== 4) throw new Error(`${name}: market session status is incomplete`);
   if (rendered.marketBadges !== 1) throw new Error(`${name}: expected one market state badge`);
   if (rendered.duplicateClosureBanners !== 0) throw new Error(`${name}: duplicate market closure banner rendered`);
-  const expectedLabels = ["Cipher FX Scoring Metric V1", "Current Scores", "Latest No-Trade Detail", "US / New York", "UK / London", "Sydney", "Asia / Tokyo"];
+  const expectedLabels = ["Live Scan", "Current scan", "Why symbols are waiting", "Recent trades", "H4", "H1", "M15", "M5", "US / New York", "UK / London", "Sydney", "Asia / Tokyo"];
   if (auditPayload.market?.weekend_closed) expectedLabels.push("MARKETS CLOSED");
   for (const expected of expectedLabels) {
     if (!rendered.text.includes(expected)) throw new Error(`${name}: missing visible text: ${expected}`);
   }
+  if (/STRATEGY_V1|NOT_QUALIFIED|SCORE_BELOW_MINIMUM/.test(rendered.text)) throw new Error(`${name}: internal rejection codes leaked into the public scan`);
+  if (!(scannerPayload.current_signals || []).every((row) => row.scan_story && Array.isArray(row.scan_progress) && row.scan_progress.length === 5)) throw new Error(`${name}: scanner API is missing the five-stage public story`);
   if (apiFailures.length) throw new Error(`${name}: API failures: ${apiFailures.join(", ")}`);
   if (mobile && rendered.horizontalOverflow) throw new Error(`${name}: mobile page has horizontal overflow`);
+
+  const intelButton = mobile
+    ? page.locator('button[aria-label="Open Intel"]')
+    : page.locator(".side-tab").filter({ hasText: "Intelligence" });
+  if (await intelButton.count() !== 1) throw new Error(`${name}: intelligence navigation is not unique`);
+  await intelButton.click();
+  await page.locator(".intelligence-workspace").waitFor({ state: "visible", timeout: 15000 });
+  const intelligenceText = await page.locator(".intelligence-workspace").innerText();
+  for (const expected of ["Planning & Learning", "What the data says", "Current plans", "Recent learning", "Trading status"]) {
+    if (!intelligenceText.includes(expected)) throw new Error(name + ": missing visible Intel text: " + expected);
+  }
+  if (/NOT_QUALIFIED|SHADOW_ONLY|UNSPECIFIED|NO ALIGNMENT/.test(intelligenceText)) {
+    throw new Error(`${name}: internal Intel labels leaked into the public dashboard`);
+  }
 
   const screenshot = path.join(ARTIFACTS, `dashboard-${name}.png`);
   await page.screenshot({ path: screenshot, fullPage: true });
@@ -137,7 +155,8 @@ async function verifyViewport(browser, token, name, viewport, mobile) {
     viewport: name,
     current_api_rows: currentRows,
     historical_api_rows: historicalRows,
-    rendered_score_rows: rendered.scoreRows,
+    rendered_story_rows: rendered.storyRows,
+    rendered_stage_tracks: rendered.stageTracks,
     rendered_history_rows: rendered.blockRows,
     metric_cards: rendered.metricCards,
     horizontal_overflow: rendered.horizontalOverflow,

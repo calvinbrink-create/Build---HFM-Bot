@@ -171,6 +171,16 @@ def _score_details_from_signal(sig: dict, market: str, htf_trend: str = "FLAT", 
         "execution_1m": float(m1) if m1 is not None else 0.0,
         "components": explicit,
         "strategy": str(sig.get("strategy") or sig.get("mode") or ""),
+        "score_stage": sig.get("score_stage"),
+        "scan_trigger": "COMPLETED_M5",
+        "scan_cycle_at": sig.get("generated_at"),
+        "bar_times": {
+            "H4_open": sig.get("h4_time"), "H4_close": sig.get("h4_closed_at"),
+            "H1_open": sig.get("h1_time"), "H1_close": sig.get("h1_closed_at"),
+            "M15_open": sig.get("m15_time"), "M15_close": sig.get("m15_closed_at"),
+            "M5_open": sig.get("m5_time"), "M5_close": sig.get("m5_candle_closed_at"),
+            "M1_close": sig.get("baseline_m1_closed_at"),
+        },
     }
     return {
         "score_band": "STRONG" if score >= 80 else "TRADEABLE" if score >= 70 else "WATCH" if score >= 60 else "WEAK",

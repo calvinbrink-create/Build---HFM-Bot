@@ -72,7 +72,7 @@ latest_tick_mtime=0
       if [ -s "$bridge_account_file" ]; then
         # account.txt is a connection receipt, not the market-feed heartbeat.
         # It may be absent briefly while MT5 rebuilds its bridge files.
-        grep -q '^terminal_connected=1$' "$bridge_account_file" 2>/dev/null || account_bad=1
+        tr -d "" < "$bridge_account_file" | grep -q '^terminal_connected=1$' 2>/dev/null || account_bad=1
       fi
       # MT5 refreshes symbol exports in a staggered cycle. Use the newest
       # tick export to detect a dead feed without restarting healthy terminals.

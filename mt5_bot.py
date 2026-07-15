@@ -11,6 +11,7 @@ import re
 import signal
 import threading
 import time
+import traceback
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from mt5_xm_config import MT5RuntimeConfig
 from mt5_xm_gateway import MT5Gateway, MT5PositionView, MT5SymbolSpec
 from trading.execution_service import ExecutionRequest, ExecutionService
 from trading.state_machine import InvalidTransition, TimedRLock, transition_state
-from tick_websocket import TickWebSocketServer
+from tick_websocket import BridgeTickFileRecovery, TickWebSocketServer
+from market_data.feed_health import FeedHealth, LIVE_DATA, STALE_MARKET_DATA
 from trading.remediation import BoundedShadowWorker, build_m15_setup, evaluate_h1_structure
 from trading.observability import GLOBAL_OPERATIONAL_METRICS as _OPS
 from mt5_shared_utils import (
@@ -1112,6 +1114,8 @@ class XM_MT5_Bot:
         self._pending_monitor_wakeup = threading.Event()
         self._pending_monitor_cycle_lock = threading.Lock()
         self._pending_monitor_thread = None
+        self._pending_monitor_exception_keys: set[str] = set()
+        self._data_freshness_state_by_symbol: dict[str, str] = {}
         self._m5_scan_stop = threading.Event()
         self._m5_scan_wakeup = threading.Event()
         self._m5_scan_thread = None
@@ -1129,16 +1133,26 @@ class XM_MT5_Bot:
         # until their own UTC candle boundary so M5 discovery never performs a
         # full higher-timeframe bridge read on every fast cycle.
         self._htf_frame_cache: dict[str, dict] = {}
+        self._htf_frame_cache_lock = threading.RLock()
         self._m5_trigger_events: dict[str, dict] = {}
         self._ws_tick_events: dict[str, dict] = {}
         self._ws_tick_last_m5_bar: dict[str, int] = {}
         self._ws_tick_lock = threading.RLock()
         self._ws_tick_last_status = 0.0
+        self._feed_health = FeedHealth(
+            max_age_seconds=_env_float("MT5_WS_FRESHNESS_MAX_AGE_SECONDS", 5.0, lo=1.0, hi=60.0)
+        )
         self._ws_tick_server = TickWebSocketServer(
             os.getenv("MT5_WS_TICK_HOST", "127.0.0.1"),
             int(os.getenv("MT5_WS_TICK_PORT", "8765") or 8765),
             self._on_websocket_tick,
             enabled=_env_bool("MT5_WS_TICK_ENABLE", True),
+        )
+        self._ws_tick_recovery = BridgeTickFileRecovery(
+            getattr(runtime, "bridge_dir", ""),
+            self._on_websocket_tick,
+            symbol_normalizer=self._canonical_from_resolved,
+            interval_seconds=_env_float("MT5_TICK_FILE_RECOVERY_SECONDS", 0.10, lo=0.05, hi=2.0),
         )
         self._execution_claim_lock = None
         self.gateway = MT5Gateway(runtime)
@@ -1815,14 +1829,31 @@ class XM_MT5_Bot:
         event = dict(event)
         event["symbol"] = canonical
         event["_ws_received_at"] = str(event.get("_ws_received_at") or datetime.utcnow().isoformat())
+        feed_transition = self._feed_health.update_tick(
+            canonical,
+            tick_epoch,
+            source=str(event.get("_feed_source") or "websocket"),
+        )
+        if feed_transition.get("changed"):
+            event_name = "MARKET_DATA_RECOVERED" if feed_transition.get("state") == LIVE_DATA else "STALE_MARKET_DATA"
+            _ss.set_status("market_data_feed_state", feed_transition.get("state"))
+            self._audit_decision({
+                "event": event_name,
+                "decision": "observe",
+                "symbol": canonical,
+                "reason": "factual WebSocket tick state transition",
+                "feed": feed_transition,
+            })
         with self._ws_tick_lock:
             previous_bar = int(self._ws_tick_last_m5_bar.get(canonical) or 0)
             self._ws_tick_last_m5_bar[canonical] = m5_bar_epoch
             self._ws_tick_events[canonical] = event
-        # Discovery is a candle-bound event, not a 250 ms scan. Wake only when
-        # the live tick clock crosses into a new M5 bar.
-        if previous_bar != m5_bar_epoch:
-            self._m5_scan_wakeup.set()
+        # A live M5 trigger is quote-bound. Wake on every factual tick so a
+        # break/retest is evaluated on the first eligible quote, not on the
+        # next five-minute boundary. The trigger identity below prevents the
+        # same classified event from being submitted twice.
+        self._update_m5_priority_frame_from_tick(event)
+        self._m5_scan_wakeup.set()
         # Execution is quote-bound. A live tick wakes pending execution without
         # recalculating H4/H1/M15 strategy context.
         if self.pending_setups:
@@ -1832,6 +1863,7 @@ class XM_MT5_Bot:
             self._ws_tick_last_status = now_mono
             _ss.set_status("mt5_ws_tick_last_event_at", event["_ws_received_at"])
             _ss.set_status("mt5_ws_tick_received_events", int(self._ws_tick_server.received_events))
+            _ss.set_status("mt5_ws_tick_recovery_events", int(self._ws_tick_recovery.event_count))
             _ss.set_status("mt5_ws_tick_connected_clients", int(self._ws_tick_server.connected_clients))
 
     def _websocket_m5_event(self, canonical: str, max_tick_age: float):
@@ -1857,8 +1889,8 @@ class XM_MT5_Bot:
                 )
                 return None
             detected_at = _parse_dt(event.get("_ws_received_at")) or now_utc
-            bucket = int(time.time())
-            trigger_id = f"M5_FORMING:{bar_open_dt.isoformat()}:{bucket}"
+            received_marker = str(event.get("_ws_received_at") or int(tick_epoch * 1000.0))
+            trigger_id = f"M5_FORMING:{bar_open_dt.isoformat()}:{received_marker}"
             return {
                 "trigger_id": trigger_id,
                 "m5_trigger_time": bar_open_dt.isoformat(),
@@ -1876,9 +1908,83 @@ class XM_MT5_Bot:
             _ss.set_status(f"last_m5_trigger_{canonical}", f"WS_TICK_ERROR {str(exc)[:120]}")
             return None
 
-    def _m5_scan_htf_frames(self, canonical: str) -> tuple[object, object, object]:
-        """Return cached H4/H1/M15 context, refreshing only at UTC boundaries."""
+    def _update_m5_priority_frame_from_tick(self, event: dict) -> None:
+        """Update only the cached forming M5 bar from a factual live tick."""
+        try:
+            canonical = canonical_symbol(self._canonical_from_resolved(str(event.get("symbol") or ""))).upper()
+            bar_epoch = int(float(event.get("m5_bar_open_utc") or 0.0))
+            bid = float(event.get("bid") or 0.0)
+            ask = float(event.get("ask") or 0.0)
+            if not canonical or bar_epoch <= 0 or bid <= 0 or ask <= 0:
+                return
+            price = (bid + ask) / 2.0
+            bar_time = pd.to_datetime(bar_epoch, unit="s", utc=True)
+            with self._htf_frame_cache_lock:
+                cache = self._htf_frame_cache.get(canonical)
+                frames = dict(cache.get("frames") or {}) if isinstance(cache, dict) else {}
+                frame = frames.get("M5")
+                if frame is None or not isinstance(frame, pd.DataFrame) or frame.empty:
+                    return
+                updated = frame.copy()
+                updated.index = pd.to_datetime(updated.index, utc=True)
+                columns = {str(column).lower(): column for column in updated.columns}
+                open_col = columns.get("open")
+                high_col = columns.get("high")
+                low_col = columns.get("low")
+                close_col = columns.get("close")
+                if not all((open_col, high_col, low_col, close_col)):
+                    return
+                if updated.index[-1] == bar_time:
+                    updated.at[updated.index[-1], high_col] = max(float(updated.iloc[-1][high_col]), price)
+                    updated.at[updated.index[-1], low_col] = min(float(updated.iloc[-1][low_col]), price)
+                    updated.at[updated.index[-1], close_col] = price
+                else:
+                    row = {column: 0.0 for column in updated.columns}
+                    row[open_col] = price
+                    row[high_col] = price
+                    row[low_col] = price
+                    row[close_col] = price
+                    volume_col = columns.get("volume") or columns.get("tick_volume")
+                    if volume_col:
+                        row[volume_col] = 0.0
+                    updated = pd.concat([updated, pd.DataFrame([row], index=[bar_time])])
+                    updated = updated.tail(max(80, int(self.runtime.history_bars or 80)))
+                cache = dict(cache or {})
+                frames["M5"] = updated
+                cache["frames"] = frames
+                cache["last_tick_update_monotonic"] = time.monotonic()
+                self._htf_frame_cache[canonical] = cache
+        except Exception:
+            return
+
+    def _m5_priority_frame(self, canonical: str):
         canonical = canonical_symbol(self._canonical_from_resolved(canonical)).upper()
+        with self._htf_frame_cache_lock:
+            cache = self._htf_frame_cache.get(canonical) or {}
+            frame = (cache.get("frames") or {}).get("M5")
+            return frame.copy() if isinstance(frame, pd.DataFrame) else frame
+
+    def _m5_scan_htf_frames(self, canonical: str, fast: bool = False) -> tuple[object, object, object]:
+        """Return HTF context, refreshing the cache at completed-frame boundaries."""
+        canonical = canonical_symbol(self._canonical_from_resolved(canonical)).upper()
+        if fast:
+            with self._htf_frame_cache_lock:
+                cache = self._htf_frame_cache.get(canonical) or {}
+                frames = dict(cache.get("frames") or {})
+                next_refresh_at = dict(cache.get("next_refresh_at") or {})
+            timeframes = ("H4", "H1", "M15")
+            missing = [timeframe for timeframe in timeframes if frames.get(timeframe) is None]
+            now_epoch = time.time()
+            due = bool(missing) or any(
+                now_epoch >= float(next_refresh_at.get(timeframe) or 0.0)
+                for timeframe in timeframes
+            )
+            if missing or due:
+                # The M5 event path may reuse only a still-valid snapshot. At
+                # an HTF boundary, run the existing probe/full-refresh path so
+                # a new M5 decision cannot use an old H4/H1/M15 context.
+                return self._m5_scan_htf_frames(canonical, fast=False)
+            return frames["H4"], frames["H1"], frames["M15"]
         now_epoch = time.time()
         cache = self._htf_frame_cache.setdefault(canonical, {"frames": {}, "next_refresh_at": {}, "last_refresh_at": {}})
         frames = cache.setdefault("frames", {})
@@ -3373,7 +3479,10 @@ class XM_MT5_Bot:
                 return False, reason
             self.pending_setups[pending_key] = setup
         self._pending_monitor_wakeup.set()
-        self._save_state()
+        if not fast_entry_mode:
+            self._save_state()
+        else:
+            _ss.set_status("m5_priority_state_persist", "deferred until order result")
         if isinstance(sig, dict):
             sig["pending_setup_created"] = True
             sig["pending_setup"] = setup
@@ -3677,7 +3786,8 @@ class XM_MT5_Bot:
                 "M5_TRIGGERED", pending_key, pending,
                 "M5 break/retest passed; immediate execution checks active", sig
             )
-            self._save_state()
+            if not direct_5m_entry:
+                self._save_state()
         if not direct_5m_entry:
             # Old pending records belong to the retired M1 execution route.
             # They are invalidated rather than allowed to revive that route.
@@ -3691,9 +3801,21 @@ class XM_MT5_Bot:
             self.analytics_engine.record("NOT_QUALIFIED", canonical, str(pending.get("engine") or ""), str(pending.get("strategy") or ""), float(pending.get("score") or 0.0), reason, sig)
             self._remove_pending_setup(pending_key, pending, "expired", "SETUP_EXPIRED", reason, sig)
             return False, reason
-        data_fresh, data_reason, data_evidence = self._pending_execution_data_freshness(
-            canonical, pending, require_m1=not direct_5m_entry
-        )
+        if direct_5m_entry:
+            # The M5 scan already classified this setup using the immutable
+            # HTF/M5 snapshot. Do not fetch or reclassify historical candles
+            # in the order path. Only the deadline and live broker checks
+            # below remain authoritative here.
+            data_fresh, data_reason, data_evidence = True, "M5_PRIORITY_SNAPSHOT_REUSED", {
+                "source": "m5_priority_snapshot",
+                "historical_fetch": False,
+                "context_id": str(pending.get("context_id") or ""),
+                "trigger_detected_at": str(pending.get("trigger_detected_at") or ""),
+            }
+        else:
+            data_fresh, data_reason, data_evidence = self._pending_execution_data_freshness(
+                canonical, pending, require_m1=not direct_5m_entry
+            )
         sig["pending_data_freshness"] = data_evidence
         sig["pending_data_state"] = str(pending.get("_freshness_state") or "")
         if not data_fresh:
@@ -3937,10 +4059,23 @@ class XM_MT5_Bot:
             if ws_started or self._ws_tick_server.enabled else "",
         )
         _ss.set_status("mt5_ws_tick_listener_active", bool(self._ws_tick_server.running))
+        recovery_started = False
+        try:
+            recovery_started = self._ws_tick_recovery.start()
+        except Exception as exc:
+            _ss.set_status("mt5_ws_tick_recovery_error", str(exc)[:180])
+        _ss.set_status("mt5_ws_tick_recovery_active", bool(recovery_started or self._ws_tick_recovery.running))
+        self._feed_health.set_transport(
+            self._ws_tick_server.running or self._ws_tick_recovery.running,
+            self._ws_tick_server.connected_clients,
+        )
+        _ss.set_status("market_data_feed_max_age_seconds", self._feed_health.max_age_seconds)
+        _ss.set_status("market_data_feed_state", self._feed_health.snapshot().get("state"))
         try:
             self.gateway.connect()
         except Exception:
             try:
+                self._ws_tick_recovery.stop()
                 self._ws_tick_server.stop()
             except Exception:
                 pass
@@ -3971,6 +4106,50 @@ class XM_MT5_Bot:
         _ss.set_status("max_open_trades", self._effective_max_open_trades())
         _ss.set_status("max_daily_trades", self._effective_max_daily_trades())
         _ss.set_status("max_position_pct", float(self.runtime.max_position_pct))
+
+    def _warm_m5_priority_cache(self) -> None:
+        """Load one startup snapshot before the live M5 priority worker starts."""
+        symbols = []
+        seen = set()
+        for group_symbols in self.symbol_groups.values():
+            for symbol in group_symbols:
+                canonical = canonical_symbol(self._canonical_from_resolved(symbol)).upper()
+                if canonical and canonical not in seen:
+                    seen.add(canonical)
+                    symbols.append(canonical)
+        if not symbols:
+            return
+
+        def load(canonical):
+            h4, h1, m15 = self._m5_scan_htf_frames(canonical, fast=False)
+            m5 = self.gateway.rates(canonical, "M5", max(80, min(int(self.runtime.history_bars or 80), 120)))
+            with self._htf_frame_cache_lock:
+                cache = self._htf_frame_cache.setdefault(canonical, {"frames": {}, "next_refresh_at": {}, "last_refresh_at": {}})
+                frames = cache.setdefault("frames", {})
+                frames.update({"H4": h4, "H1": h1, "M15": m15, "M5": m5})
+                cache.setdefault("last_refresh_at", {})["M5"] = datetime.utcnow().isoformat()
+            return canonical, True, ""
+
+        ready = []
+        failed = []
+        with ThreadPoolExecutor(max_workers=min(8, len(symbols))) as pool:
+            futures = [pool.submit(load, canonical) for canonical in symbols]
+            for future in as_completed(futures):
+                try:
+                    canonical, ok, reason = future.result()
+                    if ok:
+                        ready.append(canonical)
+                    else:
+                        failed.append("{}:{}".format(canonical, reason))
+                except Exception as exc:
+                    failed.append(str(exc)[:180])
+        detail = "ready={}/{} failed={} symbols={}".format(
+            len(ready), len(symbols), len(failed), ",".join(sorted(ready))
+        )
+        _ss.set_status("m5_priority_context_warmup", detail)
+        print("[M5_PRIORITY_CONTEXT_WARMUP] {}".format(detail), flush=True)
+        if failed:
+            _ss.set_status("m5_priority_context_warmup_failures", " | ".join(sorted(failed))[:2000])
 
     def _start_m5_scan_worker(self, interval: float) -> None:
         if self._m5_scan_thread is not None and self._m5_scan_thread.is_alive():
@@ -4058,8 +4237,23 @@ class XM_MT5_Bot:
                 _ss.set_status("pending_monitor_last_error", "")
             except Exception as exc:
                 error = f"{type(exc).__name__}: {str(exc)[:180]}"
-                _ss.set_status("pending_monitor_last_error", error)
-                print(f"[MT5_PENDING_MONITOR_ERROR] {error}", flush=True)
+                try:
+                    _ss.set_status("pending_monitor_last_error", error)
+                except Exception as status_exc:
+                    print(
+                        f"[MT5_PENDING_MONITOR_STATUS_ERROR] {type(status_exc).__name__}: "
+                        f"{str(status_exc)[:180]}",
+                        flush=True,
+                    )
+                exception_key = f"{type(exc).__name__}:{str(exc)}"
+                if exception_key not in self._pending_monitor_exception_keys:
+                    self._pending_monitor_exception_keys.add(exception_key)
+                    print(
+                        f"[MT5_PENDING_MONITOR_ERROR] {error}\n{traceback.format_exc()}",
+                        flush=True,
+                    )
+                else:
+                    print(f"[MT5_PENDING_MONITOR_ERROR_REPEAT] {error}", flush=True)
             elapsed = time.monotonic() - started
             wait_for = max(0.0, interval - elapsed)
             self._pending_monitor_wakeup.wait(wait_for)
@@ -4141,6 +4335,7 @@ class XM_MT5_Bot:
         _ss.set_status("campaign_monitor_seconds", campaign_interval)
         if pending_monitor_enabled:
             self._start_pending_monitor_worker(pending_monitor_interval)
+        self._warm_m5_priority_cache()
         self._start_m5_scan_worker(m5_trigger_interval)
         live_tickets = []
         try:
@@ -4205,10 +4400,12 @@ class XM_MT5_Bot:
             self._stop_pending_monitor_worker()
             self._stop_shadow_worker()
             try:
+                self._ws_tick_recovery.stop()
                 self._ws_tick_server.stop()
             except Exception:
                 pass
             _ss.set_status("mt5_ws_tick_listener_active", False)
+            _ss.set_status("mt5_ws_tick_recovery_active", False)
             _ss.set_status("shutdown_complete", datetime.utcnow().isoformat())
             _ss.set_status("mt5_connected", False)
             try:
@@ -4419,14 +4616,21 @@ class XM_MT5_Bot:
                 if epoch >= latest_tick_epoch:
                     latest_tick_epoch = epoch
                     latest_tick_received = str(tick.get("_ws_received_at") or "")
+        self._feed_health.set_transport(
+            self._ws_tick_server.running,
+            self._ws_tick_server.connected_clients,
+        )
+        feed_snapshot = self._feed_health.snapshot()
         snapshot["market_data"] = {
+            **feed_snapshot,
             "last_tick_at": latest_tick_received or None,
-            "last_tick_age_seconds": round(max(0.0, time.time() - latest_tick_epoch), 3)
-            if latest_tick_epoch > 0.0 else None,
             "last_m5_bar_open_utc": datetime.utcfromtimestamp(latest_tick_epoch).isoformat() + "Z"
             if latest_tick_epoch > 0.0 else None,
             "websocket_symbols": len(self._ws_tick_events),
-            "freshness_source": "websocket_tick_cache",
+            "recovery_events": int(self._ws_tick_recovery.event_count),
+            "freshness_source": (
+                f"factual_{str(feed_snapshot.get('last_tick_source') or 'websocket')}_tick_cache"
+            ),
         }
         snapshot["service"] = {
             "started_at": self._process_started_at,
@@ -7246,6 +7450,8 @@ class XM_MT5_Bot:
         """Reject a setup only when a newer completed candle invalidates its thesis."""
         if not bool(sig.get("replacement_strategy_v1") or pending.get("replacement_strategy_v1")):
             return True, "legacy route not active"
+        if bool(pending.get("fast_entry_mode") or sig.get("fast_entry_mode")):
+            return True, "direct M5 setup context frozen; no historical reclassification"
         context = pending.get("strict_htf_context") if isinstance(pending.get("strict_htf_context"), dict) else {}
         side = str(pending.get("direction") or sig.get("direction") or "").upper()
         if side not in {"BUY", "SELL"} or not context or str(context.get("status") or "ACTIVE") != "ACTIVE":
@@ -7526,6 +7732,10 @@ class XM_MT5_Bot:
             return finish(False, "BUY order has invalid SL/TP geometry")
         if direction == "SELL" and not (tp < price < sl):
             return finish(False, "SELL order has invalid SL/TP geometry")
+        feed_ok, feed_reason = self._feed_health.entry_allowed(canonical)
+        if not feed_ok:
+            _ss.set_status("market_data_feed_state", STALE_MARKET_DATA)
+            return finish(False, feed_reason)
         if bool((sig or {}).get("replacement_strategy_v1") or ((sig or {}).get("pending_setup") or {}).get("replacement_strategy_v1")):
             profile_ok, profile_reason = True, "STRATEGY_V1_ENGINE_PROFILE"
         else:
@@ -8404,8 +8614,40 @@ class XM_MT5_Bot:
         )
 
 
+    def _record_data_freshness_transition(self, canonical: str, fresh: bool, actual_state: str, reason: str) -> bool:
+        state = "FRESH" if fresh else "STALE"
+        state_by_symbol = getattr(self, "_data_freshness_state_by_symbol", None)
+        if not isinstance(state_by_symbol, dict):
+            state_by_symbol = {}
+            self._data_freshness_state_by_symbol = state_by_symbol
+        previous = state_by_symbol.get(canonical)
+        state_by_symbol[canonical] = state
+        if previous not in {"FRESH", "STALE"} or previous == state:
+            return False
+        detail = str(reason or actual_state).replace("\\n", " ").replace("\\r", " ")[:240]
+        print(
+            f"[MT5_DATA_FRESHNESS_TRANSITION] symbol={canonical} "
+            f"previous={previous} current={state} actual_state={actual_state} reason={detail}",
+            flush=True,
+        )
+        try:
+            self._audit_decision({
+                "event": "MT5_DATA_FRESHNESS_TRANSITION",
+                "symbol": canonical,
+                "previous_state": previous,
+                "current_state": state,
+                "actual_state": actual_state,
+                "reason": detail,
+            })
+        except Exception as exc:
+            print(
+                f"[MT5_DATA_FRESHNESS_AUDIT_ERROR] {type(exc).__name__}: {str(exc)[:180]}",
+                flush=True,
+            )
+        return True
+
     def _replacement_data_freshness(self, canonical: str, frames: dict) -> tuple[bool, str, str, dict]:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc).replace(tzinfo=None)
         timeframe_seconds = {"H4": 14400, "H1": 3600, "M15": 900, "M5": 300, "M1": 60}
         max_age_seconds = {"H4": 18000, "H1": 5400, "M15": 1800, "M5": 720, "M1": 180}
         minimum_bars = {"H4": 60, "H1": 80, "M15": 60, "M5": 40, "M1": 3}
@@ -8453,14 +8695,9 @@ class XM_MT5_Bot:
                 "age_seconds": round(age_seconds, 3),
                 "max_age_seconds": max_age_seconds[label],
             })
-            if raw_latest_open is None or raw_latest_open <= latest_open:
-                row["state"] = "DATA_STALE"
-                problems.append(f"{label} bridge current bar missing or out of order")
-            elif forming_close is not None and now >= forming_close:
-                # The previous final row is only an old intrabar snapshot until
-                # MT5 publishes the next forming bar. Retry instead of scoring it.
-                row["state"] = "DATA_STALE"
-                problems.append(f"{label} bridge has not advanced beyond {raw_latest_open.isoformat()}")
+            if raw_latest_open is not None and raw_latest_open < latest_open:
+                row["state"] = "DATA_CLOCK_INVALID"
+                problems.append(f"{label} bridge timestamps are out of order")
             elif age_seconds < -120:
                 row["state"] = "DATA_CLOCK_INVALID"
                 problems.append(f"{label} completed candle is {-age_seconds:.0f}s in the future")
@@ -8505,22 +8742,30 @@ class XM_MT5_Bot:
             problems.append(f"TICK unavailable: {str(exc)[:120]}")
         if getattr(self, "intelligence", None) is not None:
             try:
+                required_timeframes = ("H4", "H1", "M15", "M5")
+                if frames.get("M1") is not None:
+                    required_timeframes = required_timeframes + ("M1",)
                 integrity = self.intelligence.data.validate_frames(
                     frames,
                     tick=tick,
                     tick_max_age_seconds=tick_max_age,
+                    required_timeframes=required_timeframes,
                 )
                 evidence["INTEGRITY"] = integrity
             except Exception as exc:
                 evidence["INTEGRITY"] = {"status": "UNAVAILABLE", "issues": [str(exc)[:180]]}
         if problems:
             state = "DATA_MISSING" if any("missing" in item.lower() or "unavailable" in item.lower() for item in problems) else "DATA_STALE"
+            reason = "; ".join(problems)
             if getattr(self, "intelligence", None) is not None:
                 self.intelligence.record_health(canonical, state, {"problems": problems, "evidence": evidence})
-            return False, state, "; ".join(problems), evidence
+            self._record_data_freshness_transition(canonical, False, state, reason)
+            return False, state, reason, evidence
         if getattr(self, "intelligence", None) is not None:
             self.intelligence.record_health(canonical, "FRESH", evidence)
-        return True, "FRESH", "all required H4/H1/M15/M5 and tick inputs are fresh", evidence
+        reason = "all required H4/H1/M15/M5 and tick inputs are fresh"
+        self._record_data_freshness_transition(canonical, True, "FRESH", reason)
+        return True, "FRESH", reason, evidence
 
     def _strategy_v1_frame(self, frame, label: str, completed_only: bool = False):
         if frame is None:
@@ -8598,15 +8843,6 @@ class XM_MT5_Bot:
                 "_decision_trace": [],
             }
             self._upsert_signal(canonical, market, sig, 0.0, 0.0, sig["block_reason"], False, _score_details_from_signal(sig, market), group)
-            self._audit_decision({
-                "event": data_state,
-                "decision": "not_qualified",
-                "symbol": canonical,
-                "engine": engine_name,
-                "reason": freshness_reason,
-                "freshness": freshness,
-            })
-            print(f"[MT5_DATA_FRESHNESS] symbol={canonical} state={data_state} reason={freshness_reason}", flush=True)
             return True
         # H4/H1/M15 remain completed context. M5 is the sole live trigger
         # and a valid M5 PASS goes directly to the order path.
@@ -8995,6 +9231,17 @@ class XM_MT5_Bot:
             return True
         # M5 break/retest is a binary execution event. Only PASS reaches
         # the order path; a missing trigger creates no pending setup.
+        # The WebSocket event wakes this scan, but its receipt timestamp is not
+        # necessarily when the current M5 frame passed. Use the decision
+        # observation time for the direct execution window so a valid PASS
+        # cannot inherit an already-expired wake-up deadline.
+        if m5_is_forming and fast_entry_mode:
+            event_seen_at = _parse_dt(sig.get("trigger_detected_at"))
+            decision_observed_at = datetime.utcnow()
+            if event_seen_at is not None:
+                sig["trigger_event_seen_at"] = event_seen_at.isoformat()
+            sig["trigger_detected_at"] = decision_observed_at.isoformat()
+            sig["trigger_decision_observed_at"] = decision_observed_at.isoformat()
         profile_ok, profile_reason = self._symbol_profile_gate_allows_entry(canonical, market, sig)
         if not profile_ok:
             reason = f"STRATEGY_V1_NOT_QUALIFIED profile {profile_reason}"
@@ -9057,14 +9304,14 @@ class XM_MT5_Bot:
             sig["not_qualified"] = True
             sig["block_reason"] = reason
             sig["pending_reason"] = reason
-        self._upsert_signal(canonical, market, sig, price, atr_value, reason, created, details, group)
         if created and bool(sig.get("fast_entry_mode")):
-            # A fresh M5 PASS is executed in this scan through the same
-            # idempotent pending/order path. The monitor thread is recovery
-            # only; it must not add a decision delay.
+            # A fresh M5 PASS is executed before dashboard persistence. The
+            # monitor thread is recovery only; it must not add a decision or
+            # database-write delay to the order path.
             with self._pending_monitor_cycle_lock:
                 self._monitor_pending_setups()
-        state_label = "ORDER_PATH_COMPLETE" if created and bool(sig.get("fast_entry_mode")) else "NO_SETUP"
+        self._upsert_signal(canonical, market, sig, price, atr_value, reason, created, details, group)
+        state_label = "EXECUTION_ATTEMPTED" if created and bool(sig.get("fast_entry_mode")) else "NO_SETUP"
         print(f"[STRATEGY_V1] symbol={canonical} engine={sig['engine']} state={state_label} side={decision.side} score={decision.score:.2f} pending_created={int(created)} reason={reason}", flush=True)
         return True
 
@@ -9105,12 +9352,20 @@ class XM_MT5_Bot:
                 pass
         try:
             if source_loop_name == "m5_event_trigger":
-                h4, h1, m15 = self._m5_scan_htf_frames(canonical)
+                h4, h1, m15 = self._m5_scan_htf_frames(canonical, fast=True)
+                m5 = self._m5_priority_frame(canonical)
+                if m5 is None:
+                    raise RuntimeError("M5_PRIORITY_M5_CACHE_MISS {}".format(canonical))
             else:
                 h4 = self.gateway.rates(canonical, "H4", max(80, self.runtime.history_bars // 4))
                 h1 = self.gateway.rates(canonical, "H1", max(120, self.runtime.history_bars // 2))
                 m15 = self.gateway.rates(canonical, "M15", max(160, self.runtime.history_bars))
-            m5 = self.gateway.rates(canonical, "M5", max(180, self.runtime.history_bars))
+                m5 = self.gateway.rates(canonical, "M5", max(180, self.runtime.history_bars))
+                with self._htf_frame_cache_lock:
+                    cache = self._htf_frame_cache.setdefault(canonical, {"frames": {}, "next_refresh_at": {}, "last_refresh_at": {}})
+                    frames = cache.setdefault("frames", {})
+                    frames.update({"H4": h4, "H1": h1, "M15": m15, "M5": m5})
+                    cache["last_refresh_at"]["M5"] = datetime.utcnow().isoformat()
             # Direct M5 execution does not authorize from M1. Avoid the
             # unnecessary bridge round-trip; M1 is not part of this route.
             m1 = None if self._live_m5_direct_entry_enabled() else self.gateway.rates(canonical, "M1", 61)
@@ -9670,11 +9925,9 @@ class XM_MT5_Bot:
             stats["pending_active"] = max(int(stats.get("pending_active", 0) or 0), len(self.pending_setups))
         except Exception:
             pass
-        tradeable_today = (
-            int(stats.get("pending_active", 0) or 0)
-            + int(stats.get("confirmed", 0) or 0)
-            + int(stats.get("executed", 0) or 0)
-        )
+        # A pending or confirmed setup is not a trade. Only broker-confirmed
+        # executions may be reported as tradeable_today.
+        tradeable_today = int(stats.get("executed", 0) or 0)
         parts = [
             f"ruleset_version={RULESET_VERSION}",
             f"kind={kind}",

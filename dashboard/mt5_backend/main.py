@@ -6,6 +6,7 @@ import sys
 import csv
 import json
 import time
+import sqlite3
 import urllib.request as _ur
 import xml.etree.ElementTree as _ET
 from datetime import datetime, timedelta, timezone
@@ -16,7 +17,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -31,6 +32,10 @@ import app_store  # noqa: E402
 import state_store as db  # noqa: E402
 from mt5_xm_config import MT5RuntimeConfig  # noqa: E402
 from mt5_xm_gateway import MT5Gateway  # noqa: E402
+try:
+    from visual_market_intelligence import fetch_visual_summary  # noqa: E402
+except Exception:
+    fetch_visual_summary = None
 
 db.init_db()
 app_store.init_db()
@@ -152,6 +157,54 @@ def _connected() -> bool:
     return str(raw).lower() == "true" if isinstance(raw, str) else bool(raw)
 
 
+_INTELLIGENCE_TABLES = (
+    "trade_permission_decisions", "market_data_health", "market_regimes",
+    "strategy_permissions", "premarket_plans", "premarket_plan_versions",
+    "premarket_plan_events", "liquidity_levels", "session_profiles", "gap_events",
+    "news_events", "execution_cost_models", "setup_scores",
+    "portfolio_exposure_snapshots", "shadow_trades", "system_health_events",
+    "reconciliation_events", "configuration_versions", "trade_flow_snapshots",
+    "score_adjustments", "trade_attribution", "missed_trades", "false_entries",
+    "walk_forward_runs", "walk_forward_results", "live_drift_snapshots",
+    "trade_replay_events", "kill_switch_events", "database_integrity_events",
+    "deployment_versions", "notifications", "trade_excursions", "trade_outcomes",
+    "broker_symbol_specs",
+)
+
+def _intelligence_sql(sql, params=()):
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+    finally:
+        conn.close()
+
+
+def _intelligence_rows(table, limit=50, symbol="", status=""):
+    if table not in _INTELLIGENCE_TABLES:
+        raise HTTPException(status_code=400, detail="Unsupported intelligence table")
+    clauses = []
+    params = []
+    if symbol:
+        clauses.append("symbol=?")
+        params.append(str(symbol).upper())
+    if status:
+        clauses.append("status=?")
+        params.append(str(status))
+    where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+    rows = _intelligence_sql("SELECT * FROM " + table + where + " ORDER BY id DESC LIMIT ?", params + [max(1, min(int(limit or 50), 500))])
+    result = []
+    for row in rows:
+        payload = {}
+        try:
+            payload = json.loads(row.get("payload_json") or "{}")
+        except Exception:
+            payload = {}
+        row["payload"] = payload
+        result.append(row)
+    return result
+
 def _bridge_dir() -> Path:
     return Path(os.getenv("MT5_BRIDGE_DIR", "/root/.mt5/drive_c/Program Files/MetaTrader 5/MQL5/Files/cipherfx"))
 
@@ -238,17 +291,37 @@ def _fresh_bridge_csv(path: Path, max_age_seconds: int = 180) -> bool:
         return False
 
 
-def _read_bridge_rates(symbol: str, timeframe: str, limit: int | None = None) -> list[dict]:
+def _bridge_rows_are_fresh(rows: list[dict], max_age_seconds: int) -> bool:
+    if not rows:
+        return False
+    latest = None
+    for row in reversed(rows):
+        try:
+            candidate = float(row.get("time") or row.get("ts") or 0)
+        except (TypeError, ValueError):
+            continue
+        if candidate > 0:
+            latest = candidate
+            break
+    if latest is None:
+        return False
+    return max(0.0, time.time() - latest) <= float(max_age_seconds)
+
+
+def _read_bridge_rates(symbol: str, timeframe: str, limit: int | None = None, max_age_seconds: int = 180) -> list[dict]:
     resolved = _resolve_symbol_code(symbol)
     path = _bridge_dir() / f"rates_{resolved}_{timeframe.upper()}.csv"
-    if not _fresh_bridge_csv(path):
+    if not _fresh_bridge_csv(path, max_age_seconds):
         fallback = _bridge_dir() / f"rates_{str(symbol or '').strip().upper()}_{timeframe.upper()}.csv"
-        if fallback == path or not _fresh_bridge_csv(fallback):
+        if fallback == path or not _fresh_bridge_csv(fallback, max_age_seconds):
             return []
         path = fallback
-    if not _fresh_bridge_csv(path):
+    if not _fresh_bridge_csv(path, max_age_seconds):
         return []
-    return _read_csv(path, limit)
+    rows = _read_csv(path, limit)
+    # File mtime alone is not proof of fresh market data. Reject a file that
+    # was touched recently but whose latest candle is still old.
+    return rows if _bridge_rows_are_fresh(rows, max_age_seconds) else []
 
 
 def _aggregate_rate_rows(rows: list[dict], timeframe: str, limit: int) -> list[dict]:
@@ -479,6 +552,61 @@ def _terminal_ticks(symbols: list[str] | None = None) -> list[dict]:
     return out
 
 
+def _optional_float(value):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _live_bridge_ticks(symbols: list[str] | None = None) -> list[dict]:
+    """Read quote files only; this endpoint never reads bot state or synthetic data."""
+    wanted = {str(item or "").strip().upper() for item in (symbols or []) if str(item or "").strip()}
+    # The dashboard requests canonical names; MT5 writes broker aliases.
+    wanted.update(_resolve_symbol_code(item).upper() for item in list(wanted))
+    rows = []
+    for path in sorted(_bridge_dir().glob("tick_*.txt")):
+        resolved = path.stem.replace("tick_", "").upper()
+        if wanted and resolved not in wanted:
+            continue
+        raw = _read_kv(path)
+        bid = _optional_float(raw.get("bid"))
+        ask = _optional_float(raw.get("ask"))
+        last = _optional_float(raw.get("last"))
+        try:
+            age = max(0.0, time.time() - path.stat().st_mtime)
+        except OSError:
+            age = None
+        rows.append({
+            "symbol": resolved,
+            "bid": bid,
+            "ask": ask,
+            "last": last,
+            "spread": (ask - bid) if bid is not None and ask is not None else None,
+            "time": raw.get("time") or None,
+            "age_seconds": round(age, 3) if age is not None else None,
+            "fresh": age is not None and age <= 5.0,
+            "source": "mt5_bridge_tick",
+        })
+    return rows
+
+
+def _live_candle_age_limit(timeframe: str) -> int:
+    # Bridge rate files advance on their candle boundary; quote freshness is
+    # handled independently by _live_bridge_ticks(). Allow one bar period for
+    # the current candle file, never a database or synthetic fallback.
+    return {
+        "M1": 75,
+        "M5": 330,
+        "M15": 930,
+        "M30": 1830,
+        "H1": 3660,
+        "H4": 15000,
+        "D1": 90000,
+    }.get(str(timeframe or "").upper(), 180)
+
+
 def _usd_zar_rate() -> dict:
     now = time.time()
     ttl = int(os.getenv("USDZAR_CACHE_SECONDS", "900") or "900")
@@ -645,8 +773,40 @@ def _synthetic_candles(symbol: str, limit: int, timeframe: str) -> list[dict]:
     return rows
 
 
+def _overlay_live_tick(rows: list[dict], symbol: str) -> list[dict]:
+    if not rows:
+        return rows
+    fresh_tick = next(
+        (
+            tick for tick in _live_bridge_ticks([symbol])
+            if tick.get("fresh") and tick.get("bid") is not None and tick.get("ask") is not None
+        ),
+        None,
+    )
+    if not fresh_tick:
+        return rows
+    price = (float(fresh_tick["bid"]) + float(fresh_tick["ask"])) / 2.0
+    updated = dict(rows[-1])
+    try:
+        updated["open"] = float(updated.get("open"))
+        updated["high"] = max(float(updated.get("high")), price)
+        updated["low"] = min(float(updated.get("low")), price)
+    except (TypeError, ValueError):
+        return rows
+    updated["close"] = price
+    updated["source"] = "mt5_bridge_tick_overlay"
+    updated["tick_time"] = fresh_tick.get("time")
+    updated["quote_age_seconds"] = fresh_tick.get("age_seconds")
+    return rows[:-1] + [updated]
+
+
 def _candle_payload(row: dict, source: str = "mt5_bridge") -> dict:
-    time_detail = db.date_detail_for(row.get("time") or row.get("ts"))
+    raw_time = row.get("time") or row.get("ts")
+    time_detail = db.date_detail_for(raw_time)
+    try:
+        age_seconds = max(0.0, time.time() - float(raw_time))
+    except (TypeError, ValueError):
+        age_seconds = None
     return {
         "ts": time_detail.get("iso") or row.get("time", ""),
         "time_label": time_detail.get("label", ""),
@@ -657,6 +817,10 @@ def _candle_payload(row: dict, source: str = "mt5_bridge") -> dict:
         "close": _finite(row.get("close"), digits=8),
         "volume": _finite(row.get("volume"), digits=0),
         "source": row.get("source") or source,
+        "bar_age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
+        "tick_time": row.get("tick_time"),
+        "quote_age_seconds": row.get("quote_age_seconds"),
+        "fresh": age_seconds is not None and age_seconds <= _live_candle_age_limit("M1"),
     }
 
 
@@ -684,19 +848,9 @@ def _bridge_positions() -> list[dict]:
 
 
 def _positions() -> list[dict]:
-    bridge_rows = _bridge_positions()
-    if bridge_rows:
-        return bridge_rows
-    rows = db.read_positions(include_stale=True)
-    return [
-        {
-            **row,
-            "venue": row.get("venue") or "XM Global MT5",
-            "source": "mt5_runtime",
-            "stale": False,
-        }
-        for row in rows
-    ]
+    # The live dashboard must never present SQLite/runtime positions as open
+    # MT5 positions when the bridge has no current snapshot.
+    return _bridge_positions()
 
 
 def _orders() -> list[dict]:
@@ -960,6 +1114,38 @@ def _read_audit_window(start_utc, end_utc):
     _AUDIT_CACHE.update(key=key, rows=rows)
     return rows
 
+def _simple_public_reason(raw) -> str:
+    value = str(raw or "").lower()
+    if "market_window_closed" in value or "markets_closed" in value or "market closed" in value or "weekend" in value:
+        return "Markets closed"
+    if "extended" in value or "exhaust" in value or "vertical" in value or "danger" in value:
+        return "Move exhausted"
+    if "spread" in value or "volatile" in value:
+        return "Volatile market"
+    if "m15" in value or "pullback" in value or "reclaim" in value or "continuation" in value:
+        return "Choppy market"
+    if "range" in value:
+        return "Range-bound market"
+    if "no directional" in value or "flat" in value:
+        return "Flat market"
+    if "trend" in value or "htf" in value or "alignment" in value:
+        return "Trend not aligned"
+    if "stale" in value or "missing" in value or "data_" in value:
+        return "Data updating"
+    if "1m" in value or "confirmation" in value:
+        return "Waiting for confirmation"
+    if "cost" in value:
+        return "Trading cost too high"
+    if "profile" in value or "engine policy" in value or "final_gate" in value:
+        return "Quality check"
+    if "daily" in value or "loss" in value or "risk" in value:
+        return "Risk limit"
+    if "rejected" in value:
+        return "Order declined"
+    if "not qualified" in value:
+        return "No clear setup"
+    return "No clear setup"
+
 def _audit_context(data):
     evidence = data.get("evidence") if isinstance(data.get("evidence"), dict) else {}
     htf = evidence.get("higher_timeframes") if isinstance(evidence.get("higher_timeframes"), dict) else {}
@@ -992,22 +1178,23 @@ def _audit_context(data):
         "symbol": data.get("symbol") or data.get("sym") or "", "side": side,
         "engine": engine, "setup_type": setup_type, "score": score,
         "score_band": metric.get("band") or "",
-        "score_metric": {"version": metric.get("version") or "quality_v2", "total": score,
-                         "band": metric.get("band") or "", "components": metric.get("components") or {},
-                         "maxima": metric.get("maxima") or {}},
+        "score_metric": {"version": "cipher_fx_score", "total": score,
+                         "band": metric.get("band") or "", "components": {},
+                         "maxima": {}},
         "h4_bias": h4b or ta.get("h4_bias") or "", "h4_score": h4s if h4s is not None else ta.get("h4_score"),
         "h1_bias": h1b or ta.get("h1_bias") or "", "h1_score": h1s if h1s is not None else ta.get("h1_score", ta.get("bias_1h_score")),
         "m15_bias": m15b or ta.get("m15_bias") or "", "m15_score": m15s if m15s is not None else ta.get("m15_score", ta.get("setup_15m_score")),
         "m5_trigger_side": m5.get("side") or "", "m5_trigger_score": ta.get("trigger_5m_score"),
         "m1_status": m1.get("status") or ta.get("execution_1m_result") or "",
         "m1_confirmation_side": m1.get("direction_required") or ta.get("confirmation_side") or "",
-        "final_status": data.get("final_status") or ("PASS" if passed else "BLOCK"),
-        "gate_ok": passed, "reason": str(reason or "").strip(),
+        "final_status": "READY" if passed else _simple_public_reason(reason),
+        "gate_ok": passed, "reason": _simple_public_reason(reason), "public_metric_name": "Cipher FX Score", "public_mode": "Shadow",
         "setup_id": data.get("setup_id") or "", "setup_created_at": data.get("setup_created_at") or "",
         "confirmation_detected_at": data.get("confirmation_detected_at") or "",
         "ts": data.get("ts") or data.get("timestamp") or data.get("generated_at") or "",
         "event": data.get("event") or "", "scope": data.get("scope") or "",
-        "raw_status": data.get("status") or data.get("decision") or "",
+        "raw_status": _simple_public_reason(reason),
+        "public_metric_name": "Cipher FX Score", "public_mode": "Shadow",
     }
 
 def _audit_reason(row):
@@ -1031,7 +1218,12 @@ def _market_hours_snapshot(now_sast=None):
     ]
     sessions = []
     for sid,label,tzname,ot,ct in defs:
-        tz = ZoneInfo(tzname); local = now_sast.astimezone(tz)
+        tz = ZoneInfo(tzname)
+        if sid == "uk_london":
+            ot, ct = (10, 0), (19, 30)
+            local = now_sast
+        else:
+            local = now_sast.astimezone(tz)
         od = local.replace(hour=ot[0],minute=ot[1],second=0,microsecond=0)
         cd = local.replace(hour=ct[0],minute=ct[1],second=0,microsecond=0)
         is_open = local.weekday() < 5 and od <= local < cd
@@ -1078,8 +1270,8 @@ def _live_audit_summary():
     scanner=[x[1] for x in sorted(latest.values(),key=lambda x:x[1].get("ts") or "",reverse=True)]
     if market["weekend_closed"]:
         for row in scanner: row.update(current_market_status="MARKETS_CLOSED_WEEKEND",current_market_reason=market["global_reason"])
-    return {"source":"mt5_decision_audit.jsonl","score_source":"quality_v2",
-            "window":{"start_sast":start_sast.isoformat(),"end_sast":now_sast.isoformat(),"label":"Since 21:00 SAST last night"},
+    return {"source":"mt5_decision_audit.jsonl","score_source":"cipher_fx_score","public_metric_name":"Cipher FX Score","public_mode":"Shadow",
+            "window":{"start_sast":start_sast.isoformat(),"end_sast":now_sast.isoformat(),"label":"Current session"},
             "market":market,"counts":counts,"scanner_rows":scanner[:60],"blocks":blocks[:160],"trades":trades[:120],
             "reason_counts":sorted(({"reason":k,"count":v} for k,v in counts.items()),key=lambda x:x["count"],reverse=True),
             "updated_at":datetime.now(timezone.utc).isoformat()}
@@ -1141,6 +1333,279 @@ def status():
     }
 
 
+
+@app.get("/api/visual/status", dependencies=[Depends(_session_user)])
+def visual_status():
+    if fetch_visual_summary is None:
+        return {
+            "mode": "Shadow",
+            "available": False,
+            "reason": "visual module unavailable",
+            "verified_profitability": False,
+        }
+    try:
+        summary = fetch_visual_summary(str(db.DB_PATH))
+        summary["available"] = True
+        for _hidden in ("prediction_count", "abstention_count", "predictions", "abstentions", "live_prediction_at"):
+            summary.pop(_hidden, None)
+        summary["live_status"] = "Shadow"
+        return summary
+    except Exception as exc:
+        return {"mode": "Shadow", "available": False,
+                "verified_profitability": False, "reason": str(exc)[:180]}
+@app.get("/api/intelligence/summary", dependencies=[Depends(_session_user)])
+def intelligence_summary():
+    counts = _intelligence_sql("SELECT status, COUNT(*) AS count FROM trade_permission_decisions GROUP BY status ORDER BY count DESC")
+    health = _intelligence_sql("SELECT status, COUNT(*) AS count FROM market_data_health GROUP BY status ORDER BY count DESC")
+    table_counts = {}
+    for table in _INTELLIGENCE_TABLES:
+        table_counts[table] = _intelligence_sql("SELECT COUNT(*) AS count FROM " + table)[0]["count"]
+    runtime_raw = db.read_status("intelligence_runtime_audit")
+    try:
+        runtime_audit = json.loads(runtime_raw or "{}")
+    except Exception:
+        runtime_audit = {}
+    return {
+        "mode": "Shadow",
+        "engines_mode": "Shadow",
+        "engines_version": db.read_status("intelligence_engines_version") or "",
+        "decision_counts": counts,
+        "market_data_health": health,
+        "table_counts": table_counts,
+        "runtime_audit": runtime_audit,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+
+@app.get("/api/intelligence/overview", dependencies=[Depends(_session_user)])
+def intelligence_overview():
+    """Return the live planning, learning, validation and execution story.
+
+    All values come from the authoritative MT5 SQLite state database. Learning
+    records are deliberately presented as diagnostic/shadow evidence and never
+    as permission to trade.
+    """
+    def payload(row):
+        value = row.get("payload_json") if isinstance(row, dict) else None
+        try:
+            decoded = json.loads(value or "{}")
+            return decoded if isinstance(decoded, dict) else {}
+        except Exception:
+            return {}
+
+    def count(table):
+        try:
+            return int(_intelligence_sql("SELECT COUNT(*) AS count FROM " + table)[0]["count"])
+        except Exception:
+            return 0
+
+    def rows(table, limit=50):
+        try:
+            return _intelligence_rows(table, limit)
+        except Exception:
+            return []
+
+    def latest(table):
+        found = rows(table, 1)
+        return found[0] if found else None
+
+    def created(row):
+        return (row or {}).get("created_at") or (row or {}).get("updated_at") or (row or {}).get("event_time") or ""
+
+    def plan_view(row):
+        data = payload(row)
+        latest_ids = data.get("latest_candle_ids")
+        if not isinstance(latest_ids, dict):
+            latest_ids = {}
+        conditions = data.get("required_conditions")
+        if not isinstance(conditions, list):
+            conditions = []
+        return {
+            "plan_id": data.get("plan_id") or row.get("plan_id") or "",
+            "symbol": data.get("symbol") or row.get("symbol") or "",
+            "asset_class": data.get("asset_class") or "",
+            "status": row.get("status") or data.get("status") or "",
+            "created_at": created(row),
+            "alignment": data.get("alignment") or "",
+            "confidence": data.get("confidence"),
+            "daily_bias": data.get("daily_bias") or "",
+            "h4_bias": data.get("h4_bias") or "",
+            "h4_score": data.get("h4_score"),
+            "h1_bias": data.get("h1_bias") or "",
+            "h1_score": data.get("h1_score"),
+            "m15_bias": data.get("m15_bias") or "",
+            "m15_score": data.get("m15_score"),
+            "entry_zone": data.get("entry_zone") or "",
+            "required_conditions": conditions[:5],
+            "latest_candle_ids": latest_ids,
+            "contradictions": data.get("contradictions") or [],
+        }
+
+    plan_rows = rows("premarket_plans", 120)
+    latest_plans = []
+    seen_symbols = set()
+    for row in plan_rows:
+        view = plan_view(row)
+        symbol = str(view.get("symbol") or "").upper()
+        if symbol in seen_symbols:
+            continue
+        if symbol:
+            seen_symbols.add(symbol)
+            latest_plans.append(view)
+        if len(latest_plans) >= 12:
+            break
+
+    adjustment_views = []
+    for row in rows("score_adjustments", 20):
+        data = payload(row)
+        adjustment_views.append({
+            "symbol": data.get("symbol") or row.get("symbol") or "",
+            "created_at": created(row),
+            "score_before": data.get("score_before"),
+            "score_adjustment": data.get("score_adjustment"),
+            "score_after": data.get("score_after"),
+            "plan_alignment": data.get("plan_alignment") or "",
+            "applied": bool(data.get("applied", data.get("applied_to_live_permission", False))),
+            "mode": data.get("mode") or row.get("status") or "SHADOW_ONLY",
+            "reason": data.get("reason") or row.get("reason") or "",
+        })
+
+    decision_counts = _intelligence_sql(
+        "SELECT status, COUNT(*) AS count FROM trade_permission_decisions GROUP BY status ORDER BY count DESC"
+    )
+    health_counts = _intelligence_sql(
+        "SELECT status, COUNT(*) AS count FROM market_data_health GROUP BY status ORDER BY count DESC"
+    )
+    decision = latest("trade_permission_decisions")
+    decision_payload = payload(decision) if decision else {}
+    latest_decision = {
+        "symbol": (decision or {}).get("symbol") or decision_payload.get("symbol") or "",
+        "setup_id": decision_payload.get("setup_id") or (decision or {}).get("setup_id") or "",
+        "status": (decision or {}).get("status") or decision_payload.get("status") or "",
+        "reason": decision_payload.get("reason") or (decision or {}).get("reason") or "",
+        "created_at": created(decision),
+    }
+
+    wf_row = latest("walk_forward_runs")
+    wf_data = payload(wf_row) if wf_row else {}
+    walk_forward = {
+        "status": (wf_row or {}).get("status") or wf_data.get("status") or "UNAVAILABLE",
+        "created_at": created(wf_row),
+        "sample_size": wf_data.get("sample_size"),
+        "fold_count": wf_data.get("fold_count"),
+        "overfit": wf_data.get("overfit"),
+        "overfit_folds": wf_data.get("overfit_folds"),
+        "leakage_guard": wf_data.get("leakage_guard") or "",
+    }
+    drift_row = latest("live_drift_snapshots")
+    drift_data = payload(drift_row) if drift_row else {}
+    drift = {
+        "status": (drift_row or {}).get("status") or drift_data.get("status") or "UNAVAILABLE",
+        "created_at": created(drift_row),
+        "recent_expectancy_r": drift_data.get("recent_expectancy_r"),
+        "prior_expectancy_r": drift_data.get("prior_expectancy_r"),
+        "expectancy_delta_r": drift_data.get("expectancy_delta_r"),
+        "recent_win_rate": drift_data.get("recent_win_rate"),
+        "prior_win_rate": drift_data.get("prior_win_rate"),
+        "mode": drift_data.get("mode") or "OBSERVE_ONLY",
+    }
+
+    deployment_row = latest("deployment_versions")
+    deployment_data = payload(deployment_row) if deployment_row else {}
+    deployment = {
+        "status": (deployment_row or {}).get("status") or deployment_data.get("status") or "UNAVAILABLE",
+        "created_at": created(deployment_row),
+        "stage": deployment_data.get("stage") or "",
+        "trade_mode": deployment_data.get("trade_mode") or "",
+        "execution_mode": deployment_data.get("execution_mode") or "",
+        "replacement_strategy_live": bool(deployment_data.get("replacement_strategy_live", False)),
+        "live_approval": bool(deployment_data.get("live_approval", False)),
+    }
+
+    applied_adjustments = sum(1 for item in adjustment_views if item["applied"])
+    last_plan_at = latest_plans[0]["created_at"] if latest_plans else ""
+    data_connected = _connected()
+    last_scan = db.read_status("last_scan")
+    last_heartbeat = db.read_status("last_heartbeat")
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "source": "mt5_state.db",
+        "mode": "Shadow",
+        "data_status": {
+            "mt5_connected": data_connected,
+            "last_scan": last_scan,
+            "last_heartbeat": last_heartbeat,
+            "health_counts": health_counts,
+            "broker_symbol_specs": count("broker_symbol_specs"),
+            "plan_latest_at": last_plan_at,
+        },
+        "planning": {
+            "status": "READY" if latest_plans else "NO_PLANS",
+            "plan_count": count("premarket_plans"),
+            "latest_by_symbol": latest_plans,
+            "latest_plan_at": last_plan_at,
+            "story": (
+                "The planner is building symbol plans from persisted H4, H1 and M15 context. "
+                "A plan is evidence of preparation, not an order."
+                if latest_plans else
+                "No persisted plans are available from the MT5 state database."
+            ),
+        },
+        "learning": {
+            "mode": "SHADOW_ONLY",
+            "adjustments_count": count("score_adjustments"),
+            "applied_count": applied_adjustments,
+            "latest_adjustments": adjustment_views[:12],
+            "shadow_sample_count": count("shadow_trades"),
+            "missed_replay_count": count("missed_trades"),
+            "attribution_bucket_count": count("trade_attribution"),
+            "false_entry_review_count": count("false_entries"),
+            "story": (
+                "Learning is diagnostic only. It records score adjustments and replay evidence; "
+                "it does not change live permission."
+            ),
+        },
+        "validation": {
+            "walk_forward": walk_forward,
+            "drift": drift,
+            "story": "Validation and drift are evidence about the stored sample, not a promise of future profit.",
+        },
+        "execution": {
+            "decision_counts": decision_counts,
+            "last_decision": latest_decision,
+            "deployment": deployment,
+            "story": (
+                "Execution truth comes from the MT5 decision and deployment records. "
+                "The page does not treat a plan or shadow adjustment as a fill."
+            ),
+        },
+    }
+
+@app.get("/api/intelligence/decisions", dependencies=[Depends(_session_user)])
+def intelligence_decisions(limit: int = 100, symbol: str = "", status: str = ""):
+    return _intelligence_rows("trade_permission_decisions", limit, symbol, status)
+
+
+@app.get("/api/intelligence/evidence", dependencies=[Depends(_session_user)])
+def intelligence_evidence(table: str = "setup_scores", limit: int = 100, symbol: str = "", status: str = ""):
+    return {
+        "table": table,
+        "rows": _intelligence_rows(table, limit, symbol, status),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/intelligence/runtime", dependencies=[Depends(_session_user)])
+def intelligence_runtime():
+    raw = db.read_status("intelligence_runtime_audit")
+    try:
+        return json.loads(raw or "{}")
+    except Exception:
+        return {"status": "UNAVAILABLE", "raw": raw}
+
+
+@app.get("/api/audit/summary", dependencies=[Depends(_session_user)])
 
 @app.get("/api/audit/summary", dependencies=[Depends(_session_user)])
 def audit_summary():
@@ -1209,32 +1674,80 @@ def stats():
     return db.read_stats()
 
 
+@app.get("/api/replay", dependencies=[Depends(_session_user)])
+def replay(sym: str = "EURUSD", limit: int = 500, timeframe: str = "M5"):
+    count = max(20, min(int(limit or 500), 1000))
+    code = sym.upper()
+    tf = (timeframe or "M5").upper()
+    bridge_rows = _read_bridge_rates(code, tf, count)
+    if not bridge_rows:
+        db_rows = db.read_candles(code, count)
+        bridge_rows = db_rows or []
+    return {
+        "symbol": code,
+        "timeframe": tf,
+        "source": "mt5_bridge" if bridge_rows and bridge_rows[0].get("source") == "mt5_bridge" else "sqlite",
+        "candles": [_candle_payload(row) if isinstance(row, dict) and "time" in row else row for row in bridge_rows],
+        "trades": db.read_replay_trades(code, 300),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+@app.get("/api/live/market", dependencies=[Depends(_session_user)])
+def live_market(sym: str = "", symbols: str = ""):
+    requested = [item for item in (symbols.split(",") if symbols else ([sym] if sym else [])) if item]
+    selected = str(sym or (requested[0] if requested else "")).upper()
+    selected_rows = _read_bridge_rates(
+        selected,
+        "M1",
+        2,
+        max_age_seconds=_live_candle_age_limit("M1"),
+    ) if selected else []
+    selected_rows = _overlay_live_tick(selected_rows, selected)
+    return JSONResponse(
+        {
+            "source": "mt5_bridge_live",
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "ticks": _live_bridge_ticks(requested),
+            "selected_symbol": selected,
+            "selected_candle": _candle_payload(selected_rows[-1], "mt5_bridge_live") if selected_rows else None,
+            "selected_candle_fresh": bool(selected_rows),
+        },
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
+
+
 @app.get("/api/candles", dependencies=[Depends(_session_user)])
 def candles(sym: str = "EURUSD", limit: int = 120, timeframe: str = "M15"):
     count = max(1, min(int(limit or 120), 500))
     code = sym.upper()
     tf = (timeframe or "M15").upper()
-    bridge_rows = _read_bridge_rates(code, tf, count)
+    age_limit = _live_candle_age_limit(tf)
+    bridge_rows = _read_bridge_rates(code, tf, count, max_age_seconds=age_limit)
     if not bridge_rows and tf != "M15":
         m15_needed = count
         if _timeframe_seconds(tf) > _timeframe_seconds("M15"):
             m15_needed = min(500, count * max(1, _timeframe_seconds(tf) // _timeframe_seconds("M15")))
-        m15_rows = _read_bridge_rates(code, "M15", m15_needed)
+        m15_rows = _read_bridge_rates(
+            code,
+            "M15",
+            m15_needed,
+            max_age_seconds=_live_candle_age_limit("M15"),
+        )
         bridge_rows = _aggregate_rate_rows(m15_rows, tf, count) if m15_rows else []
-    if bridge_rows:
-        return [_candle_payload(row) for row in bridge_rows]
-    db_rows = db.read_candles(code, count)
-    if db_rows:
-        return [
-            {
-                **row,
-                "time_label": db.date_detail_for(row.get("ts")).get("label", ""),
-                "time_zone": "SAST",
-                "source": row.get("source") or "mt5_runtime",
-            }
-            for row in db_rows
-        ]
-    return []
+    bridge_rows = _overlay_live_tick(bridge_rows, code)
+    payload = [_candle_payload(row, "mt5_bridge_live") for row in bridge_rows]
+    last = payload[-1] if payload else {}
+    return JSONResponse(
+        payload,
+        headers={
+            "Cache-Control": "no-store, max-age=0",
+            "X-CipherFX-Source": "mt5_bridge_live" if payload else "mt5_bridge_unavailable",
+            "X-CipherFX-Candle-Age-Seconds": str(last.get("bar_age_seconds", "")),
+            "X-CipherFX-Quote-Age-Seconds": str(last.get("quote_age_seconds", "")),
+            "X-CipherFX-Fallback": "disabled",
+        },
+    )
 
 
 @app.get("/api/terminal", dependencies=[Depends(_session_user)])
@@ -1260,133 +1773,27 @@ def terminal():
 
 @app.post("/api/orders/market", dependencies=[Depends(_session_user)])
 def place_market_order(req: MarketOrderRequest):
-    _require_manual_trading_enabled()
-    direction = req.side.strip().upper()
-    if direction not in {"BUY", "SELL"}:
-        raise HTTPException(status_code=400, detail="side must be BUY or SELL")
-    try:
-        resolved, price, result = _with_gateway(
-            lambda gateway: gateway.place_market_order(
-                req.symbol.strip().upper(),
-                direction,
-                float(req.volume),
-                float(req.sl or 0.0),
-                float(req.tp or 0.0),
-                req.comment,
-            )
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "ok": True,
-        "symbol": resolved,
-        "side": direction,
-        "price": price,
-        "retcode": int(getattr(result, "retcode", 0) or 0),
-        "order": int(getattr(result, "order", 0) or 0),
-        "deal": int(getattr(result, "deal", 0) or 0),
-    }
+    raise HTTPException(status_code=403, detail='read-only backend: trading runtime owns broker execution')
 
 
 @app.post("/api/orders/pending", dependencies=[Depends(_session_user)])
 def place_pending_order(req: PendingOrderRequest):
-    _require_manual_trading_enabled()
-    direction = req.side.strip().upper()
-    pending_type = req.pending_type.strip().upper()
-    if direction not in {"BUY", "SELL"}:
-        raise HTTPException(status_code=400, detail="side must be BUY or SELL")
-    if pending_type not in {"LIMIT", "STOP"}:
-        raise HTTPException(status_code=400, detail="pending_type must be LIMIT or STOP")
-    try:
-        resolved, result = _with_gateway(
-            lambda gateway: gateway.place_pending_order(
-                req.symbol.strip().upper(),
-                direction,
-                float(req.volume),
-                float(req.price),
-                float(req.sl or 0.0),
-                float(req.tp or 0.0),
-                pending_type,
-                req.comment,
-            )
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "ok": True,
-        "symbol": resolved,
-        "side": direction,
-        "pending_type": pending_type,
-        "retcode": int(getattr(result, "retcode", 0) or 0),
-        "order": int(getattr(result, "order", 0) or 0),
-        "deal": int(getattr(result, "deal", 0) or 0),
-        "price": float(getattr(result, "price", 0.0) or 0.0),
-    }
+    raise HTTPException(status_code=403, detail='read-only backend: trading runtime owns broker execution')
 
 
 @app.post("/api/positions/{ticket}/close", dependencies=[Depends(_session_user)])
 def close_position(ticket: int):
-    matches = [row for row in _positions() if str(row.get("ticket", "")) == str(ticket)]
-    if not matches:
-        raise HTTPException(status_code=404, detail="Position not found")
-    row = matches[0]
-    try:
-        result = _with_gateway(lambda gateway: gateway.close_position(
-            type("PositionRow", (), {
-                "ticket": int(ticket),
-                "symbol": row.get("sym", ""),
-                "direction": row.get("direction", "BUY"),
-                "volume": float(row.get("qty", 0.0) or 0.0),
-            })()
-        ))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "ok": True,
-        "ticket": ticket,
-        "retcode": int(getattr(result, "retcode", 0) or 0),
-        "order": int(getattr(result, "order", 0) or 0),
-        "deal": int(getattr(result, "deal", 0) or 0),
-        "price": float(getattr(result, "price", 0.0) or 0.0),
-    }
+    raise HTTPException(status_code=403, detail='read-only backend: trading runtime owns broker execution')
 
 
 @app.post("/api/positions/{ticket}/modify", dependencies=[Depends(_session_user)])
 def modify_position(ticket: int, req: ModifyPositionRequest):
-    try:
-        result = _with_gateway(
-            lambda gateway: gateway.modify_position(
-                ticket,
-                req.symbol.strip().upper(),
-                float(req.sl or 0.0),
-                float(req.tp or 0.0),
-            )
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "ok": True,
-        "ticket": ticket,
-        "retcode": int(getattr(result, "retcode", 0) or 0),
-        "order": int(getattr(result, "order", 0) or 0),
-        "deal": int(getattr(result, "deal", 0) or 0),
-        "price": float(getattr(result, "price", 0.0) or 0.0),
-    }
+    raise HTTPException(status_code=403, detail='read-only backend: trading runtime owns broker execution')
 
 
 @app.delete("/api/orders/{ticket}", dependencies=[Depends(_session_user)])
 def cancel_order(ticket: int):
-    try:
-        result = _with_gateway(lambda gateway: gateway.cancel_order(ticket))
-    except Exception as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {
-        "ok": True,
-        "ticket": ticket,
-        "retcode": int(getattr(result, "retcode", 0) or 0),
-        "order": int(getattr(result, "order", 0) or 0),
-        "deal": int(getattr(result, "deal", 0) or 0),
-    }
+    raise HTTPException(status_code=403, detail='read-only backend: trading runtime owns broker execution')
 
 
 @app.post("/api/symbols/activate", dependencies=[Depends(_session_user)])

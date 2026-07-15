@@ -1299,7 +1299,11 @@ def _score_details_from_signal(sig: dict, market: str, htf_trend: str = "FLAT", 
     elif market == "crypto":
         rr = CFG.get("crypto_rr", rr)
     explicit_h1_score = sig.get("bias_1h_score")
+    if explicit_h1_score is None:
+        explicit_h1_score = sig.get("h1_score")
     explicit_m15_score = sig.get("setup_15m_score")
+    if explicit_m15_score is None:
+        explicit_m15_score = sig.get("m15_score")
     bias_1h_score = float(explicit_h1_score) if explicit_h1_score is not None else 90 if htf_trend in {"UP", "DOWN"} and (
         (htf_trend == "UP" and sig.get("direction") == "BUY") or
         (htf_trend == "DOWN" and sig.get("direction") == "SELL")

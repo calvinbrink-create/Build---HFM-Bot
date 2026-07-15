@@ -1,12 +1,35 @@
 #property strict
 
+#import "ws2_32.dll"
+int WSAStartup(ushort version, uchar &data[]);
+int WSACleanup();
+int socket(int af, int type, int protocol);
+int connect(int socket_handle, uchar &name[], int namelen);
+int send(int socket_handle, uchar &buffer[], int length, int flags);
+int closesocket(int socket_handle);
+int WSAGetLastError();
+#import
+
 input string SymbolsCSV = "EURUSD,GBPUSD,USDJPY,USDCHF,USDCAD,AUDUSD,NZDUSD,USDZAR,XAUUSD,XAGUSD,BTCUSD,ETHUSD,NAS100,US30,GER40,UK100";
 input string SymbolsFile = "cipherfx\\symbols.txt";
 input int ExportBars = 220;
+input int HistoricalM1Bars = 10080;
+input int HistoricalM1RefreshSeconds = 3600;
+input int HistoricalM1SliceSeconds = 15;
 input int TimerSeconds = 1;
-input int TimerMilliseconds = 250;
+// MT5 high-resolution timer floor is approximately 10-16 ms in real time.
+// Keep the hot tick publisher on that clock; bulk bridge exports are throttled
+// independently inside RunBridge().
+input int TimerMilliseconds = 12;
+input int TickFileMilliseconds = 250;
+// WebSocket tick transport is a required live-feed path for Phase 5.
+// Keep it non-overridable so a stale chart input cannot silently disable it.
+bool EnableWebSocketTickEvents = true;
+input string WebSocketHost = "127.0.0.1";
+input int WebSocketPort = 8765;
 input int SlippagePoints = 20;
-input int MaxRateSymbolsPerCycle = 25;
+input int MaxRateSymbolsPerCycle = 2;
+input int RateCycleMilliseconds = 15000;
 input bool ExportExtraTimeframes = true;
 input double MinLotSize = 0.00;
 input double TargetProfitPerTradeUSD = 0.00;
@@ -29,9 +52,27 @@ int RateCursor = 0;
 string LastRateExportKeys[];
 datetime LastRateExportBars[];
 ulong LastStaticExportMs = 0;
+ulong LastRateCycleMs = 0;
+ulong LastHistoricalM1SliceMs = 0;
+int HistoricalM1Cursor = 0;
+ulong HistoricalM1LastExportMs[];
+ulong LastPriorityM1CycleMs = 0;
+ulong LastPriorityM5M15CycleMs = 0;
+int PriorityM1Cursor = 0;
+int PriorityM5M15Cursor = 0;
 ulong LastAccountExportMs = 0;
 ulong LastPositionExportMs = 0;
 ulong LastDealExportMs = 0;
+ulong LastRiskCommentMs = 0;
+ulong LastTickFileExportMs = 0;
+int WebSocketSocket = INVALID_HANDLE;
+bool WebSocketWinsockReady = false;
+ulong LastWebSocketConnectMs = 0;
+ulong LastWebSocketHeartbeatMs = 0;
+string WebSocketTickSymbols[];
+long WebSocketLastTickMs[];
+double WebSocketLastBid[];
+double WebSocketLastAsk[];
 string ActiveRiskSymbol = "";
 ulong ActiveRiskMagic = 0;
 string ActiveRiskComment = "";
@@ -39,6 +80,199 @@ string LastTradeBlockReason = "";
 int LastPyramidCount = 0;
 bool LastTradingBlocked = false;
 datetime LastBridgeExportLogAt = 0;
+
+void CloseWebSocket()
+{
+   if(WebSocketSocket != INVALID_HANDLE)
+      closesocket(WebSocketSocket);
+   WebSocketSocket = INVALID_HANDLE;
+}
+
+bool EnsureWebSocket()
+{
+   if(!EnableWebSocketTickEvents)
+      return false;
+   if(WebSocketSocket != INVALID_HANDLE)
+      return true;
+   ulong now_ms = GetTickCount64();
+   if(LastWebSocketConnectMs > 0 && (now_ms - LastWebSocketConnectMs) < 1000)
+      return false;
+   LastWebSocketConnectMs = now_ms;
+
+   if(!WebSocketWinsockReady)
+   {
+      uchar wsa_data[];
+      ArrayResize(wsa_data, 512);
+      int wsa_rc = WSAStartup((ushort)0x0202, wsa_data);
+      if(wsa_rc != 0)
+      {
+         PrintFormat("CipherFX WebSocket winsock_startup_failed rc=%d", wsa_rc);
+         return false;
+      }
+      WebSocketWinsockReady = true;
+   }
+
+   CloseWebSocket();
+   int sock = socket(2, 1, 6);
+   if(sock == INVALID_HANDLE)
+   {
+      PrintFormat("CipherFX WebSocket winsock_socket_failed error=%d", WSAGetLastError());
+      return false;
+   }
+
+   uchar address[];
+   ArrayResize(address, 16);
+   ArrayInitialize(address, 0);
+   address[0] = (uchar)2;
+   address[1] = (uchar)0;
+   address[2] = (uchar)((WebSocketPort >> 8) & 0xFF);
+   address[3] = (uchar)(WebSocketPort & 0xFF);
+   address[4] = (uchar)127;
+   address[5] = (uchar)0;
+   address[6] = (uchar)0;
+   address[7] = (uchar)1;
+   if(connect(sock, address, 16) != 0)
+   {
+      PrintFormat("CipherFX WebSocket winsock_connect_failed host=%s port=%d error=%d", WebSocketHost, WebSocketPort, WSAGetLastError());
+      closesocket(sock);
+      return false;
+   }
+
+   string request =
+      "GET /mt5/ticks HTTP/1.1\r\n"
+      "Host: " + WebSocketHost + ":" + IntegerToString(WebSocketPort) + "\r\n"
+      "Upgrade: websocket\r\n"
+      "Connection: Upgrade\r\n"
+      "Sec-WebSocket-Key: Q2lwaGVyRlhUcmFkZVdTS2V5MTIzNA==\r\n"
+      "Sec-WebSocket-Version: 13\r\n\r\n";
+   uchar request_bytes[];
+   int request_len = StringToCharArray(request, request_bytes, 0, WHOLE_ARRAY, CP_UTF8);
+   if(request_len <= 0)
+   {
+      PrintFormat("CipherFX WebSocket handshake_encode_failed");
+      closesocket(sock);
+      return false;
+   }
+   if(request_bytes[request_len - 1] == 0)
+      request_len--;
+   int sent = send(sock, request_bytes, request_len, 0);
+   if(sent != request_len)
+   {
+      PrintFormat("CipherFX WebSocket handshake_send_failed sent=%d expected=%d error=%d", sent, request_len, WSAGetLastError());
+      closesocket(sock);
+      return false;
+   }
+   WebSocketSocket = sock;
+   PrintFormat("CipherFX WebSocket connected transport=WS2_32 %s:%d", WebSocketHost, WebSocketPort);
+   return true;
+}
+
+bool SendWebSocketText(string payload)
+{
+   if(!EnsureWebSocket())
+      return false;
+   uchar body[];
+   int body_len = StringToCharArray(payload, body, 0, WHOLE_ARRAY, CP_UTF8);
+   if(body_len <= 0)
+      return false;
+   if(body[body_len - 1] == 0)
+      body_len--;
+   if(body_len <= 0 || body_len >= 65536)
+      return false;
+
+   int header_len = body_len < 126 ? 2 : 4;
+   int total_len = header_len + 4 + body_len;
+   uchar frame[];
+   ArrayResize(frame, total_len);
+   frame[0] = (uchar)0x81;
+   int mask_pos = 2;
+   if(body_len < 126)
+   {
+      frame[1] = (uchar)(0x80 | body_len);
+   }
+   else
+   {
+      frame[1] = (uchar)0xFE;
+      frame[2] = (uchar)((body_len >> 8) & 0xFF);
+      frame[3] = (uchar)(body_len & 0xFF);
+      mask_pos = 4;
+   }
+   for(int i = 0; i < 4; i++)
+      frame[mask_pos + i] = (uchar)(MathRand() % 256);
+   for(int i = 0; i < body_len; i++)
+      frame[mask_pos + 4 + i] = (uchar)(body[i] ^ frame[mask_pos + (i % 4)]);
+
+   int sent = send(WebSocketSocket, frame, total_len, 0);
+   if(sent != total_len)
+   {
+      PrintFormat("CipherFX WebSocket frame_send_failed sent=%d expected=%d error=%d", sent, total_len, WSAGetLastError());
+      CloseWebSocket();
+      return false;
+   }
+   return true;
+}
+
+int WebSocketTickIndex(string symbol)
+{
+   int total = ArraySize(WebSocketTickSymbols);
+   for(int i = 0; i < total; i++)
+      if(WebSocketTickSymbols[i] == symbol)
+         return i;
+   ArrayResize(WebSocketTickSymbols, total + 1);
+   ArrayResize(WebSocketLastTickMs, total + 1);
+   ArrayResize(WebSocketLastBid, total + 1);
+   ArrayResize(WebSocketLastAsk, total + 1);
+   WebSocketTickSymbols[total] = symbol;
+   WebSocketLastTickMs[total] = 0;
+   WebSocketLastBid[total] = 0.0;
+   WebSocketLastAsk[total] = 0.0;
+   return total;
+}
+
+void PublishTickEvent(string symbol, MqlTick &tick)
+{
+   if(!EnableWebSocketTickEvents)
+      return;
+   long tick_ms = tick.time_msc;
+   int index = WebSocketTickIndex(symbol);
+   if(index >= 0 && WebSocketLastTickMs[index] == tick_ms &&
+      MathAbs(WebSocketLastBid[index] - tick.bid) < 0.0000000001 &&
+      MathAbs(WebSocketLastAsk[index] - tick.ask) < 0.0000000001)
+      return;
+
+   int offset = BrokerUtcOffsetSeconds();
+   long tick_utc = (long)tick.time - offset;
+   if(tick_utc <= 0)
+      return;
+   // Use the live tick clock for the active M5 boundary. iTime() can lag
+   // during a series refresh even when SymbolInfoTick() is current.
+   long m5_bar_utc = (tick_utc / 300) * 300;
+   string payload =
+      "{\"type\":\"tick\",\"symbol\":\"" + symbol +
+      "\",\"time_utc\":" + DoubleToString((double)tick_utc, 0) +
+      ",\"time_msc\":" + DoubleToString((double)tick_ms, 0) +
+      ",\"m5_bar_open_utc\":" + DoubleToString((double)m5_bar_utc, 0) +
+      ",\"bid\":" + DoubleToString(tick.bid, 8) +
+      ",\"ask\":" + DoubleToString(tick.ask, 8) +
+      ",\"last\":" + DoubleToString(tick.last, 8) + "}";
+   if(SendWebSocketText(payload))
+   {
+      WebSocketLastTickMs[index] = tick_ms;
+      WebSocketLastBid[index] = tick.bid;
+      WebSocketLastAsk[index] = tick.ask;
+   }
+}
+
+void SendWebSocketHeartbeat()
+{
+   if(!EnableWebSocketTickEvents)
+      return;
+   ulong now_ms = GetTickCount64();
+   if(LastWebSocketHeartbeatMs > 0 && (now_ms - LastWebSocketHeartbeatMs) < 5000)
+      return;
+   LastWebSocketHeartbeatMs = now_ms;
+   SendWebSocketText("{\"type\":\"heartbeat\",\"source\":\"CipherFxBridge\"}");
+}
 
 bool ShouldLogBridgeExportCycle()
 {
@@ -58,9 +292,14 @@ int OnInit()
    FolderCreate(BRIDGE_DIR);
    FolderCreate(COMMANDS_DIR);
    FolderCreate(RESULTS_DIR);
+   MathSrand((int)(GetTickCount64() & 0x7FFFFFFF));
+   // Give the Python listener time to bind after the terminal process starts.
+   // This is startup-only; subsequent tick delivery remains event-driven.
+   LastWebSocketConnectMs = GetTickCount64();
+   PrintFormat("CipherFX WebSocket runtime_enabled=%s host=%s port=%d", EnableWebSocketTickEvents ? "true" : "false", WebSocketHost, WebSocketPort);
    int timer_ms = MathMax(0, TimerMilliseconds);
    if(timer_ms > 0)
-      EventSetMillisecondTimer(MathMax(100, timer_ms));
+      EventSetMillisecondTimer(MathMax(10, timer_ms));
    else
       EventSetTimer(MathMax(1, TimerSeconds));
    return(INIT_SUCCEEDED);
@@ -69,11 +308,19 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
+   CloseWebSocket();
 }
 
 void OnTick()
 {
-   // The 250 ms timer owns bridge cadence; ticks must not duplicate full exports.
+   // SocketConnect is initiated from the EA tick context. The timer remains
+   // responsible for bulk exports, but tick context is the lowest-latency
+   // reconnect point for the live WebSocket.
+   if(_Symbol != "")
+   {
+      EnsureWebSocket();
+      ExportTick(_Symbol);
+   }
 }
 
 void OnTimer()
@@ -83,8 +330,10 @@ void OnTimer()
 
 void RunBridge()
 {
+   // Commands and account readiness must never wait behind history refresh.
    ProcessCommands();
    ulong nowMs = GetTickCount64();
+
    if(LastAccountExportMs == 0 || (nowMs - LastAccountExportMs) >= 1000)
    {
       ExportAccount();
@@ -96,14 +345,50 @@ void RunBridge()
       ExportOrders();
       LastPositionExportMs = nowMs;
    }
-   if(LastDealExportMs == 0 || (nowMs - LastDealExportMs) >= 3000)
+   // WebSocket publication is the hot path. File snapshots remain available
+   // for diagnostics/fallback but are intentionally much slower.
+   ExportFastTicks();
+   if(LastTickFileExportMs == 0 || (nowMs - LastTickFileExportMs) >= (ulong)MathMax(50, TickFileMilliseconds))
+   {
+      ExportTickFiles();
+      LastTickFileExportMs = nowMs;
+   }
+   SendWebSocketHeartbeat();
+
+   if(LastPriorityM1CycleMs == 0 || (nowMs - LastPriorityM1CycleMs) >= 1000)
+   {
+      ExportPriorityRates(true, false);
+      LastPriorityM1CycleMs = nowMs;
+   }
+   if(LastPriorityM5M15CycleMs == 0 || (nowMs - LastPriorityM5M15CycleMs) >= 1000)
+   {
+      ExportPriorityRates(false, true);
+      LastPriorityM5M15CycleMs = nowMs;
+   }
+   int second_in_minute = (int)(TimeLocal() % 60);
+   if((LastDealExportMs == 0 || (nowMs - LastDealExportMs) >= 5000) && second_in_minute >= 5 && second_in_minute <= 50)
    {
       ExportDeals();
       LastDealExportMs = nowMs;
    }
-   ExportSymbols();
-   UpdateRiskComment(LastTradingBlocked, LastTradeBlockReason, LastPyramidCount);
-   ProcessCommands();
+
+   // Candle/rate work is throttled and bounded so one timer invocation does
+   // not serialize every symbol and starve the fast tick path.
+   if(LastRateCycleMs == 0 || (nowMs - LastRateCycleMs) >= (ulong)MathMax(1000, RateCycleMilliseconds))
+   {
+      ExportSymbols(false);
+      LastRateCycleMs = nowMs;
+   }
+   if((LastRiskCommentMs == 0 || (nowMs - LastRiskCommentMs) >= 5000) && second_in_minute >= 5 && second_in_minute <= 50)
+   {
+      UpdateRiskComment(LastTradingBlocked, LastTradeBlockReason, LastPyramidCount);
+      LastRiskCommentMs = nowMs;
+   }
+
+   // Historical M1 export is deliberately outside the live tick and trigger
+   // path. One symbol is backfilled per slice so server history download
+   // cannot turn into a global execution wait.
+   ExportHistoricalM1Slice();
 }
 
 string Trim(string value)
@@ -729,7 +1014,23 @@ bool ShouldExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
    int idx = RateExportIndex(symbol, label);
    if(idx < 0 || !FileIsExist(file_name))
       return true;
-   return current_bar > 0 && LastRateExportBars[idx] != current_bar;
+   if(current_bar > 0 && LastRateExportBars[idx] != current_bar)
+      return true;
+
+   // If live ticks have crossed the next candle boundary while this series
+   // has not advanced, force CopyRates to request/rebuild the real MT5 data.
+   // Closed markets have no fresh tick, so this never fabricates candles.
+   MqlTick tick;
+   int period_seconds = PeriodSeconds(timeframe);
+   if(current_bar > 0 && period_seconds > 0 && SymbolInfoTick(symbol, tick))
+   {
+      datetime terminal_now = TimeCurrent();
+      int tick_age = (int)(terminal_now - tick.time);
+      int fresh_tick_limit = MathMax(10, MathMin(60, period_seconds));
+      if(tick_age >= 0 && tick_age <= fresh_tick_limit && tick.time >= current_bar + period_seconds + 2)
+         return true;
+   }
+   return false;
 }
 
 void RememberRateExport(string symbol, ENUM_TIMEFRAMES timeframe, string label)
@@ -755,7 +1056,81 @@ bool ExportRatesIfChanged(string symbol, ENUM_TIMEFRAMES timeframe, string label
    return ExportRates(symbol, timeframe, label);
 }
 
-void ExportSymbols()
+void ExportPriorityRates(bool export_m1, bool export_m5_m15)
+{
+   string configuredSymbols[];
+   LoadConfiguredSymbols(configuredSymbols);
+   int total = ArraySize(configuredSymbols);
+   int start = export_m1 ? PriorityM1Cursor : PriorityM5M15Cursor;
+   int processed = 0;
+   // Export every changed M5/M15 series in one priority pass. Five-symbol
+   // batching made the final active symbols arrive several seconds after the
+   // first batch at the same candle boundary.
+   int max_per_cycle = total;
+   for(int n = 0; n < total && processed < max_per_cycle; n++)
+   {
+      int i = (start + n) % total;
+      string symbol = configuredSymbols[i];
+      if(symbol == "")
+         continue;
+      SymbolSelect(symbol, true);
+      if(!(bool)SymbolInfoInteger(symbol, SYMBOL_VISIBLE))
+         continue;
+      if(export_m1)
+         ExportRatesIfChanged(symbol, PERIOD_M1, "M1");
+      if(export_m5_m15)
+      {
+         ExportRatesIfChanged(symbol, PERIOD_M5, "M5");
+         ExportRatesIfChanged(symbol, PERIOD_M15, "M15");
+      }
+      // Service broker commands between symbol exports so geometry and orders
+      // are not held behind the full priority-rate batch.
+      ProcessCommands();
+      processed++;
+   }
+   if(total > 0 && export_m1)
+      PriorityM1Cursor = (start + MathMax(processed, 1)) % total;
+   if(total > 0 && export_m5_m15)
+      PriorityM5M15Cursor = (start + MathMax(processed, 1)) % total;
+}
+
+void ExportFastTicks()
+{
+   string configuredSymbols[];
+   LoadConfiguredSymbols(configuredSymbols);
+   int total = ArraySize(configuredSymbols);
+   for(int i = 0; i < total; i++)
+   {
+      string symbol = configuredSymbols[i];
+      if(symbol == "") continue;
+      SymbolSelect(symbol, true);
+      if((bool)SymbolInfoInteger(symbol, SYMBOL_VISIBLE))
+      {
+         MqlTick tick;
+         if(SymbolInfoTick(symbol, tick))
+            PublishTickEvent(symbol, tick);
+         ProcessCommands();
+      }
+   }
+}
+
+void ExportTickFiles()
+{
+   string configuredSymbols[];
+   LoadConfiguredSymbols(configuredSymbols);
+   int total = ArraySize(configuredSymbols);
+   for(int i = 0; i < total; i++)
+   {
+      string symbol = configuredSymbols[i];
+      if(symbol == "") continue;
+      SymbolSelect(symbol, true);
+      if((bool)SymbolInfoInteger(symbol, SYMBOL_VISIBLE))
+         ExportTick(symbol);
+      ProcessCommands();
+   }
+}
+
+void ExportSymbols(bool export_ticks)
 {
    string configuredSymbols[];
    SelectConfiguredSymbols(configuredSymbols);
@@ -773,10 +1148,10 @@ void ExportSymbols()
          "tick_value", "tick_value_profit", "tick_value_loss", "tick_size",
          "stops_level", "trade_mode", "filling_mode", "currency_profit"
       );
-   int totalAll = exportStatic ? SymbolsTotal(false) : 0;
+   int totalAll = exportStatic ? ArraySize(configuredSymbols) : 0;
    for(int idx = 0; idx < totalAll; idx++)
    {
-      string allSymbol = SymbolName(idx, false);
+      string allSymbol = configuredSymbols[idx];
       if(allSymbol == "") continue;
       bool visible = SymbolInfoInteger(allSymbol, SYMBOL_VISIBLE);
       if(allHandle != INVALID_HANDLE)
@@ -813,7 +1188,10 @@ void ExportSymbols()
 
    int totalConfigured = ArraySize(configuredSymbols);
    int exported = 0;
-   int maxPerCycle = MathMax(1, MaxRateSymbolsPerCycle);
+   // H1/H4 establish live strategic context. Once MT5 series are synchronized,
+   // check every configured symbol in the same cycle so two-symbol batching
+   // cannot leave higher-timeframe context stale for ten seconds at rollover.
+   int maxPerCycle = totalConfigured;
    int start = RateCursor;
    bool logCycle = ShouldLogBridgeExportCycle();
    for(int n = 0; n < totalConfigured && exported < maxPerCycle; n++)
@@ -828,21 +1206,19 @@ void ExportSymbols()
             PrintFormat("CipherFX bridge export symbol=%s visible=0 tick=SKIP M1=SKIP M5=SKIP M15=SKIP broker_time=%s local_time=%s", visibleSymbol, TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS));
          continue;
       }
-      bool tickOk = ExportTick(visibleSymbol);
-      bool m15Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M15, "M15");
-      bool m1Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M1, "M1");
-      bool m5Ok = ExportRatesIfChanged(visibleSymbol, PERIOD_M5, "M5");
+      bool tickOk = export_ticks ? ExportTick(visibleSymbol) : true;
+      bool m15Ok = true;
+      bool m1Ok = true;
+      bool m5Ok = true;
       if(logCycle)
          PrintFormat("CipherFX bridge export symbol=%s visible=1 tick=%s M1=%s M5=%s M15=%s broker_time=%s local_time=%s", visibleSymbol, tickOk ? "OK" : "FAIL", m1Ok ? "OK" : "FAIL", m5Ok ? "OK" : "FAIL", m15Ok ? "OK" : "FAIL", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS));
       if(ExportExtraTimeframes)
       {
-         ExportRatesIfChanged(visibleSymbol, PERIOD_M30, "M30");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H1, "H1");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H4, "H4");
-         ExportRatesIfChanged(visibleSymbol, PERIOD_D1, "D1");
-         ExportRatesIfChanged(visibleSymbol, PERIOD_W1, "W1");
-         ExportRatesIfChanged(visibleSymbol, PERIOD_MN1, "MN");
       }
+      // Keep broker calculations and order requests ahead of the next symbol.
+      ProcessCommands();
       exported++;
    }
    if(totalConfigured > 0)
@@ -865,40 +1241,139 @@ bool ExportTick(string symbol)
    FileWrite(handle, "ask=" + DoubleToString(tick.ask, 8));
    FileWrite(handle, "last=" + DoubleToString(tick.last, 8));
    FileClose(handle);
-   return AtomicReplaceFile(temp_path, final_path);
+   bool replaced = AtomicReplaceFile(temp_path, final_path);
+   if(replaced)
+      PublishTickEvent(symbol, tick);
+   return replaced;
 }
 
 bool ExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
 {
+   if(!SymbolIsSynchronized(symbol))
+   {
+      SymbolSelect(symbol, true);
+      return false;
+   }
+   long series_synchronized = 0;
+   if(!SeriesInfoInteger(symbol, timeframe, SERIES_SYNCHRONIZED, series_synchronized) || series_synchronized == 0)
+   {
+      MqlRates warmup[];
+      ArraySetAsSeries(warmup, false);
+      CopyRates(symbol, timeframe, 0, 3, warmup);
+      return false;
+   }
+   datetime current_bar = iTime(symbol, timeframe, 0);
+   if(current_bar <= 0) return false;
    MqlRates rates[];
    ArraySetAsSeries(rates, false);
-   int copied = CopyRates(symbol, timeframe, 0, ExportBars, rates);
+   bool historical_m1 = (label == "M1_HISTORY");
+   int export_count = historical_m1
+      ? MathMax(10080, HistoricalM1Bars)
+      : MathMax(20, ExportBars);
+   // Live execution files stay small. The separate M1_HISTORY file is the
+   // durable forensic/replay archive and is refreshed on a slow maintenance
+   // schedule, never on the order path.
+   if(!historical_m1)
+   {
+      if(timeframe == PERIOD_M1)
+         export_count = MathMin(export_count, 32);
+      else if(timeframe == PERIOD_M5)
+         export_count = MathMin(export_count, 100);
+      else if(timeframe == PERIOD_M15)
+         export_count = MathMin(export_count, 100);
+      else if(timeframe == PERIOD_H1 || timeframe == PERIOD_H4)
+         export_count = MathMin(export_count, 120);
+   }
+   int copied = CopyRates(symbol, timeframe, 0, export_count, rates);
    if(copied <= 0) return false;
+   if(rates[copied - 1].time != current_bar) return false;
    string final_path = BRIDGE_DIR + "\\rates_" + symbol + "_" + label + ".csv";
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return false;
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   FileWrite(handle, "time", "open", "high", "low", "close", "volume", "spread_points", "spread_price");
+   if(historical_m1)
+      FileWrite(handle, "time", "time_utc", "open", "high", "low", "close", "volume", "spread_points", "spread_price");
+   else
+      FileWrite(handle, "time", "open", "high", "low", "close", "volume", "spread_points", "spread_price");
    for(int i = 0; i < copied; i++)
    {
-      FileWrite(
-         handle,
-         IntegerToString((int)rates[i].time),
-         DoubleToString(rates[i].open, 8),
-         DoubleToString(rates[i].high, 8),
-         DoubleToString(rates[i].low, 8),
-         DoubleToString(rates[i].close, 8),
-         IntegerToString((int)rates[i].tick_volume),
-         IntegerToString((int)rates[i].spread),
-         DoubleToString((double)rates[i].spread * point, 10)
-      );
+      if(historical_m1)
+      {
+         FileWrite(
+            handle,
+            IntegerToString((int)rates[i].time),
+            IntegerToString((int)rates[i].time - BrokerUtcOffsetSeconds()),
+            DoubleToString(rates[i].open, 8),
+            DoubleToString(rates[i].high, 8),
+            DoubleToString(rates[i].low, 8),
+            DoubleToString(rates[i].close, 8),
+            IntegerToString((int)rates[i].tick_volume),
+            IntegerToString((int)rates[i].spread),
+            DoubleToString((double)rates[i].spread * point, 10)
+         );
+      }
+      else
+      {
+         FileWrite(
+            handle,
+            IntegerToString((int)rates[i].time),
+            DoubleToString(rates[i].open, 8),
+            DoubleToString(rates[i].high, 8),
+            DoubleToString(rates[i].low, 8),
+            DoubleToString(rates[i].close, 8),
+            IntegerToString((int)rates[i].tick_volume),
+            IntegerToString((int)rates[i].spread),
+            DoubleToString((double)rates[i].spread * point, 10)
+         );
+      }
    }
    FileClose(handle);
    if(!AtomicReplaceFile(temp_path, final_path))
       return false;
    RememberRateExport(symbol, timeframe, label);
    return true;
+}
+
+void ExportHistoricalM1Slice()
+{
+   ulong nowMs = GetTickCount64();
+   ulong sliceMs = (ulong)MathMax(5, HistoricalM1SliceSeconds) * 1000;
+   if(LastHistoricalM1SliceMs > 0 && (nowMs - LastHistoricalM1SliceMs) < sliceMs)
+      return;
+
+   string configuredSymbols[];
+   LoadConfiguredSymbols(configuredSymbols);
+   int total = ArraySize(configuredSymbols);
+   if(total <= 0)
+      return;
+   if(ArraySize(HistoricalM1LastExportMs) != total)
+   {
+      ArrayResize(HistoricalM1LastExportMs, total);
+      for(int i = 0; i < total; i++)
+         HistoricalM1LastExportMs[i] = 0;
+   }
+
+   int start = HistoricalM1Cursor;
+   ulong refreshMs = (ulong)MathMax(60, HistoricalM1RefreshSeconds) * 1000;
+   for(int n = 0; n < total; n++)
+   {
+      int i = (start + n) % total;
+      string symbol = configuredSymbols[i];
+      if(symbol == "")
+         continue;
+      if(HistoricalM1LastExportMs[i] > 0 && (nowMs - HistoricalM1LastExportMs[i]) < refreshMs)
+         continue;
+      if(!SymbolSelect(symbol, true) || !(bool)SymbolInfoInteger(symbol, SYMBOL_VISIBLE))
+         continue;
+      if(ExportRates(symbol, PERIOD_M1, "M1_HISTORY"))
+      {
+         HistoricalM1LastExportMs[i] = nowMs;
+         HistoricalM1Cursor = (i + 1) % total;
+         break;
+      }
+   }
+   LastHistoricalM1SliceMs = nowMs;
 }
 
 void ProcessCommands()

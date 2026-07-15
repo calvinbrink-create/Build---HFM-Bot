@@ -66,6 +66,8 @@ ProfileLast=${BRIDGE_PROFILE}
 [Experts]
 AllowLiveTrading=1
 AllowDllImport=1
+AllowWebRequest=1
+WebRequestURL=127.0.0.1:8765
 Enabled=1
 Account=0
 Profile=0

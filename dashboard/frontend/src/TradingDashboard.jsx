@@ -16,8 +16,12 @@ import {
   MonitorSmartphone,
   Newspaper,
   PanelLeft,
+  Pause,
+  Play,
   Plus,
   Search,
+  SkipBack,
+  StepForward,
   Sparkles,
   TrendingDown,
   TrendingUp,
@@ -26,19 +30,49 @@ import {
 } from "lucide-react";
 import logoSrc from "./cipherfx-icon.png";
 import CandleChart from "./CandleChart";
-import {
-  ALL_SYMBOLS,
-  DEFAULT_ACTIVE_SYMBOLS,
-  buildSymbolSnapshot,
-} from "./mt5Universe";
+import TradeReplayChart from "./TradeReplayChart";
+import { DEFAULT_ACTIVE_SYMBOLS } from "./mt5Universe";
 
 const API = `${window.location.origin}/mt5-api`;
+
+function volatileDashboardStorage() {
+  try {
+    if (!window.__cipherfxDashboardStorage) {
+      window.__cipherfxDashboardStorage = Object.create(null);
+    }
+    return window.__cipherfxDashboardStorage;
+  } catch {
+    return Object.create(null);
+  }
+}
+
+function safeStorageGet(key) {
+  const memory = volatileDashboardStorage();
+  try {
+    const value = window.localStorage?.getItem(key);
+    if (value) memory[key] = value;
+    return value || memory[key] || "";
+  } catch {
+    return memory[key] || "";
+  }
+}
+
+function safeStorageRemove(key) {
+  delete volatileDashboardStorage()[key];
+  try {
+    window.localStorage?.removeItem(key);
+  } catch {
+    // Storage failure must not prevent API auth recovery.
+  }
+}
 
 const DESKTOP_TABS = [
   { id: "market-hours", label: "Market Hours", icon: Clock3 },
   { id: "watchlist", label: "Watchlist", icon: List },
   { id: "chart", label: "Chart", icon: LineChart },
+  { id: "replay", label: "Replay", icon: History },
   { id: "scanner", label: "Scanner", icon: Activity },
+  { id: "intelligence", label: "Intelligence", icon: Sparkles },
   { id: "trade", label: "Trade", icon: Sparkles },
   { id: "positions", label: "Positions", icon: Briefcase },
   { id: "orders", label: "Orders", icon: FileText },
@@ -50,7 +84,9 @@ const DESKTOP_TABS = [
 const MOBILE_TABS = [
   { id: "quotes", label: "Quotes", icon: TrendingUp },
   { id: "chart", label: "Chart", icon: BarChart3 },
+  { id: "replay", label: "Replay", icon: History },
   { id: "scanner", label: "Scan", icon: Activity },
+  { id: "intelligence", label: "Intel", icon: Sparkles },
   { id: "trade", label: "Trade", icon: Sparkles },
   { id: "history", label: "History", icon: Clock3 },
 ];
@@ -60,16 +96,29 @@ const SYMBOL_GROUP_NAMES = ["All", "Forex", "Metals", "CFDs", "Crypto"];
 const DISPLAY_TIME_ZONE = "Africa/Johannesburg";
 const DISPLAY_TZ_LABEL = "SAST";
 
-const DESKTOP_EVENTS = [
-  { time: "07:00", label: "London Open Liquidity Window", tag: "FX" },
-  { time: "10:30", label: "Europe Mid-Session Rotation", tag: "Indices" },
-  { time: "15:30", label: "New York Open Volatility", tag: "US" },
-  { time: "22:00", label: "Daily Roll & Swap Check", tag: "Rollover" },
-];
 
 function fmtPrice(symbol, value) {
-  const digits = symbol.includes("JPY") ? 3 : value > 1000 ? 2 : value > 10 ? 3 : 5;
-  return Number(value).toFixed(digits);
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) return "--";
+  const digits = String(symbol || "").includes("JPY") ? 3 : numeric > 1000 ? 2 : numeric > 10 ? 3 : 5;
+  return numeric.toFixed(digits);
+}
+
+function liveNumber(value) {
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric : null;
+}
+
+function fmtNumber(value, decimals = 2, fallback = "--") {
+  if (value === null || value === undefined || value === "") return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? numeric.toFixed(decimals) : fallback;
+}
+
+function fmtAbsNumber(value, decimals = 2, fallback = "--") {
+  if (value === null || value === undefined || value === "") return fallback;
+  const numeric = Number(value);
+  return Number.isFinite(numeric) ? Math.abs(numeric).toFixed(decimals) : fallback;
 }
 
 function describeInstrument(symbol, group) {
@@ -84,7 +133,7 @@ function describeInstrument(symbol, group) {
 function formatNewsTime(value) {
   if (!value) return "Live";
   try {
-    return new Date(Number(value) * 1000).toLocaleString([], {
+    return new Date(Number(value) * 1000).toLocaleString("en-US", {
       timeZone: DISPLAY_TIME_ZONE,
       month: "short",
       day: "numeric",
@@ -99,7 +148,7 @@ function formatNewsTime(value) {
 function formatClock(value) {
   if (!value) return "Live";
   try {
-    return parseDateValue(value).toLocaleTimeString([], {
+    return parseDateValue(value).toLocaleTimeString("en-US", {
       timeZone: DISPLAY_TIME_ZONE,
       hour: "2-digit",
       minute: "2-digit",
@@ -128,7 +177,7 @@ function parseDateValue(value) {
 function formatDateTimeLabel(value) {
   const parsed = parseDateValue(value);
   if (!parsed) return "";
-  return parsed.toLocaleString([], {
+  return parsed.toLocaleString("en-US", {
     timeZone: DISPLAY_TIME_ZONE,
     month: "short",
     day: "numeric",
@@ -154,15 +203,72 @@ function formatAgeLabel(value) {
   return `${prefix}${Math.floor(hours / 24)}d${suffix}`;
 }
 
+const FRAME_SECONDS = {
+  M1: 60,
+  M5: 300,
+  M15: 900,
+  M30: 1800,
+  H1: 3600,
+  H4: 14400,
+  D1: 86400,
+};
+
+function applyLiveQuoteToCandles(candles, timeframe, quote) {
+  if (!Array.isArray(candles) || !candles.length) return candles;
+  const bid = Number(quote?.bid);
+  const ask = Number(quote?.ask);
+  const price = Number.isFinite(bid) && Number.isFinite(ask)
+    ? (bid + ask) / 2
+    : Number.isFinite(bid) ? bid : Number.isFinite(ask) ? ask : null;
+  if (!Number.isFinite(price)) return candles;
+  const step = FRAME_SECONDS[String(timeframe || "M15").toUpperCase()] || 900;
+  const tickDate = parseDateValue(quote?.tickTime);
+  const referenceSeconds = tickDate ? Math.floor(tickDate.getTime() / 1000) : Math.floor(Date.now() / 1000);
+  const bucketSeconds = Math.floor(referenceSeconds / step) * step;
+  const last = candles[candles.length - 1];
+  const lastDate = parseDateValue(last?.ts || last?.time);
+  const lastSeconds = lastDate ? Math.floor(lastDate.getTime() / 1000) : 0;
+  const rows = candles.slice();
+  if (lastSeconds >= bucketSeconds) {
+    const updated = {
+      ...last,
+      close: price,
+      high: Math.max(Number(last.high) || price, price),
+      low: Math.min(Number(last.low) || price, price),
+      source: "mt5_bridge_tick_overlay",
+      tick_time: quote?.tickTime || "",
+      quote_age_seconds: quote?.quoteAgeSeconds ?? null,
+    };
+    rows[rows.length - 1] = updated;
+    return rows;
+  }
+  const open = Number(last.close);
+  if (!Number.isFinite(open)) return rows;
+  rows.push({
+    ts: new Date(bucketSeconds * 1000).toISOString(),
+    time_label: "",
+    time_zone: "SAST",
+    open,
+    high: Math.max(open, price),
+    low: Math.min(open, price),
+    close: price,
+    volume: 0,
+    source: "mt5_bridge_tick_overlay",
+    tick_time: quote?.tickTime || "",
+    quote_age_seconds: quote?.quoteAgeSeconds ?? null,
+  });
+  return rows;
+}
+
 function compactCount(value) {
   const numeric = Number(value || 0);
-  return numeric.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  return numeric.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
 
 function formatMonthLabel(value) {
   const parsed = parseDateValue(value);
   if (!parsed) return "";
-  return parsed.toLocaleString([], {
+  return parsed.toLocaleString("en-US", {
     timeZone: DISPLAY_TIME_ZONE,
     month: "short",
     year: "numeric",
@@ -194,7 +300,7 @@ function tradeDateLine(row, mode = "position") {
 
 function formatSignedUsd(value) {
   const numeric = Number(value || 0);
-  const absolute = Math.abs(numeric).toLocaleString(undefined, {
+  const absolute = Math.abs(numeric).toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   });
@@ -238,14 +344,16 @@ function normalizePositionRows(rows) {
 
 function formatUsd(value) {
   const numeric = Number(value || 0);
-  return `$${numeric.toLocaleString(undefined, {
+  return `$${numeric.toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
 }
 
 function formatZar(value, rate, { signed = false, compact = false } = {}) {
-  const numeric = Number(value || 0) * Number(rate || 0);
+  const numericRate = Number(rate);
+  if (!Number.isFinite(numericRate) || numericRate <= 0) return "--";
+  const numeric = Number(value || 0) * numericRate;
   const abs = Math.abs(numeric);
   const sign = signed ? (numeric >= 0 ? "+" : "-") : "";
   if (compact && abs >= 1000) {
@@ -253,7 +361,7 @@ function formatZar(value, rate, { signed = false, compact = false } = {}) {
     const divisor = abs >= 1000000 ? 1000000 : 1000;
     return `${sign}R${(abs / divisor).toFixed(1)}${suffix}`;
   }
-  return `${sign}R${abs.toLocaleString(undefined, {
+  return `${sign}R${abs.toLocaleString("en-US", {
     minimumFractionDigits: 2,
     maximumFractionDigits: 2,
   })}`;
@@ -300,114 +408,13 @@ function groupBadge(group) {
   return `${bucket} · ${group}`;
 }
 
-function buildCandles(seed = 1, scale = 1) {
-  return Array.from({ length: 26 }, (_, index) => {
-    const pivot = 40 + Math.sin((index + seed) / 2.8) * 18 + ((index % 6) - 3) * 2.5;
-    const open = pivot + Math.sin(index * 1.2 + seed) * 4 * scale;
-    const close = pivot + Math.cos(index * 1.15 + seed / 2) * 5 * scale;
-    const high = Math.max(open, close) + 4 + (index % 4);
-    const low = Math.min(open, close) - 4 - (index % 3);
-    return { open, close, high, low };
-  });
-}
-
-function priceToY(value, min, max, height) {
-  const padding = 14;
-  const range = max - min || 1;
-  return height - padding - ((value - min) / range) * (height - padding * 2);
-}
-
-function MiniChart({ symbol, timeframe, mobile = false, candleData = [] }) {
-  const symbolIndex = ALL_SYMBOLS.findIndex((item) => item.symbol === symbol);
-  const tfIndex = TIMEFRAMES.indexOf(timeframe);
-  const fallbackCandles = useMemo(
-    () => buildCandles((symbolIndex + 2) * 1.7 + tfIndex, mobile ? 0.86 : 1),
-    [mobile, symbolIndex, tfIndex]
-  );
-  const candles = candleData.length ? candleData.map((candle) => ({
-    open: Number(candle.open || 0),
-    close: Number(candle.close || 0),
-    high: Number(candle.high || 0),
-    low: Number(candle.low || 0),
-  })) : fallbackCandles;
-  const width = mobile ? 360 : 820;
-  const height = mobile ? 470 : 430;
-  const candleWidth = width / (candles.length + 4);
-  const highs = candles.map((candle) => candle.high);
-  const lows = candles.map((candle) => candle.low);
-  const max = Math.max(...highs);
-  const min = Math.min(...lows);
-  const upperLine = candles.map((candle, index) => {
-    const x = (index + 2) * candleWidth;
-    const y = priceToY(candle.high + 8, min - 6, max + 10, height);
-    return `${x},${y}`;
-  }).join(" ");
-  const lowerLine = candles.map((candle, index) => {
-    const x = (index + 2) * candleWidth;
-    const y = priceToY(candle.low - 8, min - 14, max + 2, height);
-    return `${x},${y}`;
-  }).join(" ");
-
-  return (
-    <div className={`chart-surface${mobile ? " mobile" : ""}`}>
-      <svg viewBox={`0 0 ${width} ${height}`} className="chart-svg" preserveAspectRatio="none">
-        <defs>
-          <linearGradient id={`fade-${symbol}-${timeframe}-${mobile ? "m" : "d"}`} x1="0" x2="0" y1="0" y2="1">
-            <stop offset="0%" stopColor="rgba(122,52,255,.18)" />
-            <stop offset="100%" stopColor="rgba(122,52,255,0)" />
-          </linearGradient>
-        </defs>
-        {Array.from({ length: 8 }).map((_, row) => (
-          <line
-            key={`h-${row}`}
-            x1="0"
-            x2={width}
-            y1={(height / 8) * row}
-            y2={(height / 8) * row}
-            className="chart-grid"
-          />
-        ))}
-        {Array.from({ length: 10 }).map((_, col) => (
-          <line
-            key={`v-${col}`}
-            x1={(width / 10) * col}
-            x2={(width / 10) * col}
-            y1="0"
-            y2={height}
-            className="chart-grid"
-          />
-        ))}
-        <polygon
-          points={`${upperLine} ${lowerLine.split(" ").reverse().join(" ")}`}
-          fill={`url(#fade-${symbol}-${timeframe}-${mobile ? "m" : "d"})`}
-        />
-        <polyline points={upperLine} className="chart-channel" />
-        <polyline points={lowerLine} className="chart-channel alt" />
-        {candles.map((candle, index) => {
-          const x = (index + 2) * candleWidth;
-          const isUp = candle.close >= candle.open;
-          const openY = priceToY(candle.open, min, max, height);
-          const closeY = priceToY(candle.close, min, max, height);
-          const highY = priceToY(candle.high, min, max, height);
-          const lowY = priceToY(candle.low, min, max, height);
-          const bodyY = Math.min(openY, closeY);
-          const bodyH = Math.max(Math.abs(closeY - openY), 2.4);
-          return (
-            <g key={`${symbol}-${timeframe}-${index}`} className={isUp ? "candle up" : "candle down"}>
-              <line x1={x} x2={x} y1={highY} y2={lowY} className="wick" />
-              <rect x={x - candleWidth * 0.27} y={bodyY} width={candleWidth * 0.54} height={bodyH} rx="1.5" />
-            </g>
-          );
-        })}
-        <line x1="0" x2={width} y1={height * 0.61} y2={height * 0.61} className="entry-line" />
-      </svg>
-      <div className="chart-callout">
-        <div>30.08.2022 18:00 · 1 events</div>
-        <strong>{DESKTOP_EVENTS[(symbolIndex + tfIndex + (mobile ? 1 : 0)) % DESKTOP_EVENTS.length]}</strong>
-        <span>Actual: -9223372036854, Forecast: -, Previous: -</span>
-      </div>
-    </div>
-  );
+function symbolMarket(symbol, group) {
+  const code = String(symbol || "").toUpperCase();
+  const bucket = toDeskGroup(group);
+  if (bucket === "Metals" || /^(XAU|XAG)/.test(code)) return "Metals";
+  if (bucket === "Crypto" || /^(BTC|ETH|LTC|XRP)/.test(code)) return "Crypto";
+  if (bucket === "CFDs" || /^(NAS|US30|SPX|GER|EU50|FRA|UK100|JP225|AUS200|HK50)/.test(code)) return "Indices";
+  return "Forex";
 }
 
 function WatchlistTable({ symbols, activeSymbols, selectedSymbol, onSelect, onToggle }) {
@@ -437,7 +444,7 @@ function WatchlistTable({ symbols, activeSymbols, selectedSymbol, onSelect, onTo
             <div className="watch-prices">
               <span>{fmtPrice(item.symbol, item.bid)}</span>
               <span>{fmtPrice(item.symbol, item.ask)}</span>
-              <span className={item.change >= 0 ? "pos" : "neg"}>{Math.abs(item.change).toFixed(2)}%</span>
+              <span className={item.change >= 0 ? "pos" : "neg"}>{fmtAbsNumber(item.change, 2)}%</span>
               <span
                 className={`watch-toggle${isActive ? " active" : ""}`}
                 aria-label={isActive ? `Remove ${item.symbol} from active symbols` : `Add ${item.symbol} to active symbols`}
@@ -479,14 +486,22 @@ export function TradingDashboard() {
   const [stopLoss, setStopLoss] = useState("0.99683");
   const [takeProfit, setTakeProfit] = useState("1.00399");
   const [activeSymbols, setActiveSymbols] = useState(() => [...DEFAULT_ACTIVE_SYMBOLS]);
-  const [token, setToken] = useState(() => localStorage.getItem("cipherfx_mt5_token") || "");
+  const [token, setToken] = useState(() => safeStorageGet("cipherfx_mt5_token") || "");
   const [status, setStatus] = useState(null);
   const [terminal, setTerminal] = useState(null);
+  const [marketFeed, setMarketFeed] = useState(null);
   const [symbolsFeed, setSymbolsFeed] = useState([]);
   const [signalsFeed, setSignalsFeed] = useState([]);
   const [scanner, setScanner] = useState(null);
   const [audit, setAudit] = useState(null);
   const [marketHours, setMarketHours] = useState(null);
+  const [visualIntelligence, setVisualIntelligence] = useState(null);
+  const [intelligenceOverview, setIntelligenceOverview] = useState(null);
+  const [replayTimeframe, setReplayTimeframe] = useState("M5");
+  const [replayData, setReplayData] = useState(null);
+  const [replayCursor, setReplayCursor] = useState(0);
+  const [replayPlaying, setReplayPlaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState(2);
   const [scannerExpanded, setScannerExpanded] = useState(null);
   const [desktopCandles, setDesktopCandles] = useState([]);
   const [mobileCandles, setMobileCandles] = useState([]);
@@ -498,6 +513,7 @@ export function TradingDashboard() {
   const [positions, setPositions] = useState([]);
   const [orders, setOrders] = useState([]);
   const [deals, setDeals] = useState([]);
+  const [dealSummaries, setDealSummaries] = useState({ today: null, week: null, month: null });
 
   async function hRaw(method, path, body, bearer = token, timeoutMs = 15000) {
     const controller = new AbortController();
@@ -530,7 +546,7 @@ export function TradingDashboard() {
   }
 
   async function ensureToken(force = false) {
-    const nextToken = force ? "" : (token || localStorage.getItem("cipherfx_mt5_token") || "");
+    const nextToken = force ? "" : (token || safeStorageGet("cipherfx_mt5_token") || "");
     if (nextToken) {
       if (nextToken !== token) setToken(nextToken);
       return nextToken;
@@ -548,7 +564,7 @@ export function TradingDashboard() {
         || error?.status === 403
         || /401|403|Not authenticated|expired session|Invalid or expired session/i.test(String(error?.message || ""))
       ) {
-        localStorage.removeItem("cipherfx_mt5_token");
+        safeStorageRemove("cipherfx_mt5_token");
         setToken("");
         window.dispatchEvent(new CustomEvent("cipherfx:auth-expired", { detail: { dashboard: "mt5" } }));
       }
@@ -562,9 +578,9 @@ export function TradingDashboard() {
       try {
         setApiError("");
         const sessionToken = await ensureToken();
-        const [nextStatus, nextTerminal, nextSymbols, nextTrades, nextOrders, nextScanner, nextAudit, nextMarketHours] = await Promise.all([
+        const [nextStatus, nextTerminal, nextSymbols, nextTrades, nextOrders, nextScanner, nextAudit, nextMarketHours, nextVisual, nextIntelligence, nextTodayDeals, nextWeekDeals, nextMonthDeals] = await Promise.all([
           h("GET", "/status", null, sessionToken).catch((error) => {
-            setApiError(describeApiError(error, "Status feed unavailable"));
+            setApiError(describeApiError(error, "Status MT5 feed unavailable"));
             return null;
           }),
           h("GET", "/terminal", null, sessionToken).catch((error) => {
@@ -572,11 +588,16 @@ export function TradingDashboard() {
             return null;
           }),
           h("GET", "/symbols", null, sessionToken).catch(() => []),
-          h("GET", "/trades?limit=100&include_history=true", null, sessionToken).catch(() => []),
+          h("GET", "/trades?limit=1&include_history=false", null, sessionToken).catch(() => []),
           h("GET", "/orders", null, sessionToken).catch(() => []),
           h("GET", "/scanner", null, sessionToken).catch(() => null),
           h("GET", "/audit/summary", null, sessionToken).catch(() => null),
           h("GET", "/market-hours", null, sessionToken).catch(() => null),
+          h("GET", "/visual/status", null, sessionToken).catch(() => null),
+          h("GET", "/intelligence/overview", null, sessionToken).catch(() => null),
+          h("GET", "/deals?period=today&limit=50", null, sessionToken).catch(() => ({ deals: [], summary: null })),
+          h("GET", "/deals?period=week&limit=50", null, sessionToken).catch(() => ({ deals: [], summary: null })),
+          h("GET", "/deals?period=month&limit=50", null, sessionToken).catch(() => ({ deals: [], summary: null })),
         ]);
         const nextSignals = await h("GET", "/signals", null, sessionToken).catch(() => []);
         if (cancelled) return;
@@ -587,6 +608,13 @@ export function TradingDashboard() {
         setScanner(nextScanner);
         setAudit(nextAudit);
         setMarketHours(nextMarketHours);
+        setVisualIntelligence(nextVisual);
+        setIntelligenceOverview(nextIntelligence);
+        setDealSummaries({
+          today: nextTodayDeals?.summary || null,
+          week: nextWeekDeals?.summary || null,
+          month: nextMonthDeals?.summary || null,
+        });
         setOrders((nextOrders || []).map((row) => ({
           id: String(row.ticket),
           symbol: row.symbol,
@@ -599,7 +627,10 @@ export function TradingDashboard() {
           time: formatDateTimeLabel(row.time_setup || row.time) || row.time_setup || row.time || "Pending",
         })));
         setPositions(normalizePositionRows(nextTerminal?.positions));
-        setDeals((nextTrades || []).map((row, index) => {
+        const closedTradeRows = Array.isArray(nextMonthDeals?.deals) && nextMonthDeals.deals.length
+          ? nextMonthDeals.deals
+          : (nextTrades || []);
+        setDeals(closedTradeRows.map((row, index) => {
           const openedAt = row.opened_at || "";
           const closedAt = row.closed_at || row.trade_date || "";
           return {
@@ -631,60 +662,164 @@ export function TradingDashboard() {
       }
     }
     loadLive();
-    const id = window.setInterval(loadLive, 5000);
+    const id = window.setInterval(loadLive, 10000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
     };
   }, [selectedSymbol, token]);
 
+  // Quotes are a dashboard-only bridge feed. They do not depend on scanner,
+  // setup, pending, or execution state and are refreshed independently.
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    async function loadMarketFeed() {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const sessionToken = await ensureToken();
+        const symbols = activeSymbols.join(",");
+        const payload = await h(
+          "GET",
+          "/live/market?sym=" + encodeURIComponent(selectedSymbol) + "&symbols=" + encodeURIComponent(symbols),
+          null,
+          sessionToken,
+          5000,
+        );
+        if (!cancelled) {
+          setMarketFeed(
+            payload && payload.source === "mt5_bridge_live"
+              ? payload
+              : { source: "mt5_bridge_unavailable", ticks: [], generated_at: new Date().toISOString() },
+          );
+        }
+      } catch {
+        if (!cancelled) {
+          setMarketFeed({ source: "mt5_bridge_unavailable", ticks: [], generated_at: new Date().toISOString() });
+        }
+      } finally {
+        inFlight = false;
+      }
+    }
+    loadMarketFeed();
+    const id = window.setInterval(loadMarketFeed, 250);
+    return () => {
+      cancelled = true;
+      window.clearInterval(id);
+    };
+  }, [activeSymbols, selectedSymbol, token]);
+
+  useEffect(() => {
+    let cancelled = false;
+    let inFlight = false;
+    let timerId = null;
     async function loadCandles(targetTf, setter) {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         const sessionToken = await ensureToken();
         const rows = await h(
           "GET",
           `/candles?sym=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(targetTf)}&limit=140`,
           null,
-          sessionToken
+          sessionToken,
+          5000,
         );
         if (!cancelled) setter(Array.isArray(rows) ? rows : []);
       } catch {
         if (!cancelled) setter([]);
+      } finally {
+        inFlight = false;
+        if (!cancelled) timerId = window.setTimeout(() => loadCandles(targetTf, setter), 1000);
       }
     }
     loadCandles(timeframe, setDesktopCandles);
-    const id = window.setInterval(() => loadCandles(timeframe, setDesktopCandles), 1000);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      if (timerId !== null) window.clearTimeout(timerId);
     };
   }, [selectedSymbol, timeframe, token]);
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
+    let timerId = null;
     async function loadCandles(targetTf, setter) {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         const sessionToken = await ensureToken();
         const rows = await h(
           "GET",
           `/candles?sym=${encodeURIComponent(selectedSymbol)}&timeframe=${encodeURIComponent(targetTf)}&limit=110`,
           null,
-          sessionToken
+          sessionToken,
+          5000,
         );
         if (!cancelled) setter(Array.isArray(rows) ? rows : []);
       } catch {
         if (!cancelled) setter([]);
+      } finally {
+        inFlight = false;
+        if (!cancelled) timerId = window.setTimeout(() => loadCandles(targetTf, setter), 1000);
       }
     }
     loadCandles(mobileTimeframe, setMobileCandles);
-    const id = window.setInterval(() => loadCandles(mobileTimeframe, setMobileCandles), 1000);
     return () => {
       cancelled = true;
-      window.clearInterval(id);
+      if (timerId !== null) window.clearTimeout(timerId);
     };
   }, [selectedSymbol, mobileTimeframe, token]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function loadReplay() {
+      try {
+        const sessionToken = await ensureToken();
+        const payload = await h(
+          "GET",
+          "/replay?sym=" + encodeURIComponent(selectedSymbol) + "&timeframe=" + encodeURIComponent(replayTimeframe) + "&limit=500",
+          null,
+          sessionToken
+        );
+        if (!cancelled) {
+          setReplayData(payload && typeof payload === "object" ? payload : null);
+          setReplayCursor(0);
+          setReplayPlaying(false);
+        }
+      } catch {
+        if (!cancelled) {
+          setReplayData(null);
+          setReplayCursor(0);
+          setReplayPlaying(false);
+        }
+      }
+    }
+    loadReplay();
+    return () => {
+      cancelled = true;
+    };
+  }, [selectedSymbol, replayTimeframe, token]);
+
+  useEffect(() => {
+    if (!replayPlaying || !replayData?.candles?.length) return undefined;
+    const last = replayData.candles.length - 1;
+    if (replayCursor >= last) {
+      setReplayPlaying(false);
+      return undefined;
+    }
+    const interval = window.setInterval(() => {
+      setReplayCursor((current) => {
+        if (current >= last) {
+          setReplayPlaying(false);
+          return current;
+        }
+        return current + 1;
+      });
+    }, Math.max(80, Math.round(1000 / Number(replaySpeed || 1))));
+    return () => window.clearInterval(interval);
+  }, [replayPlaying, replaySpeed, replayCursor, replayData]);
 
   useEffect(() => {
     let cancelled = false;
@@ -702,7 +837,8 @@ export function TradingDashboard() {
   }, [selectedSymbol, token]);
 
   const liveSymbols = useMemo(() => {
-    const tickMap = new Map((terminal?.ticks || []).map((row) => [row.symbol, row]));
+    const liveTicks = Array.isArray(marketFeed?.ticks) ? marketFeed.ticks : [];
+    const tickMap = new Map(liveTicks.map((row) => [row.symbol, row]));
     const signalMap = new Map((signalsFeed || []).map((row) => [row.sym, row]));
     const apiRows = new Map((symbolsFeed || []).map((row) => [row.symbol, row]));
     const resolvedAliasSymbols = new Set(
@@ -710,47 +846,52 @@ export function TradingDashboard() {
         .filter((row) => row.resolved_symbol && row.resolved_symbol !== row.symbol)
         .map((row) => String(row.resolved_symbol).toUpperCase())
     );
-    const merged = ALL_SYMBOLS.map((fallback) => {
-      const row = apiRows.get(fallback.symbol) || {};
-      const resolvedSymbol = row.resolved_symbol || fallback.symbol;
-      const tick = tickMap.get(fallback.symbol) || tickMap.get(resolvedSymbol) || {};
-      const signal = signalMap.get(fallback.symbol) || {};
-      const group = row.description || fallback.group;
+    const catalog = Array.isArray(symbolsFeed) && symbolsFeed.length
+      ? symbolsFeed
+      : (Array.isArray(terminal?.symbols) ? terminal.symbols : []);
+    const merged = catalog.map((row) => {
+      const symbol = String(row.symbol || row.sym || "").toUpperCase();
+      const resolvedSymbol = row.resolved_symbol || symbol;
+      const tick = tickMap.get(symbol) || tickMap.get(resolvedSymbol) || {};
+      const signal = signalMap.get(symbol) || {};
+      const group = row.description || row.group || row.path || "Market";
       return {
-        symbol: fallback.symbol,
+        symbol,
         resolvedSymbol,
         group,
-        bucket: toDeskGroup(row.path || group || fallback.group),
-        bid: Number(tick.bid ?? fallback.bid),
-        ask: Number(tick.ask ?? fallback.ask),
-        change: Number(signal.chg ?? fallback.change ?? 0),
-        low: Number(signal.low ?? fallback.low ?? Math.min(fallback.bid || 0, fallback.ask || 0)),
-        high: Number(signal.high ?? fallback.high ?? Math.max(fallback.bid || 0, fallback.ask || 0)),
-        spread: Number(tick.spread ?? fallback.spread ?? 0),
-        visible: row.visible ?? activeSymbols.includes(fallback.symbol) ?? DEFAULT_ACTIVE_SYMBOLS.includes(fallback.symbol),
+        bucket: toDeskGroup(row.path || group),
+        market: symbolMarket(symbol, row.path || group),
+        bid: liveNumber(tick.bid),
+        ask: liveNumber(tick.ask),
+        change: liveNumber(signal.chg),
+        low: liveNumber(signal.low),
+        high: liveNumber(signal.high),
+        spread: liveNumber(tick.spread),
+        tickTime: tick.time || tick.time_utc || tick.timestamp || "",
+        quoteAgeSeconds: liveNumber(tick.age_seconds),
+        fresh: tick.fresh !== false,
+        visible: row.visible !== false && (row.visible === true || activeSymbols.includes(symbol) || DEFAULT_ACTIVE_SYMBOLS.includes(symbol)),
       };
-    });
+    }).filter((row) => row.symbol);
 
-    for (const row of symbolsFeed || []) {
-      if (merged.find((item) => item.symbol === row.symbol)) continue;
-      if (resolvedAliasSymbols.has(String(row.symbol || "").toUpperCase())) continue;
-      const fallback = buildSymbolSnapshot(row.symbol, row.description || "Custom");
-      const resolvedSymbol = row.resolved_symbol || row.symbol;
-      const tick = tickMap.get(row.symbol) || tickMap.get(resolvedSymbol) || {};
-      const signal = signalMap.get(row.symbol) || {};
-      const group = row.description || fallback.group;
+    for (const row of liveTicks) {
+      const symbol = String(row.symbol || "").toUpperCase();
+      if (!symbol || merged.find((item) => item.symbol === symbol)) continue;
       merged.push({
-        symbol: row.symbol,
-        resolvedSymbol,
-        group,
-        bucket: toDeskGroup(row.path || group || fallback.group),
-        bid: Number(tick.bid ?? fallback.bid),
-        ask: Number(tick.ask ?? fallback.ask),
-        change: Number(signal.chg ?? fallback.change ?? 0),
-        low: Number(signal.low ?? fallback.low),
-        high: Number(signal.high ?? fallback.high),
-        spread: Number(tick.spread ?? fallback.spread ?? 0),
-        visible: row.visible ?? activeSymbols.includes(row.symbol),
+        symbol,
+        resolvedSymbol: symbol,
+        group: "Live feed",
+        bucket: "All",
+        bid: liveNumber(row.bid),
+        ask: liveNumber(row.ask),
+        change: null,
+        low: null,
+        high: null,
+        spread: liveNumber(row.spread),
+        tickTime: row.time || row.time_utc || row.timestamp || "",
+        quoteAgeSeconds: liveNumber(row.age_seconds),
+        fresh: row.fresh !== false,
+        visible: true,
       });
     }
 
@@ -759,7 +900,20 @@ export function TradingDashboard() {
       if (left.group !== right.group) return left.group.localeCompare(right.group);
       return left.symbol.localeCompare(right.symbol);
     });
-  }, [terminal, symbolsFeed, signalsFeed, activeSymbols]);
+  }, [marketFeed, terminal, symbolsFeed, signalsFeed, activeSymbols]);
+
+  const selectedLiveQuote = useMemo(
+    () => liveSymbols.find((row) => row.symbol === selectedSymbol) || null,
+    [liveSymbols, selectedSymbol],
+  );
+  const liveDesktopCandles = useMemo(
+    () => applyLiveQuoteToCandles(desktopCandles, timeframe, selectedLiveQuote),
+    [desktopCandles, timeframe, selectedLiveQuote, marketFeed?.generated_at],
+  );
+  const liveMobileCandles = useMemo(
+    () => applyLiveQuoteToCandles(mobileCandles, mobileTimeframe, selectedLiveQuote),
+    [mobileCandles, mobileTimeframe, selectedLiveQuote, marketFeed?.generated_at],
+  );
 
   useEffect(() => {
     if (!liveSymbols.length) return;
@@ -814,7 +968,18 @@ export function TradingDashboard() {
   }, [activeSymbols, liveSymbols, mobileGroupFilter, mobileSearchTerm, watchlistMode]);
 
   const selected = useMemo(
-    () => liveSymbols.find((item) => item.symbol === selectedSymbol) || liveSymbols[0] || ALL_SYMBOLS[0],
+    () => liveSymbols.find((item) => item.symbol === selectedSymbol) || liveSymbols[0] || {
+      symbol: "",
+      resolvedSymbol: "",
+      group: "Live feed",
+      bucket: "All",
+      bid: null,
+      ask: null,
+      low: null,
+      high: null,
+      spread: null,
+      change: null,
+    },
     [selectedSymbol, liveSymbols]
   );
 
@@ -835,6 +1000,7 @@ export function TradingDashboard() {
     [signalsFeed]
   );
   const scannerSummary = scanner?.summary || {};
+  const intelligence = intelligenceOverview || {};
   const scannerScoreBands = scanner?.score_bands_today?.length
     ? scanner.score_bands_today
     : scanner?.score_bands_week || [];
@@ -849,7 +1015,7 @@ export function TradingDashboard() {
       ? "Signal found"
       : "Scanning";
   const heartbeatSource = status?.last_heartbeat || terminal?.updated_at;
-  const quoteClock = formatClock(terminal?.updated_at || status?.last_heartbeat);
+  const quoteClock = formatClock(marketFeed?.generated_at || terminal?.updated_at || status?.last_heartbeat);
   const heartbeatLabel = formatDateTimeLabel(heartbeatSource) || "Live feed";
   const serverClockLabel = formatClock(heartbeatSource) || "Live";
 
@@ -893,7 +1059,7 @@ export function TradingDashboard() {
   const positionTracker = useMemo(() => {
     const bySymbol = new Map();
     positions.forEach((row) => {
-      const symbol = row.symbol || "MT5";
+      const symbol = row.symbol || row.sym || "Symbol";
       const existing = bySymbol.get(symbol) || { symbol, profit: 0, volume: 0, count: 0, winners: 0, losers: 0 };
       const profit = Number(row.profit || 0);
       existing.profit += profit;
@@ -914,8 +1080,8 @@ export function TradingDashboard() {
       worst: rows.length ? [...rows].sort((left, right) => left.profit - right.profit)[0] : null,
     };
   }, [positions]);
-  const usdZarRate = Number(status?.usd_zar_rate || terminal?.currency?.usd_zar_rate || 16.21);
-  const usdZarLabel = `USD/ZAR ${usdZarRate.toFixed(2)}`;
+  const usdZarRate = Number(status?.usd_zar_rate ?? terminal?.currency?.usd_zar_rate);
+  const usdZarLabel = Number.isFinite(usdZarRate) && usdZarRate > 0 ? "USD/ZAR " + usdZarRate.toFixed(2) : "USD/ZAR unavailable";
   const accountCurrency = status?.currency || terminal?.currency?.account || terminal?.account?.currency || "USD";
   const mobileDailyPnl = Number(status?.daily_pnl ?? totals.closedPnl ?? 0);
   const mobilePnlClass = mobileDailyPnl >= 0 ? "profit" : "loss";
@@ -1044,7 +1210,7 @@ export function TradingDashboard() {
           <span>{type === "orders" ? row.price : row.side || row.type}</span>
           <span>{type === "history" ? `${row.entry} → ${row.exit}` : row.volume}</span>
           <span className={(row.profit ?? row.pnl ?? 0) >= 0 ? "pos" : "neg"}>
-            {(row.profit ?? row.pnl ?? 0).toFixed(2)}
+            {fmtNumber(row.profit ?? row.pnl, 2, "0.00")}
             {type === "positions" && (
               <button
                 type="button"
@@ -1129,67 +1295,296 @@ export function TradingDashboard() {
   const showBottomPanel = false;
 
 
+  function simpleReason(raw) {
+    const value = String(raw || "").toLowerCase();
+    if (value.includes("market_window_closed") || value.includes("markets_closed") || value.includes("market closed") || value.includes("weekend")) return "Markets closed";
+    if (value.includes("extended") || value.includes("exhaust") || value.includes("vertical") || value.includes("danger")) return "Move may be finished";
+    if (value.includes("spread") || value.includes("volatile")) return "Fast price movement";
+    if (value.includes("m5_trigger_not_ready") || value.includes("m5_trigger_waiting") || value.includes("m5 trigger")) return "Waiting for M5 trigger";
+    if (value.includes("m5_trigger_not_ready") || value.includes("m5_trigger_waiting") || value.includes("m5 trigger")) return "Waiting for M5 trigger";
+    if (value.includes("h1_not_aligned") || value.includes("m15_not_aligned") || value.includes("no clear alignment") || value.includes("timeframes disagree")) return "Timeframes disagree";
+    if (value.includes("m15") || value.includes("pullback") || value.includes("reclaim") || value.includes("continuation")) return "Choppy movement";
+    if (value.includes("range")) return "Moving in a range";
+    if (value.includes("no directional") || value.includes("flat")) return "No clear direction";
+    if (value.includes("trend") || value.includes("htf") || value.includes("alignment")) return "Timeframes disagree";
+    if (value.includes("stale") || value.includes("missing") || value.includes("data_")) return "Data updating";
+    if (value.includes("1m") || value.includes("confirmation")) return "Waiting for a fresh trigger";
+    if (value.includes("cost")) return "Trading cost is high";
+    if (value.includes("profile") || value.includes("engine policy") || value.includes("final_gate")) return "Final checks in progress";
+    if (value.includes("daily") || value.includes("loss") || value.includes("risk")) return "Risk limit reached";
+    if (value.includes("rejected")) return "Order rejected";
+    if (value.includes("not qualified")) return "No clear setup";
+    return "No clear setup";
+  }
+
+  function simpleMarketState(row, raw) {
+    const value = String(raw || "").toLowerCase();
+    const regime = String(row?.regime || row?.market_regime || row?.regime_state || "").toLowerCase();
+    if (value.includes("spread") || value.includes("volatile") || regime.includes("volatile")) return "Fast price movement";
+    if (value.includes("extended") || value.includes("exhaust") || value.includes("vertical") || value.includes("danger")) return "Move may be finished";
+    if (value.includes("h1_not_aligned") || value.includes("m15_not_aligned") || value.includes("no clear alignment") || value.includes("timeframes disagree")) return "Timeframes disagree";
+    if (regime.includes("trend")) return "Trend";
+    if (regime.includes("chop") || regime.includes("range") || regime.includes("consolidat")) return "Choppy movement";
+    if (value.includes("range") || value.includes("chop") || value.includes("consolidat")) return "Choppy movement";
+    if (value.includes("flat") || value.includes("no directional") || String(row?.h1_bias || "").toUpperCase() === "FLAT") return "No clear direction";
+    if (row?.gate_ok && value.includes("trend")) return "Trend";
+    if (value.includes("trend") || value.includes("htf") || value.includes("alignment")) return "Timeframes disagree";
+    if (value.includes("m15") || value.includes("pullback") || value.includes("reclaim") || value.includes("continuation")) return "Choppy movement";
+    return simpleReason(raw);
+  }
+
+  function simpleTradeEvent(row) {
+    const event = String(row?.event || "").toUpperCase();
+    if (event === "ORDER_FILLED") return "Trade filled";
+    if (event === "ORDER_SENT") return "Order sent";
+    if (event === "ORDER_REJECTED" || event === "ORDER_REJECTED_RECORDED") return "Order declined";
+    return "Trade update";
+  }
+
   function renderScannerWorkspace(mode = "desktop") {
     const compact = mode === "mobile";
-    const rows = (audit?.scanner_rows?.length ? audit.scanner_rows : scannerRecentRows).slice(0, compact ? 10 : 18);
+    const rows = (Array.isArray(scanner?.current_signals) ? scanner.current_signals : []).slice(0, compact ? 17 : 18);
     const counts = audit?.counts || {};
-    const reasonCounts = audit?.reason_counts || [];
-    const tradeItems = [...(audit?.trades || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 6 : 12);
-    const blockItems = [...(audit?.blocks || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 10 : 18);
+    const tradeItems = [...(audit?.trades || [])].sort((left, right) => String(right.ts || "").localeCompare(String(left.ts || ""))).slice(0, compact ? 6 : 10);
+    const blockItems = [...(scannerBlockers.length ? scannerBlockers : (audit?.blocks || []))].sort((left, right) => String(right.updated_at || right.created_at || right.ts || "").localeCompare(String(left.updated_at || left.created_at || left.ts || ""))).slice(0, 30);
+    const reasonSummary = Object.entries(blockItems.reduce((summary, row) => {
+      const label = simpleReason(row.reason || row.reason_group || row.event);
+      summary[label] = (summary[label] || 0) + 1;
+      return summary;
+    }, {})).sort((left, right) => right[1] - left[1]).slice(0, 6);
     const market = marketHours || audit?.market || {};
     const sessions = market.sessions || [];
     const marketClosed = Boolean(marketHours?.weekend_closed || audit?.market?.weekend_closed);
-    const currentGate = marketClosed ? "MARKETS CLOSED" : (scannerState || "Scanning");
+    const missingRecent = Array.isArray(scannerSummary.missing_recent_symbols) ? scannerSummary.missing_recent_symbols : [];
+    const actionable = Number(scannerSummary.current_actionable || 0);
+    const currentGate = marketClosed ? "MARKETS CLOSED" : status?.halt ? simpleReason(status.halt).toUpperCase() : actionable > 0 ? `${actionable} READY` : "WATCHING MARKET";
+    const marketSymbolGroups = ["Forex", "Indices", "Metals"].map((label) => ({
+      label,
+      items: liveSymbols.filter((item) => item.market === label),
+    }));
     return (
       <div className={"scanner-workspace" + (compact ? " mobile-scanner" : "")}>
         <div className="workspace-header scanner-header">
-          <div><h3>Score Scan</h3><span>Cipher FX Scoring Metric V1 - {audit?.window?.label || "Live decision audit"} - {compactCount(scannerSummary.tracked_symbols || liveSymbols.length)} MT5 symbols</span></div>
-          <div className={"scanner-state " + (marketClosed ? "blocked" : Number(scannerSummary.current_actionable || 0) > 0 ? "active" : "")}><Activity size={16} /><strong>{currentGate}</strong></div>
+          <div><h3>Live Scan</h3><span>Live MT5 symbols · {compactCount(scannerSummary.tracked_symbols || liveSymbols.length)}</span></div>
+          <div className={"scanner-state " + (marketClosed ? "blocked" : actionable > 0 ? "active" : "")}><Activity size={16} /><strong>{currentGate}</strong></div>
         </div>
         <div className="scanner-session-strip" aria-label="Global market sessions">
           {sessions.map((session) => <div className={"scanner-session " + (session.open ? "open" : "closed")} key={session.id}><span className="market-status-dot" /><div><strong>{session.label}</strong><em>{session.open ? "OPEN" : "CLOSED"} · {session.hours_sast}</em></div></div>)}
         </div>
-        <div className="scanner-metrics">
-          <div className="scanner-card score-model-card"><span>Scoring metric</span><strong>Cipher FX Scoring Metric V1</strong><em>100-point decision model</em></div>
-          <div className="scanner-card"><span>Audit window</span><strong>{compactCount((audit?.blocks || []).length)}</strong><em>{compactCount((audit?.trades || []).length)} trade events</em></div>
-          <div className="scanner-card"><span>Setups created</span><strong>{compactCount(counts.SETUP_CREATED || 0)}</strong><em>{compactCount(counts.SETUP_CONFIRMED_FRESH || 0)} fresh confirmations</em></div>
-          <div className="scanner-card"><span>Orders filled</span><strong className={(counts.ORDER_FILLED || 0) > 0 ? "pos" : ""}>{compactCount(counts.ORDER_FILLED || 0)}</strong><em>{compactCount(counts.ORDER_SENT || 0)} sent - {compactCount(counts.ORDER_REJECTED || 0)} rejected</em></div>
-          <div className="scanner-card"><span>Profit campaigns</span><strong className={Number(status?.active_campaign_count || 0) > 0 ? "pos" : ""}>{compactCount(status?.active_campaign_count || 0)}</strong><em>up to {status?.max_pyramid_levels || 10} legs - {status?.campaign_monitor_seconds || 0.5}s monitor</em></div>
-          <div className="scanner-card"><span>Scan heartbeat</span><strong>{formatAgeLabel(status?.last_scan || scannerSummary.latest_signal_at)}</strong><em>{formatDateTimeLabel(status?.last_scan || scannerSummary.latest_signal_at) || "Audit live"}</em></div>
+        <div className="scanner-symbol-groups" aria-label="Live symbols by market">
+          {marketSymbolGroups.map((group) => {
+            const active = !marketClosed && group.items.some((item) => item.fresh !== false && item.bid !== null && item.ask !== null);
+            return (
+              <div className={"scanner-symbol-group " + (active ? "active" : "closed")} key={group.label}>
+                <div className="scanner-symbol-group-head"><span className="market-status-dot" /><strong>{group.label}</strong><em>{active ? "ACTIVE" : "OFF"}</em></div>
+                <div className="scanner-symbol-list">
+                  {group.items.length ? group.items.map((item) => <span className={"scanner-symbol-pill " + (item.fresh !== false && item.bid !== null ? "live" : "stale")} key={item.symbol}>{item.symbol}</span>) : <span className="scanner-symbol-empty">No live symbols</span>}
+                </div>
+              </div>
+            );
+          })}
         </div>
-        <div className="scanner-split">
+        <div className="scanner-metrics scanner-metrics-compact">
+          <div className="scanner-card"><span>Live symbols</span><strong>{compactCount(scannerSummary.current_universe_rows || scannerSummary.tracked_symbols || liveSymbols.length)}</strong><em>{missingRecent.length ? missingRecent.length + " waiting for session or scan" : "Grouped by market above"}</em></div>
+          <div className="scanner-card"><span>Setups found</span><strong>{compactCount(counts.SETUP_CREATED ?? scannerSummary.actionable_today ?? 0)}</strong><em>{compactCount(Math.max(0, Number(scannerSummary.tracked_symbols || liveSymbols.length) - actionable))} currently monitored</em></div>
+          <div className="scanner-card"><span>Trades opened</span><strong className={(counts.ORDER_FILLED || 0) > 0 ? "pos" : ""}>{compactCount(counts.ORDER_FILLED || 0)}</strong><em>{compactCount(counts.ORDER_REJECTED || 0)} orders rejected</em></div>
+          <div className="scanner-card"><span>Live market feed</span><strong>{formatAgeLabel(marketFeed?.generated_at)}</strong><em>{formatDateTimeLabel(marketFeed?.generated_at) || "Waiting for live bridge"}</em></div>
+        </div>
+        <div className="scanner-split scanner-story-layout">
           <div className="scanner-list">
-            <div className="scanner-section-title"><strong>Current Scores</strong><span>H4 / H1 / M15 / M5 / M1</span></div>
+            <div className="scanner-section-title">H4 direction -&gt; H1 confirmation -&gt; M15 POI / structure -&gt; M5 break / retest -&gt; order</div>
             {rows.length ? rows.map((row, index) => {
-              const symbol = row.symbol || row.sym || "MT5";
-              const id = symbol + "-" + (row.ts || index);
-              const score = Number(row.score ?? row.score_metric?.total ?? 0);
-              const statusLabel = row.gate_ok ? "PASS" : (row.final_status || "NOT QUALIFIED");
-              const reason = row.reason || row.gate || row.status || "No block reason recorded";
-              const context = "H4 " + (row.h4_bias || "-") + " " + (row.h4_score ?? "-") + " - H1 " + (row.h1_bias || "-") + " " + (row.h1_score ?? "-") + " - M15 " + (row.m15_bias || "-") + " " + (row.m15_score ?? "-") + " - M5 " + (row.m5_trigger_side || "-") + " - M1 " + (row.m1_status || "-");
+              const symbol = row.symbol || row.sym || "Symbol";
+              const id = symbol + "-" + (row.updated_at || row.ts || index);
+              const rawScore = row.score ?? row.score_metric?.total;
+              const score = Number(rawScore);
+              const scoreAvailable = rawScore !== null && rawScore !== undefined && Number.isFinite(score);
+              const h4Bias = String(row.h4_bias || row.bias_4h || "").toUpperCase();
+              const scoreContext = h4Bias === "BUY" || h4Bias === "SELL"
+                ? "Context " + h4Bias + " · M5 entry"
+                : "M5 entry";
+              const side = String(row.side || row.direction || "").toUpperCase();
+              const liveReason = String(row.reason || row.gate || row.status || "").toLowerCase();
+              const m5Waiting = liveReason.includes("m5_trigger_not_ready") || liveReason.includes("m5_trigger_waiting") || liveReason.includes("m5 trigger");
+              const setupState = String(row.setup_state || row.state || "").toUpperCase();
+              const hasRealSetup = row.pending_setup_created === true || ["ARMED", "WAITING_M5", "CONFIRMED", "M5_TRIGGERED", "EXECUTION_PENDING", "PASS"].includes(setupState);
+              const rowSession = row.market_session ? sessions.find((session) => session.id === row.market_session) : null;
+              const rowMarketClosed = Boolean(rowSession && !rowSession.open);
+              const scoreMinimum = Number(row.score_metric?.minimum ?? row.min_score ?? 70);
+              const scorePass = scoreAvailable && Number.isFinite(scoreMinimum) && score >= scoreMinimum && row.gate_ok === true;
+              const scanStatus = marketClosed || rowMarketClosed ? "CLOSED" : m5Waiting && !hasRealSetup ? "WATCHING M5" : m5Waiting ? "WAITING FOR M5" : String(row.scan_status || (scorePass ? "WAITING" : "WATCHING")).toUpperCase();
+              const story = marketClosed
+                ? "This market is closed; scanning resumes in its next session."
+                : rowMarketClosed
+                  ? symbol + " is configured and active; " + rowSession.label + " is closed until " + rowSession.next_open_sast + "."
+                  : m5Waiting && !hasRealSetup
+                    ? "No M5 setup: the required break or retest was not present on this scan."
+                    : (row.scan_story || simpleMarketState(row, row.reason || row.gate || row.status));
+              const usesM1Entry = !String(row.execution_1m_result || "").toUpperCase().includes("NOT_USED")
+                && !String(row.execution_path || "").toUpperCase().includes("M5_DIRECT")
+                && !String(row.entry_mode || "").toUpperCase().includes("M5");
+              const rawProgress = Array.isArray(row.scan_progress) && row.scan_progress.length ? row.scan_progress : [
+                { key: "H4", label: "Direction", state: scorePass ? "complete" : "current" },
+                { key: "H1", label: "Check", state: scorePass ? "complete" : "inactive" },
+                { key: "M15", label: "Structure", state: scorePass ? "complete" : "inactive" },
+                { key: "M5", label: "Trigger", state: scorePass ? "complete" : "inactive" },
+                { key: "ORDER", label: "Order", state: scorePass ? "current" : "inactive" },
+              ];
+              const progress = rawProgress.map((stage) => {
+                const key = String(stage.key || "").toUpperCase();
+                if (key === "ORDER" && !scorePass) return { ...stage, state: "inactive" };
+                return stage;
+              }).filter((stage) => {
+                const key = String(stage.key || "").toUpperCase();
+                const diagnostic = String(stage.label || "").toLowerCase().includes("diagnostic");
+                return key !== "M1" || (usesM1Entry && !diagnostic);
+              });
               return (
-                <React.Fragment key={id}>
-                  <button type="button" className={"scanner-row" + (row.gate_ok && !marketClosed ? " ok" : " blocked")} onClick={() => setScannerExpanded((current) => current === id ? null : id)}>
-                    <div className="scanner-row-main"><strong>{symbol} <span>{row.side || "WAIT"}</span></strong><em>{row.engine || "engine pending"} - {row.setup_type || "setup pending"}</em><small>{context}</small></div>
-                    <div className="scanner-row-score"><strong>{score ? score.toFixed(0) : "--"}</strong><span>{row.score_band || "Cipher FX V1"}</span><em className={row.gate_ok && !marketClosed ? "pos" : "neg"}>{statusLabel}</em></div>
-                  </button>
-                  {scannerExpanded === id && <div className="scanner-detail"><div className="scan-detail-grid"><span>H4 <b>{row.h4_bias || "-"} {row.h4_score ?? "-"}</b></span><span>H1 <b>{row.h1_bias || "-"} {row.h1_score ?? "-"}</b></span><span>M15 <b>{row.m15_bias || "-"} {row.m15_score ?? "-"}</b></span><span>M5 trigger <b>{row.m5_trigger_side || "-"}</b></span><span>M1 confirmation <b>{row.m1_status || "-"}</b></span><span>setup <b>{row.setup_type || "-"}</b></span></div><div className="scanner-detail-reason"><b>{statusLabel}</b> - {reason}</div>{Object.keys(row.score_metric?.components || {}).length > 0 && <div className="scanner-components">{Object.entries(row.score_metric.components).map(([key, value]) => <span key={key}>{key.replaceAll("_", " ")} <b>{Number(value).toFixed(1)}</b></span>)}</div>}</div>}
-                </React.Fragment>
+                <article className={"scanner-story-row " + scanStatus.toLowerCase()} key={id}>
+                  <div className="scanner-story-head">
+                    <div><strong>{symbol}</strong><span className={side === "BUY" ? "pos" : side === "SELL" ? "neg" : ""}>{side || "WATCH"}</span></div>
+                    <div><b>{scoreAvailable ? `Score ${score.toFixed(0)}` : `Score unavailable`}</b><em>{scoreContext ? `${scoreContext} · ` : ""}{scanStatus}</em></div>
+                  </div>
+                  <p>{story}</p>
+                  <div className="scanner-stage-track" aria-label={`${symbol} scan progress`}>
+                    {progress.map((stage) => <div className={"scanner-stage " + stage.state} key={stage.key}><span>{stage.key === "ORDER" ? (stage.state === "current" ? "SEND" : "ORDER") : stage.key}</span><em>{stage.label}</em></div>)}
+                  </div>
+                  <time>{row.scan_trigger === "COMPLETED_M5" ? "Latest completed M5 · " + (formatDateTimeLabel(row.scan_candle_times?.M5_close || row.scan_cycle_at || row.updated_at || row.ts) || "Live") : (formatDateTimeLabel(row.updated_at || row.ts) || "Live")}</time>
+                </article>
               );
-            }) : <div className="empty-state">No score rows are available in the current audit window.</div>}
+            }) : <div className="empty-state">Waiting for the next completed market scan.</div>}
           </div>
-          <div className="scanner-side">
-            <div className="scanner-section-title"><strong>Block Reasons</strong><span>Audit window</span></div>
-            <div className="reason-summary-grid">{reasonCounts.length ? reasonCounts.slice(0, 8).map((row) => <div className="reason-summary-row" key={row.reason}><strong>{row.reason.replaceAll("_", " ")}</strong><span>{compactCount(row.count)}</span></div>) : <div className="empty-state">No recorded blocks.</div>}</div>
-            <div className="scanner-section-title"><strong>Trade Events</strong><span>Since 21:00 SAST · {compactCount(tradeItems.length)} shown</span></div>
-            <div className="scanner-event-list">{tradeItems.length ? tradeItems.map((row, index) => <div className="scanner-event-row" key={row.event + "-" + row.ts + "-" + index}><div><strong>{row.symbol || "MT5"}</strong><span>{row.event}</span><time>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</time></div><p>{row.reason || row.raw_status || "Recorded trade event"}</p></div>) : <div className="empty-state">No trade events in the window.</div>}</div>
-            <div className="scanner-section-title"><strong>Latest No-Trade Detail</strong><span>{compactCount((audit?.blocks || []).length)} total</span></div>
-            <div className="scanner-event-list">{blockItems.length ? blockItems.map((row, index) => <div className="scanner-event-row" key={row.event + "-" + row.ts + "-" + index}><div><strong>{row.symbol || "MT5"}</strong><span>{(row.reason_group || row.event || "AUDIT").replaceAll("_", " ")}</span><time>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</time></div><p>{row.reason || row.event}</p></div>) : <div className="empty-state">No block events in the window.</div>}</div>
-          </div>
+          <aside className="scanner-side">
+            <div className="scanner-section-title"><strong>Why symbols are waiting</strong><span>Latest checks</span></div>
+            <div className="reason-summary-grid">{reasonSummary.length ? reasonSummary.map(([label, count]) => <div className="reason-summary-row" key={label}><strong>{label}</strong><span>{count}</span></div>) : <div className="empty-state">No current checks.</div>}</div>
+            <div className="scanner-section-title"><strong>Recent trades</strong><span>{compactCount(tradeItems.length)} recent</span></div>
+            <div className="scanner-event-list">{tradeItems.length ? tradeItems.map((row, index) => <div className="scanner-event-row" key={row.event + "-" + row.ts + "-" + index}><div><strong>{row.symbol || row.sym || "Symbol"}</strong><span>{simpleTradeEvent(row)}</span><time>{formatDateTimeLabel(row.ts) || row.ts || "Live"}</time></div><p>{row.event === "ORDER_FILLED" ? "Trade opened on MT5" : simpleReason(row.reason || row.raw_status || row.event)}</p></div>) : <div className="empty-state">No trades recorded in this session.</div>}</div>
+          </aside>
         </div>
       </div>
     );
   }
+  function renderIntelligenceWorkspace(mode = "desktop") {
+    const compact = mode === "mobile";
+    const overview = intelligenceOverview || {};
+    const planning = overview.planning || {};
+    const learning = overview.learning || {};
+    const validation = overview.validation || {};
+    const execution = overview.execution || {};
+    const data = overview.data_status || {};
+    const plans = Array.isArray(planning.latest_by_symbol) ? planning.latest_by_symbol : [];
+    const adjustments = Array.isArray(learning.latest_adjustments) ? learning.latest_adjustments : [];
+    const health = Array.isArray(data.health_counts) ? data.health_counts : [];
+    const walk = validation.walk_forward || {};
+    const drift = validation.drift || {};
+    const deployment = execution.deployment || {};
+    const latestDecision = execution.last_decision || {};
+    const number = (value, decimals = 0) => {
+      const n = Number(value);
+      return Number.isFinite(n) ? n.toFixed(decimals) : "--";
+    };
+    const humanStatus = (value) => {
+      const raw = String(value || "UNAVAILABLE").toUpperCase();
+      const labels = { SHADOW_ONLY:"Shadow only", SHADOW:"Shadow", AVAILABLE:"Available", UNAVAILABLE:"Not available", PASS:"Ready", CLEAR:"Clear", REVIEW:"Review needed", DRIFT_DETECTED:"Change detected", NO_TRADE:"No trade", ACTIONABLE:"Ready", NOT_QUALIFIED:"Not ready", QUALIFIED:"Ready", LIVE:"Live", OFFLINE:"Offline", APPLIED:"Applied", NOT_APPLIED:"Not applied", UNKNOWN:"Not available" };
+      if (labels[raw]) return labels[raw];
+      return raw.toLowerCase().replaceAll("_"," ").replace(/(^|\s)\S/g,(letter)=>letter.toUpperCase());
+    };
+    const humanAlignment = (value) => {
+      const raw = String(value || "").toUpperCase();
+      if (raw === "ALIGNED" || raw === "FULL_ALIGNMENT") return "Timeframes agree";
+      if (raw === "PARTIAL" || raw === "PARTIAL_ALIGNMENT") return "Some timeframes agree";
+      if (raw === "NOT_ALIGNED") return "Timeframes disagree";
+      return "No clear alignment";
+    };
+    const humanAsset = (value) => {
+      const raw = String(value || "").toUpperCase();
+      if (raw.includes("FOREX") || raw === "FX") return "Forex";
+      if (raw.includes("METAL")) return "Metal";
+      if (raw.includes("INDEX")) return "Index";
+      return raw ? raw.toLowerCase().replaceAll("_"," ") : "Market";
+    };
+    const humanReason = (value) => simpleReason(value);
+    const zoneLabel = (value) => {
+      if (value && typeof value === "object") {
+        const low = value.low ?? value.min ?? value.lower;
+        const high = value.high ?? value.max ?? value.upper;
+        if (low != null || high != null) return [low, high].filter((item) => item != null).join(" - ");
+        return "Zone recorded";
+      }
+      return String(value || "No price area recorded");
+    };
+    return (
+      <div className={"intelligence-workspace" + (compact ? " mobile-intelligence" : "")}>
+        <div className="workspace-header intelligence-header">
+          <div><h3>Planning & Learning</h3><span>What MT5 planned, learned and recorded</span></div>
+          <div className="intelligence-source"><Sparkles size={16} /><strong>LIVE MT5</strong><span>Mode: {humanStatus(overview.mode || "SHADOW")}</span></div>
+        </div>
+        <div className="intelligence-metrics">
+          <div className="intelligence-card"><span>Plans</span><strong>{compactCount(planning.plan_count || 0)}</strong><em>{humanStatus(planning.status)}</em></div>
+          <div className="intelligence-card"><span>Learning samples</span><strong>{compactCount(learning.shadow_sample_count || 0)}</strong><em>Shadow data only</em></div>
+          <div className="intelligence-card"><span>Changes applied</span><strong className={learning.applied_count ? "neg" : "pos"}>{compactCount(learning.applied_count || 0)}</strong><em>{humanStatus(learning.mode || "SHADOW_ONLY")}</em></div>
+          <div className="intelligence-card"><span>Connection</span><strong className={data.mt5_connected ? "pos" : "neg"}>{data.mt5_connected ? "Connected" : "Offline"}</strong><em>{formatAgeLabel(data.last_scan) || "No recent update"}</em></div>
+        </div>
+        <div className="intelligence-story">
+          <div className="scanner-section-title"><strong>What the data says</strong><span>Updated {formatDateTimeLabel(overview.generated_at) || "live"}</span></div>
+          <p>{planning.story || "Planning data is not available yet."}</p>
+          <p>{learning.story || "Learning data is not available yet."}</p>
+          <div className="intelligence-boundary"><strong>What this means</strong><span>This tab explains the plan and data record. The Scan tab shows the live market decision.</span></div>
+        </div>
+        <div className="intelligence-grid">
+          <section className="intelligence-panel">
+            <div className="scanner-section-title"><strong>Current plans</strong><span>{compactCount(plans.length)} symbols</span></div>
+            <div className="intelligence-list">
+              {plans.length ? plans.map((plan, index) => (
+                <div className="intelligence-row" key={(plan.symbol || "plan") + "-" + index}>
+                  <div className="intelligence-row-main"><strong>{plan.symbol || "--"}</strong><span>{humanAsset(plan.asset_class)}</span><em>{humanStatus(plan.status)}</em></div>
+                  <div className="intelligence-row-detail"><b className={plan.h4_bias === "BUY" ? "pos" : plan.h4_bias === "SELL" ? "neg" : ""}>{plan.h4_bias || "NO TRADE"}</b><span>H4 {number(plan.h4_score)} - H1 {number(plan.h1_score)} - M15 {number(plan.m15_score)}</span><span>{humanAlignment(plan.alignment)}</span><span>Confidence {number(plan.confidence)}%</span></div>
+                  <small>{zoneLabel(plan.entry_zone)} - {formatDateTimeLabel(plan.created_at) || "time unavailable"}</small>
+                </div>
+              )) : <div className="empty-state">No plans recorded in MT5 SQLite.</div>}
+            </div>
+          </section>
+          <section className="intelligence-panel">
+            <div className="scanner-section-title"><strong>Recent learning</strong><span>{humanStatus(learning.mode || "SHADOW_ONLY")}</span></div>
+            <div className="intelligence-list">
+              {adjustments.length ? adjustments.slice(0, compact ? 6 : 10).map((item, index) => (
+                <div className="intelligence-row" key={(item.symbol || "adjustment") + "-" + index}>
+                  <div className="intelligence-row-main"><strong>{item.symbol || "--"}</strong><span>{humanAlignment(item.plan_alignment)}</span><em>{humanStatus(item.mode || "SHADOW_ONLY")}</em></div>
+                  <div className="intelligence-row-detail"><b>{number(item.score_before)} {"->"} {number(item.score_after)}</b><span>Score change {number(item.score_adjustment, 1)}</span><span>{item.applied ? "Applied" : "Not applied"}</span></div>
+                  <small>{humanReason(item.reason || "No clear setup")} - {formatDateTimeLabel(item.created_at) || "time unavailable"}</small>
+                </div>
+              )) : <div className="empty-state">No score adjustments recorded.</div>}
+            </div>
+          </section>
+        </div>
+        <div className="intelligence-grid">
+          <section className="intelligence-panel">
+            <div className="scanner-section-title"><strong>Checks on the data</strong><span>Recorded evidence</span></div>
+            <div className="intelligence-facts">
+              <div><span>Historical test</span><b>{humanStatus(walk.status)}</b><em>{walk.sample_size || "--"} samples - {walk.fold_count || "--"} folds</em></div>
+              <div><span>Pattern reliability</span><b className={walk.overfit ? "neg" : "pos"}>{walk.overfit ? "Review" : "Clear"}</b><em>{walk.overfit_folds || 0} patterns need review</em></div>
+              <div><span>Recent change</span><b className={drift.status === "DRIFT_DETECTED" ? "neg" : ""}>{humanStatus(drift.status)}</b><em>recent data</em></div>
+              <div><span>Recent result</span><b>{number(drift.recent_expectancy_r, 2)}R</b><em>change {number(drift.expectancy_delta_r, 2)}R</em></div>
+            </div>
+          </section>
+          <section className="intelligence-panel">
+            <div className="scanner-section-title"><strong>Trading status</strong><span>Current MT5 records</span></div>
+            <div className="intelligence-facts">
+              <div><span>Live setup</span><b>{humanStatus(deployment.stage || deployment.status)}</b><em>MT5 decision path active</em></div>
+              <div><span>Live permission</span><b className={deployment.live_approval ? "pos" : ""}>{deployment.live_approval ? "YES" : "NO"}</b><em>{deployment.replacement_strategy_live ? "Live route available" : "Live route not active"}</em></div>
+              <div><span>Latest decision</span><b>{latestDecision.symbol || "--"}</b><em>{humanStatus(latestDecision.status)} - {humanReason(latestDecision.reason || "No clear setup")}</em></div>
+              <div><span>Broker symbols</span><b>{compactCount(data.broker_symbol_specs || 0)}</b><em>{data.mt5_connected ? "Loaded from live MT5" : "MT5 feed unavailable"}</em></div>
+            </div>
+          </section>
+        </div>
+        <div className="intelligence-footer">
+          <span>System: {health.map((item) => humanStatus(item.status) + " " + item.count).join(" - ") || "No health data"}</span>
+          <span>Reviews waiting: {compactCount(learning.false_entry_review_count || 0)}</span>
+        </div>
+      </div>
+    );
+  }
+
   function renderMarketHoursWorkspace() {
     const market = marketHours || audit?.market || {};
     const sessions = market.sessions || [];
@@ -1208,15 +1603,16 @@ export function TradingDashboard() {
     if (desktopTab === "calendar") {
       return (
         <div className="info-panel">
-          <h3>Market Pulse</h3>
-          <p>Live signal rotation and desk timing for {selected.symbol}.</p>
+          <h3>Market Sessions</h3>
+          <p>Live session status for {selected.symbol || "the selected market"}. Times are SAST.</p>
           <div className="info-list">
-            {DESKTOP_EVENTS.map((event) => (
-              <div className="info-row" key={event.label}>
-                <strong>{event.time} · {event.tag}</strong>
-                <span>{event.label}</span>
+            {(marketHours?.sessions || []).map((session) => (
+              <div className="info-row" key={session.id}>
+                <strong className={session.open ? "pos" : "neg"}>{session.label} · {session.open ? "OPEN" : "CLOSED"}</strong>
+                <span>{session.hours_sast} · {session.open ? "Live session" : session.reason}</span>
               </div>
             ))}
+            {!marketHours?.sessions?.length && <div className="empty-state">Waiting for live market-hours data.</div>}
           </div>
           <div className="info-grid pulse-grid">
             {(marketPulse.length ? marketPulse : signalsFeed.slice(0, 6)).map((row) => (
@@ -1257,6 +1653,65 @@ export function TradingDashboard() {
     return null;
   }
 
+  function renderReplayWorkspace(mode = "desktop") {
+    const compact = mode === "mobile";
+    const replayCandles = Array.isArray(replayData?.candles) ? replayData.candles : [];
+    const replayTrades = Array.isArray(replayData?.trades) ? replayData.trades : [];
+    const maxCursor = Math.max(0, replayCandles.length - 1);
+    const cursor = Math.min(replayCursor, maxCursor);
+    const currentCandle = replayCandles[cursor];
+    const progress = replayCandles.length ? Math.round(((cursor + 1) / replayCandles.length) * 100) : 0;
+    return (
+      <div className={"replay-workspace" + (compact ? " replay-mobile" : "")}>
+        <div className="workspace-header replay-header">
+          <div>
+            <h3>Trade Replay</h3>
+            <span>Historical evidence only · no live orders · {replayData?.source || "waiting for data"}</span>
+          </div>
+          <div className="replay-safety-label">REPLAY ONLY</div>
+        </div>
+        <div className="replay-toolbar">
+          <div className="replay-timeframes">
+            {["M1", "M5", "M15", "H1", "H4"].map((item) => (
+              <button key={item} type="button" className={replayTimeframe === item ? "active" : ""} onClick={() => setReplayTimeframe(item)}>{item}</button>
+            ))}
+          </div>
+          <div className="replay-controls">
+            <button type="button" className="icon-btn" title="Reset replay" aria-label="Reset replay" onClick={() => { setReplayPlaying(false); setReplayCursor(0); }}><SkipBack size={16} /></button>
+            <button type="button" className="icon-btn replay-play" title={replayPlaying ? "Pause replay" : "Play replay"} aria-label={replayPlaying ? "Pause replay" : "Play replay"} onClick={() => setReplayPlaying((value) => !value)} disabled={!replayCandles.length}>{replayPlaying ? <Pause size={16} /> : <Play size={16} />}</button>
+            <button type="button" className="icon-btn" title="Step one candle" aria-label="Step one candle" onClick={() => setReplayCursor((value) => Math.min(maxCursor, value + 1))} disabled={!replayCandles.length || cursor >= maxCursor}><StepForward size={16} /></button>
+            <label className="replay-speed"><span>Speed</span><select value={replaySpeed} onChange={(event) => setReplaySpeed(Number(event.target.value))}><option value="0.5">0.5x</option><option value="1">1x</option><option value="2">2x</option><option value="4">4x</option><option value="8">8x</option></select></label>
+          </div>
+        </div>
+        <div className="replay-progress">
+          <input aria-label="Replay position" type="range" min="0" max={maxCursor} value={cursor} onChange={(event) => { setReplayPlaying(false); setReplayCursor(Number(event.target.value)); }} disabled={!replayCandles.length} />
+          <span>{progress}% · {cursor + 1}/{replayCandles.length || 0} candles</span>
+        </div>
+        <div className="replay-chart-stage">
+          <TradeReplayChart sym={selected.symbol} timeframe={replayTimeframe} candles={replayCandles} trades={replayTrades} cursor={cursor} height={compact ? 350 : 500} />
+        </div>
+        <div className="replay-summary">
+          <div><span>Replay time</span><strong>{currentCandle ? formatDateTimeLabel(currentCandle.ts || currentCandle.time || currentCandle.timestamp) : "--"}</strong></div>
+          <div><span>Candle close</span><strong>{currentCandle ? fmtPrice(selected.symbol, currentCandle.close) : "--"}</strong></div>
+          <div><span>Trades loaded</span><strong>{replayTrades.length}</strong></div>
+          <div><span>Execution</span><strong>DISABLED</strong></div>
+        </div>
+        <div className="replay-trade-list">
+          <div className="scanner-section-title"><strong>Trade markers</strong><span>{replayTrades.length} persisted trade records</span></div>
+          {replayTrades.length ? replayTrades.slice(0, compact ? 8 : 14).map((trade, index) => (
+            <div className="replay-trade-row" key={(trade.trade_id || "trade") + "-" + index}>
+              <strong className={String(trade.direction || "").toUpperCase() === "BUY" ? "pos" : "neg"}>{trade.direction || "--"}</strong>
+              <span>{trade.trade_id || "MT5 trade"}</span>
+              <span>{fmtPrice(selected.symbol, trade.entry)}</span>
+              <span>{trade.outcome || "OPEN"}</span>
+              <span>{trade.opened_at || trade.opened_date || "--"}</span>
+            </div>
+          )) : <div className="empty-state">No persisted trades are available for this symbol.</div>}
+        </div>
+      </div>
+    );
+  }
+
   function renderTradeWorkspace(mode = "chart") {
     return (
       <div className={`chart-and-trade${mode === "watchlist" ? " watchlist-focus" : ""}${mode === "trade" ? " trade-focus" : ""}`}>
@@ -1284,7 +1739,7 @@ export function TradingDashboard() {
               sym={selected.symbol}
               token={token}
               timeframe={timeframe}
-              candles={desktopCandles}
+              candles={liveDesktopCandles}
               height={420}
               fill
               apiBase={API}
@@ -1293,7 +1748,7 @@ export function TradingDashboard() {
           <div className="chart-readout">
             <div className="detail-card"><strong>Session</strong><span>{describeInstrument(selected.symbol, selected.group)}</span></div>
             <div className="detail-card"><strong>Low / High</strong><span>{fmtPrice(selected.symbol, selected.low)} / {fmtPrice(selected.symbol, selected.high)}</span></div>
-            <div className="detail-card"><strong>Execution</strong><span>{status?.dry_run ? "DRY RUN" : "LIVE MT5"} · daily {status?.daily_trade_count ?? 0}/{status?.max_daily_trades || 30} · scan {status?.scan_seconds || 890}s</span></div>
+            <div className="detail-card"><strong>Execution</strong><span>{status?.dry_run ? "DRY RUN" : status?.mt5_connected ? "LIVE MT5" : "MT5 offline"} · daily {status?.daily_trade_count ?? "--"}/{status?.max_daily_trades ?? "--"} · scan {status?.scan_seconds ?? "--"} s</span></div>
             <div className="detail-card"><strong>Heartbeat</strong><span>{heartbeatLabel}</span></div>
           </div>
           <div className="timeframe-bar">
@@ -1343,7 +1798,7 @@ export function TradingDashboard() {
           <button type="button" className="ghost-btn" disabled={busyAction === "pending"} onClick={submitPendingOrder}>
             {busyAction === "pending" ? "Sending..." : "Place Pending Order"}
           </button>
-          <div className="ticket-footer">Spread: {selected.spread} · Equity Protection: ON · AI Trading: ACTIVE</div>
+          <div className="ticket-footer">Spread: {selected.spread ?? "--"} · {status?.mt5_trade_allowed === true ? "MT5 trading allowed" : status?.mt5_trade_allowed === false ? "MT5 trading disabled" : "MT5 trade status unavailable"}</div>
         </div>
       </div>
     );
@@ -1390,7 +1845,7 @@ export function TradingDashboard() {
                 sym={selected.symbol}
                 token={token}
                 timeframe={timeframe}
-                candles={desktopCandles}
+                candles={liveDesktopCandles}
                 height={360}
                 fill
                 apiBase={API}
@@ -1447,7 +1902,7 @@ export function TradingDashboard() {
                   <div className="position-pnl-row" key={row.symbol}>
                     <div>
                       <strong>{row.symbol}</strong>
-                      <span>{row.count} trade{row.count === 1 ? "" : "s"} · vol {row.volume.toFixed(2)}</span>
+                      <span>{row.count} trade{row.count === 1 ? "" : "s"} · vol {fmtNumber(row.volume, 2, "0.00")}</span>
                     </div>
                     <div className="position-pnl-track">
                       <div className={row.profit >= 0 ? "profit" : "loss"} style={{ width: `${width}%` }} />
@@ -1507,6 +1962,24 @@ export function TradingDashboard() {
     );
   }
 
+  function renderDealPeriodSummary() {
+    return (
+      <div className="deal-period-summary" aria-label="Trade totals">
+        {[
+          ["Today", dealSummaries.today],
+          ["This week", dealSummaries.week],
+          ["This month", dealSummaries.month],
+        ].map(([label, summary]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>{summary?.total_trades ?? 0}</strong>
+            <em className={Number(summary?.pnl || 0) >= 0 ? "pos" : "neg"}>{formatSignedUsd(summary?.pnl || 0)}</em>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   function renderHistoryWorkspace() {
     return (
       <div className="workspace-card">
@@ -1514,12 +1987,13 @@ export function TradingDashboard() {
           <h3>Deals History</h3>
           <span>{deals.length} deal row(s)</span>
         </div>
+        {renderDealPeriodSummary()}
         <div className="workspace-stack">
           {deals.length ? deals.map((row) => (
             <div className="position-card" key={row.id}>
               <div><strong>{row.symbol}</strong><span>{row.side} {row.volume}</span></div>
               <div className="trade-date-line"><span>{tradeDateLine(row, "history")}</span><span>{tradeMonthLabel(row) || row.tradeDate}</span></div>
-              <div><span>{row.entry} → {row.exit}</span><strong className={row.pnl >= 0 ? "pos" : "neg"}>{row.pnl.toFixed(2)}</strong></div>
+              <div><span>{row.entry} → {row.exit}</span><strong className={row.pnl >= 0 ? "pos" : "neg"}>{fmtNumber(row.pnl, 2, "0.00")}</strong></div>
             </div>
           )) : <div className="empty-state">No deal history from MT5.</div>}
         </div>
@@ -1692,7 +2166,7 @@ export function TradingDashboard() {
               <div className="quick-stats">
                 <span>Bid {fmtPrice(selected.symbol, selected.bid)}</span>
                 <span>Ask {fmtPrice(selected.symbol, selected.ask)}</span>
-                <span className={selected.change >= 0 ? "pos" : "neg"}>{selected.change.toFixed(2)}%</span>
+                <span className={selected.change >= 0 ? "pos" : "neg"}>{fmtNumber(selected.change, 2)}%</span>
               </div>
             </div>
             <div className="mt5-status-line">
@@ -1704,7 +2178,9 @@ export function TradingDashboard() {
             <div className="center-workspace">
               {desktopTab === "watchlist" && renderWatchlistWorkspace()}
               {desktopTab === "chart" && renderTradeWorkspace("chart")}
+              {desktopTab === "replay" && renderReplayWorkspace("desktop")}
               {desktopTab === "scanner" && renderScannerWorkspace("desktop")}
+              {desktopTab === "intelligence" && renderIntelligenceWorkspace("desktop")}
               {desktopTab === "market-hours" && renderMarketHoursWorkspace()}
               {desktopTab === "trade" && renderTradeWorkspace("trade")}
               {desktopTab === "positions" && renderPositionsWorkspace()}
@@ -1817,11 +2293,11 @@ export function TradingDashboard() {
         </div>
 
         <footer className="desktop-footer">
-          <span>Server: CipherFX-Live</span>
-          <span>Ping: 12.4 ms</span>
+          <span>{status?.mt5_connected ? "MT5 connected" : "MT5 offline"}</span>
+          <span>Last update: {heartbeatLabel}</span>
           <span>SAST time: {serverClockLabel}</span>
-          <span className="pos">Equity Protection: ON</span>
-          <span className="pos">AI Trading: ACTIVE</span>
+          <span>{positions.length} open position{positions.length === 1 ? "" : "s"}</span>
+          <span className={status?.allow_pyramiding ? "pos" : ""}>{status?.allow_pyramiding ? "Pyramiding " + (status.max_pyramid_levels || "") : "Pyramiding unavailable"}</span>
         </footer>
       </div>
 
@@ -1934,7 +2410,7 @@ export function TradingDashboard() {
                     <div className="mobile-prices">
                       <span>{fmtPrice(item.symbol, item.bid)}</span>
                       <span>{fmtPrice(item.symbol, item.ask)}</span>
-                      <span className={item.change >= 0 ? "pos" : "neg"}>{Math.abs(item.change).toFixed(2)}%</span>
+                      <span className={item.change >= 0 ? "pos" : "neg"}>{fmtAbsNumber(item.change, 2)}%</span>
                     </div>
                   </div>
                 )) : <div className="empty-state">No symbols match this search.</div>}
@@ -1982,7 +2458,7 @@ export function TradingDashboard() {
                   sym={selected.symbol}
                   token={token}
                   timeframe={mobileTimeframe}
-                  candles={mobileCandles}
+                  candles={liveMobileCandles}
                   height={304}
                   apiBase={API}
                 />
@@ -1998,6 +2474,25 @@ export function TradingDashboard() {
                   </button>
                 ))}
               </div>
+            </div>
+          )}
+
+          {mobileTab === "replay" && (
+            <div className="mobile-screen replay-screen">
+              {renderReplayWorkspace("mobile")}
+            </div>
+          )}
+
+          {mobileTab === "intelligence" && (
+            <div className="mobile-screen intelligence-screen">
+              <div className="mobile-brand-row">
+                <span className="mobile-brand-spacer" aria-hidden="true" />
+                <img src={logoSrc} alt="" className="mobile-header-logo" aria-hidden="true" />
+                <div className="phone-actions">
+                  <button className="icon-btn" title="Open scanner" aria-label="Open scanner" onClick={() => setMobileTab("scanner")}><Activity size={17} /></button>
+                </div>
+              </div>
+              {renderIntelligenceWorkspace("mobile")}
             </div>
           )}
 
@@ -2059,7 +2554,7 @@ export function TradingDashboard() {
                       <div className="mobile-sub">{tradeDateLine(row)}</div>
                     </div>
                     <div className="mobile-row-actions">
-                      <span className={row.profit >= 0 ? "pos" : "neg"}>{row.profit.toFixed(2)}</span>
+                      <span className={row.profit >= 0 ? "pos" : "neg"}>{fmtNumber(row.profit, 2, "0.00")}</span>
                       <button
                         type="button"
                         className="row-action danger"
@@ -2087,6 +2582,7 @@ export function TradingDashboard() {
                 <button className={`mode-btn${mobileHistoryTab === "orders" ? " active" : ""}`} onClick={() => setMobileHistoryTab("orders")}>Orders</button>
                 <button className={`mode-btn${mobileHistoryTab === "deals" ? " active" : ""}`} onClick={() => setMobileHistoryTab("deals")}>Deals</button>
               </div>
+              {mobileHistoryTab === "deals" && renderDealPeriodSummary()}
               <div className="mobile-history-list">
                 {mobileHistoryRows.length ? mobileHistoryRows.map((row) => (
                   <div className="mobile-history-row" key={row.id}>

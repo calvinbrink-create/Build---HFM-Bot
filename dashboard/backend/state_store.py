@@ -991,6 +991,12 @@ def set_status(key, value):
         conn = None
         try:
             conn = get_conn()
+            existing = conn.execute(
+                "SELECT value FROM bot_status WHERE key=?",
+                (key,),
+            ).fetchone()
+            if existing is not None and str(existing[0]) == str(payload[1]):
+                return
             conn.execute("INSERT OR REPLACE INTO bot_status (key,value) VALUES (?,?)", payload)
             conn.commit()
             return

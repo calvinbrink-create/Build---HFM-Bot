@@ -214,6 +214,7 @@ export default function CandleChart({
         tickMarkFormatter: (time) => formatSastTick(time, timeframe),
       },
       localization: {
+        locale: "en-US",
         priceFormatter: (price) => formatPrice(sym, price),
         timeFormatter: (time) => formatSastTime(time),
       },

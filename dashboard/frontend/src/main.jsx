@@ -24,13 +24,54 @@ const DASHBOARDS = {
   },
 };
 
+function volatileDashboardStorage() {
+  try {
+    if (!window.__cipherfxDashboardStorage) {
+      window.__cipherfxDashboardStorage = Object.create(null);
+    }
+    return window.__cipherfxDashboardStorage;
+  } catch {
+    return Object.create(null);
+  }
+}
+
+function safeStorageGet(key) {
+  const memory = volatileDashboardStorage();
+  try {
+    const value = window.localStorage?.getItem(key);
+    if (value) memory[key] = value;
+    return value || memory[key] || "";
+  } catch {
+    return memory[key] || "";
+  }
+}
+
+function safeStorageSet(key, value) {
+  const normalized = String(value ?? "");
+  volatileDashboardStorage()[key] = normalized;
+  try {
+    window.localStorage?.setItem(key, normalized);
+  } catch {
+    // Some embedded browsers deny storage; keep this session in memory.
+  }
+}
+
+function safeStorageRemove(key) {
+  delete volatileDashboardStorage()[key];
+  try {
+    window.localStorage?.removeItem(key);
+  } catch {
+    // Storage failure must not prevent logout or auth-state recovery.
+  }
+}
+
 function currentDashboardId() {
   return window.location.pathname.startsWith("/dashboard/mt5") ? "mt5" : "ibkr";
 }
 
 function readAuthMeta() {
   try {
-    const parsed = JSON.parse(localStorage.getItem(AUTH_KEY) || "{}");
+    const parsed = JSON.parse(safeStorageGet(AUTH_KEY) || "{}");
     return parsed && typeof parsed === "object" ? parsed : {};
   } catch {
     return {};
@@ -41,12 +82,12 @@ function hasValidDashboardSession(dashboardId = currentDashboardId()) {
   const meta = readAuthMeta();
   const expiresAt = Number(meta.expiresAt || 0);
   const target = DASHBOARDS[dashboardId] || DASHBOARDS.ibkr;
-  return expiresAt > Date.now() && Boolean(localStorage.getItem(target.tokenKey));
+  return expiresAt > Date.now() && Boolean(safeStorageGet(target.tokenKey));
 }
 
 function clearDashboardSession() {
-  localStorage.removeItem(AUTH_KEY);
-  Object.values(DASHBOARDS).forEach((dashboard) => localStorage.removeItem(dashboard.tokenKey));
+  safeStorageRemove(AUTH_KEY);
+  Object.values(DASHBOARDS).forEach((dashboard) => safeStorageRemove(dashboard.tokenKey));
 }
 
 async function loginDashboard(dashboard, credentials) {
@@ -61,7 +102,7 @@ async function loginDashboard(dashboard, credentials) {
   }
   const data = await response.json();
   if (!data.token) throw new Error(`${dashboard.label} did not return a session token`);
-  localStorage.setItem(dashboard.tokenKey, data.token);
+  safeStorageSet(dashboard.tokenKey, data.token);
   return data;
 }
 
@@ -108,9 +149,9 @@ function LoginPage({ activeDashboard, onLogin }) {
         throw currentResult?.reason || new Error("Login failed");
       }
       const available = entries
-        .filter(([, dashboard]) => Boolean(localStorage.getItem(dashboard.tokenKey)))
+        .filter(([, dashboard]) => Boolean(safeStorageGet(dashboard.tokenKey)))
         .map(([id]) => id);
-      localStorage.setItem(AUTH_KEY, JSON.stringify({
+      safeStorageSet(AUTH_KEY, JSON.stringify({
         email: credentials.email,
         expiresAt: Date.now() + AUTH_TTL_MS,
         dashboards: available,

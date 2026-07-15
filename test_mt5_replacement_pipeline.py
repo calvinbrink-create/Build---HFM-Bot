@@ -53,7 +53,8 @@ def test_manifest_and_strategy_sides():
             assert decision.side == side
             assert decision.engine == expected[asset]
             consistency = decision.evidence["side_consistency"]
-            assert consistency["setup_side"] == consistency["confirmation_side"] == consistency["final_order_side"] == side
+            assert consistency["setup_side"] == consistency["final_order_side"] == side
+            assert consistency["confirmation_side"] == "M5_TRIGGER"
 
 
 def test_m1_confirmation_and_close_time():
@@ -76,13 +77,19 @@ def test_m1_confirmation_and_close_time():
     sell["Low"] = [value - 0.02 for value in sell_close]
     ok, _reason, _score = mt5_bot.valid_1m_confirmation(sell, "SELL", "FOREX_TREND_PULLBACK")
     assert ok
-    doji = frame.copy()
-    doji.loc[doji.index[-1], "Open"] = doji.iloc[-1]["Close"]
-    ok, _reason, _score = mt5_bot.valid_1m_confirmation(doji, "BUY", "FOREX_TREND_PULLBACK")
+    no_breakout = frame.copy()
+    no_breakout.loc[no_breakout.index[-2], "Close"] = no_breakout.iloc[-3]["Close"] - 0.01
+    no_breakout.loc[no_breakout.index[-2], "High"] = no_breakout.iloc[-3]["Close"]
+    ok, reason, _score = mt5_bot.valid_1m_confirmation(no_breakout, "BUY", "FOREX_TREND_PULLBACK")
     assert not ok
+    assert "M1_BREAKOUT_RETEST_WAITING" in reason
     closed_at, candle_id = mt5_bot._completed_m1_candle_id(frame)
     assert datetime.fromisoformat(closed_at) == frame.index[-2].to_pydatetime() + timedelta(seconds=60)
     assert candle_id.startswith("M1:")
+    short_probe = frame.tail(3)
+    closed_at, candle_id = mt5_bot._completed_candle_identity(short_probe, "M5", 300)
+    assert datetime.fromisoformat(closed_at) == short_probe.index[-2].to_pydatetime() + timedelta(seconds=300)
+    assert candle_id.startswith("M5:")
 
 
 def test_tick_engine_routing():
@@ -99,6 +106,39 @@ def test_tick_engine_routing():
     finally:
         mt5_bot.forex_spread_gate, mt5_bot.index_spread_gate, mt5_bot.metals_spread_gate = originals
 
+
+def test_completed_m5_price_displacement_is_observe_only():
+    original = mt5_bot.forex_spread_gate
+    mt5_bot.forex_spread_gate = lambda *args: (True, 90.0, "spread OK", {})
+    try:
+        ok, reason, meta = mt5_bot.tick_execution_check(
+            "USDJPY", "FOREX_TREND_PULLBACK", 162.342, 162.344, 162.331, 0.030, 90.5
+        )
+        assert ok, reason
+        assert meta["slippage_atr"] > 0.35
+        assert meta["entry_displacement_observe_only"] is True
+        assert "displaced" in meta["entry_displacement_reason"]
+    finally:
+        mt5_bot.forex_spread_gate = original
+
+
+def test_closed_campaign_identity_cannot_bleed_into_new_trade():
+    source=open("/opt/cipherfx_mt5/mt5_bot.py", encoding="utf-8").read()
+    assert 'campaign_is_current' in source
+    assert 'CAMPAIGN_IDENTITY_REFRESHED' in source
+    assert 'self.campaigns.setdefault(key, {' not in source
+
+def test_pyramid_uses_replacement_engine_rr_context():
+    source=open("/opt/cipherfx_mt5/mt5_bot.py", encoding="utf-8").read()
+    assert 'rr_context = {' in source
+    assert 'self._entry_rr_for_symbol(canonical, market, rr_context, configured_rr=cfg.get("tp_r"))' in source
+    assert 'self._entry_rr_for_symbol(canonical, market, {}, configured_rr=cfg.get("tp_r"))' not in source
+
+def test_execution_reuses_broker_geometry_without_double_cost_penalty():
+    source=open("/opt/cipherfx_mt5/mt5_bot.py", encoding="utf-8").read()
+    assert 'reused_at_engine_policy_recheck' in source
+    assert 'profit_source = "sizing_broker_geometry"' in source
+    assert 'same_cost_geometry' in source
 
 def test_cost_policy():
     bot = SimpleNamespace(
@@ -157,7 +197,7 @@ def test_campaign_stop_target_and_add():
         )
         bot = object.__new__(mt5_bot.XM_MT5_Bot)
         bot.state = {"campaigns": {}, "open_trades": {"11": {
-            "trade_id": "direct-1", "opened_at": "2026-07-11T00:00:00",
+            "trade_id": "direct-1", "opened_at": datetime.utcnow().isoformat(),
             "risk_meta": {"planned_risk": 100.0},
             "trade_audit": {"engine": "INDEX_SESSION_BREAKOUT", "strategy": "SESSION_BREAKOUT_RETEST"},
         }}}
@@ -173,7 +213,6 @@ def test_campaign_stop_target_and_add():
         bot._open_position_count = lambda: 1
         bot._effective_max_open_trades = lambda: 30
         bot._market_for_symbol = lambda symbol: "index_cfd"
-        bot._campaign_alignment_allows_add = lambda symbol, side: (True, "OK", {"h1_side": side, "m15_side": side})
         bot._recent_atr = lambda symbol: 1.0
         bot._cap_stop_distance_for_symbol = lambda symbol, market, distance, sig: distance
         bot._entry_rr_for_symbol = lambda *args, **kwargs: 1.8
@@ -203,6 +242,19 @@ def test_campaign_stop_target_and_add():
     bot._campaign_cycle()
     assert len(placed) == 1 and not closed
     assert bot.campaigns["NAS100:BUY"]["accepted_legs"] == 2
+    campaign = bot.campaigns["NAS100:BUY"]
+    assert campaign["pyramid_add_status"] == "active_same_setup_burst"
+    assert campaign["next_add_required_r"] == 0.01
+    source = open("/opt/cipherfx_mt5/mt5_bot.py", encoding="utf-8").read()
+    assert "_campaign_alignment_allows_add" not in source
+    assert "MT5_PYRAMID_STEP_R" not in source
+    assert "PYRAMID_BURST_WINDOW_CLOSED" in source
+    assert "self.open_trades[str(live_pos.ticket)] = meta" not in source
+    bot, placed, closed = make_bot(20.0)
+    bot.open_trades["11"]["opened_at"] = (datetime.utcnow() - timedelta(seconds=61)).isoformat()
+    bot._campaign_cycle()
+    assert not placed and not closed
+    assert bot.campaigns["NAS100:BUY"]["pyramid_add_status"] == "closed_after_burst"
 
 
 
@@ -217,6 +269,9 @@ def test_fixed_controls_and_mql_defaults():
         assert not bot._daily_trade_count_allows_entry()
     finally:
         mt5_bot._ss.set_status = original
+    bot_source = open("/opt/cipherfx_mt5/mt5_bot.py", encoding="utf-8").read()
+    assert 'name="mt5-fast-m1-discovery"' not in bot_source
+    assert "self._start_m5_scan_worker(m5_trigger_interval)" in bot_source
     source = open("/opt/cipherfx_mt5/mt5_bridge/CipherFxBridge.mq5", encoding="utf-8").read()
     for expected in (
         "input double DailyLossLimitUSD = 1000.00;",
@@ -225,6 +280,7 @@ def test_fixed_controls_and_mql_defaults():
         "input bool AllowSameCandlePyramids = true;",
         "input int MaxOpenTradesTotal = 30;",
         "input int MaxTradesPerDay = 60;",
+        "export_count = MathMin(export_count, 32);",
     ):
         assert expected in source
     assert state_store.broker_trade_date_for("2026-07-10T21:00:00+00:00") == "2026-07-11"
@@ -235,6 +291,10 @@ def main():
         test_manifest_and_strategy_sides,
         test_m1_confirmation_and_close_time,
         test_tick_engine_routing,
+        test_completed_m5_price_displacement_is_observe_only,
+        test_closed_campaign_identity_cannot_bleed_into_new_trade,
+        test_pyramid_uses_replacement_engine_rr_context,
+        test_execution_reuses_broker_geometry_without_double_cost_penalty,
         test_cost_policy,
         test_broker_sizing_batch,
         test_campaign_stop_target_and_add,
