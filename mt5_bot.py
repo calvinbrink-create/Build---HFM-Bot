@@ -2798,6 +2798,27 @@ class XM_MT5_Bot:
         canonical = self._canonical_from_resolved(sym).upper()
         return f"dt_{canonical}_{datetime.utcnow().strftime('%Y%m%d%H%M%S%f')}"
 
+    def _ensure_signal_lifecycle(self, sig: dict | None, *, timeframe_source: str = "H4,H1,M15,M5") -> dict | None:
+        """Attach one durable identity and lifecycle envelope to every signal."""
+        if not isinstance(sig, dict):
+            return None
+        canonical = str(sig.get("symbol") or "").upper()
+        trace_id = str(
+            sig.get("signal_id")
+            or sig.get("decision_trace_id")
+            or self._new_decision_trace_id(canonical)
+        )
+        created_at = str(sig.get("signal_created_at") or sig.get("generated_at") or datetime.utcnow().isoformat())
+        sig["signal_id"] = trace_id
+        sig["decision_trace_id"] = str(sig.get("decision_trace_id") or trace_id)
+        sig["signal_created_at"] = created_at
+        sig["signal_timeframe_source"] = str(sig.get("signal_timeframe_source") or timeframe_source)
+        sig.setdefault("signal_lifecycle_state", "CANDIDATE")
+        sig.setdefault("signal_expires_at", "")
+        sig.setdefault("signal_terminal_reason", "")
+        sig.setdefault("signal_terminal_at", "")
+        return sig
+
     def _trace_step(self, sig: dict | None, step: str, status: str = "PASS", reason: str = "", **fields) -> None:
         if sig is None:
             return
@@ -2880,24 +2901,36 @@ class XM_MT5_Bot:
     def _mark_not_qualified(self, sig: dict | None, reason: str, step: str = "QUALITY_FILTER") -> None:
         if not isinstance(sig, dict):
             return
+        self._ensure_signal_lifecycle(sig)
         safe_reason = str(reason or "quality filter rejected candidate")
+        terminal_at = datetime.utcnow().isoformat()
         sig["not_qualified"] = True
         sig["final_status"] = "NOT_QUALIFIED"
         sig["state"] = "NOT_QUALIFIED"
         sig["block_reason"] = safe_reason
         sig["blocked_at_step"] = ""
         sig["quality_filter_step"] = str(step)
+        sig["signal_lifecycle_state"] = "REJECTED"
+        sig["signal_terminal_reason"] = safe_reason
+        sig["signal_terminal_at"] = terminal_at
+        sig["signal_expires_at"] = str(sig.get("signal_expires_at") or "")
         self._trace_step(sig, "NOT_QUALIFIED", "NOT_QUALIFIED", safe_reason, quality_filter_step=step)
-        self._audit_decision({
-            "event": "NOT_QUALIFIED",
+        lifecycle_event = {
             "decision": "not_qualified",
             "scope": "setup" if isinstance(sig.get("pending_setup"), dict) else "candidate",
             "symbol": sig.get("symbol"),
             "side": sig.get("direction"),
+            "signal_id": sig.get("signal_id"),
             "setup_id": sig.get("setup_id"),
+            "signal_created_at": sig.get("signal_created_at"),
+            "signal_timeframe_source": sig.get("signal_timeframe_source"),
+            "signal_lifecycle_state": sig.get("signal_lifecycle_state"),
+            "signal_terminal_at": terminal_at,
             "reason": safe_reason,
             "quality_filter_step": step,
-        })
+        }
+        self._audit_decision({"event": "NOT_QUALIFIED", **lifecycle_event})
+        self._audit_decision({"event": "SIGNAL_LIFECYCLE_TERMINAL", **lifecycle_event})
 
     def _attach_engine_route_contract(self, sym: str, market: str, sig: dict) -> None:
         if not isinstance(sig, dict):
@@ -8627,6 +8660,7 @@ class XM_MT5_Bot:
             "block_reason": "",
             "pending_reason": "",
         }
+        self._ensure_signal_lifecycle(sig)
         if isinstance(m5_event, dict) and str(m5_event.get("trigger_id") or "") == str(m5_trigger_id or ""):
             sig.update({
                 "m5_trigger_time": m5_event.get("m5_trigger_time"),
@@ -8720,6 +8754,93 @@ class XM_MT5_Bot:
         sig["m15_invalidation_price"] = m15_metrics.get("invalidation_price")
         sig["m15_entry_zone_low"] = m15_metrics.get("entry_zone_low")
         sig["m15_entry_zone_high"] = m15_metrics.get("entry_zone_high")
+        self._ensure_signal_lifecycle(sig)
+        decision_bar_times = {}
+        for label in ("H4", "H1", "M15"):
+            meta = htf.get(label) if isinstance(htf, dict) else {}
+            frame = frames.get(label)
+            candle = frame.candles[-1] if frame and frame.candles else None
+            decision_bar_times[label] = {
+                "bar_open_time": (meta or {}).get("bar_open_time") or (candle.timestamp if candle else ""),
+                "bar_close_time": (meta or {}).get("bar_close_time") or "",
+            }
+        decision_bar_times["M5"] = {
+            "bar_open_time": m5_bar_open_time,
+            "bar_close_time": m5_closed_at,
+        }
+        m15_structure_events = [
+            {
+                "timeframe": "M15",
+                "structure_event": "POI",
+                "price_level": m15_metrics.get("entry_zone_low") if decision.side == "BUY" else m15_metrics.get("entry_zone_high"),
+                "timestamp": decision_bar_times["M15"]["bar_close_time"] or decision_bar_times["M15"]["bar_open_time"],
+                "decision": "PASS" if m15_metrics.get("poi_types") else "FAIL",
+                "evidence": {"poi_types": m15_metrics.get("poi_types") or []},
+            },
+            {
+                "timeframe": "M15",
+                "structure_event": "CHOCH",
+                "price_level": m15_metrics.get("close"),
+                "timestamp": decision_bar_times["M15"]["bar_close_time"] or decision_bar_times["M15"]["bar_open_time"],
+                "decision": "PASS" if bool(m15_metrics.get("choch")) else "FAIL",
+            },
+            {
+                "timeframe": "M15",
+                "structure_event": "BOS",
+                "price_level": m15_metrics.get("close"),
+                "timestamp": decision_bar_times["M15"]["bar_close_time"] or decision_bar_times["M15"]["bar_open_time"],
+                "decision": "PASS" if bool(m15_metrics.get("bos")) else "FAIL",
+            },
+            {
+                "timeframe": "M15",
+                "structure_event": "RETRACEMENT",
+                "price_level": m15_metrics.get("entry_zone_low") if decision.side == "BUY" else m15_metrics.get("entry_zone_high"),
+                "timestamp": decision_bar_times["M15"]["bar_close_time"] or decision_bar_times["M15"]["bar_open_time"],
+                "decision": "PASS" if bool(m15_metrics.get("retracement")) else "FAIL",
+            },
+            {
+                "timeframe": "M5",
+                "structure_event": "BREAK_OR_RETEST",
+                "price_level": m5_metrics.get("high_level") if decision.side == "BUY" else m5_metrics.get("low_level"),
+                "timestamp": decision_bar_times["M5"]["bar_close_time"] or decision_bar_times["M5"]["bar_open_time"],
+                "decision": "PASS" if str(m5_evidence.get("side") or "") == str(decision.side or "") and str(decision.side or "") in {"BUY", "SELL"} else "FAIL",
+                "evidence": {
+                    "trigger_type": m5_metrics.get("trigger_type") or "",
+                    "break": bool(m5_metrics.get("break")),
+                    "retest": bool(m5_metrics.get("retest")),
+                    "body_fraction": m5_metrics.get("body_fraction"),
+                    "close_location": m5_metrics.get("close_location"),
+                },
+            },
+        ]
+        self._audit_decision({
+            "event": "STRATEGY_SIGNAL_LIFECYCLE",
+            "decision": "PASS" if decision.state == "PASS" else "REJECTED",
+            "signal_id": sig.get("signal_id"),
+            "setup_id": sig.get("setup_id"),
+            "symbol": canonical,
+            "engine": sig.get("engine"),
+            "side": sig.get("direction"),
+            "created_at": sig.get("signal_created_at"),
+            "timeframe_source": sig.get("signal_timeframe_source"),
+            "bar_times": decision_bar_times,
+            "state": decision.state,
+            "reason": decision.reason,
+            "reasons": decision.reasons,
+            "expiry": sig.get("signal_expires_at") or "",
+        })
+        self._audit_decision({
+            "event": "STRATEGY_STRUCTURE_AUDIT",
+            "signal_id": sig.get("signal_id"),
+            "setup_id": sig.get("setup_id"),
+            "symbol": canonical,
+            "engine": sig.get("engine"),
+            "side": sig.get("direction"),
+            "structure_events": self._audit_json_safe(m15_structure_events),
+            "liquidity_map": {"poi_types": m15_metrics.get("poi_types") or [], "entry_zone_low": m15_metrics.get("entry_zone_low"), "entry_zone_high": m15_metrics.get("entry_zone_high"), "invalidation_price": m15_metrics.get("invalidation_price")},
+            "decision": "PASS" if decision.state == "PASS" else "REJECTED",
+            "reason": decision.reason or (decision.reasons[0] if decision.reasons else ""),
+        })
         self._enqueue_shadow_task("scan", {
             "canonical": canonical,
             "asset": asset,
@@ -8937,6 +9058,7 @@ class XM_MT5_Bot:
 
     def _upsert_signal(self, sym: str, market: str, sig: dict, price: float, atr: float,
                        gate: str, gate_ok: bool, details: dict, group: str) -> None:
+        self._ensure_signal_lifecycle(sig)
         self._assert_signal_engine_contract(sym, sig)
         quality = bool(sig.get("not_qualified")) or self._is_quality_filter_reason(gate or sig.get("block_reason") or "", sig)
         if not gate_ok and not quality:
@@ -8955,6 +9077,13 @@ class XM_MT5_Bot:
         self._log_forex_pre_pending_decision(sym, sig, str(sig.get("final_status") or ""), str(gate or ""), bool(sig.get("pending_setup_created")))
         conditions = dict(sig.get("conditions") or {})
         conditions.setdefault("group", group)
+        conditions["signal_id"] = sig.get("signal_id")
+        conditions["signal_created_at"] = sig.get("signal_created_at")
+        conditions["signal_timeframe_source"] = sig.get("signal_timeframe_source")
+        conditions["signal_expires_at"] = sig.get("signal_expires_at") or ""
+        conditions["signal_lifecycle_state"] = sig.get("signal_lifecycle_state") or "CANDIDATE"
+        conditions["signal_terminal_reason"] = sig.get("signal_terminal_reason") or ""
+        conditions["signal_terminal_at"] = sig.get("signal_terminal_at") or ""
         conditions["decision_trace_id"] = sig.get("decision_trace_id")
         conditions["decision_trace"] = self._audit_json_safe(sig.get("_decision_trace") or [])
         conditions["final_status"] = sig.get("final_status") or ("ACTIONABLE" if gate_ok else "BLOCKED")
@@ -9027,6 +9156,7 @@ class XM_MT5_Bot:
             "status": str(conditions.get("final_status") or ""),
             "reason": str(conditions.get("rejection_reason") or ""),
             "payload": {
+                "signal_id": sig.get("signal_id"),
                 "decision_id": sig.get("decision_trace_id"),
                 "scan_id": sig.get("scan_id"),
                 "symbol": self._canonical_from_resolved(sym),
@@ -9061,6 +9191,12 @@ class XM_MT5_Bot:
                 "learning_mode": conditions.get("learning_mode"),
                 "m1_role": conditions.get("m1_role"),
                 "setup_created_at": sig.get("setup_created_at") or sig.get("_pending_setup_created_at"),
+                "signal_created_at": sig.get("signal_created_at"),
+                "signal_timeframe_source": sig.get("signal_timeframe_source"),
+                "signal_expires_at": sig.get("signal_expires_at") or "",
+                "signal_lifecycle_state": sig.get("signal_lifecycle_state"),
+                "signal_terminal_reason": sig.get("signal_terminal_reason") or "",
+                "signal_terminal_at": sig.get("signal_terminal_at") or "",
                 "m5_candle_closed_at": sig.get("m5_candle_closed_at"),
                 "latency": {
                     "confirmation_latency_ms": sig.get("confirmation_latency_ms"),
