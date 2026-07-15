@@ -323,12 +323,34 @@ def trading_month_range(today_value: str | None = None) -> tuple[str, str]:
 
 
 def get_conn():
+    # Keep dashboard/trading writes bounded. A long SQLite wait must not pin the
+    # trading process during a service stop or feed outage.
     conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
-    conn.execute("PRAGMA journal_mode=WAL")
+    # WAL mode is initialized once; do not request a database-level mode change on every connection.
     conn.execute("PRAGMA synchronous=NORMAL")
+    conn.execute("PRAGMA wal_autocheckpoint=1000")
+    conn.execute("PRAGMA journal_size_limit=67108864")
     return conn
+
+
+def checkpoint_wal() -> dict:
+    """Perform a non-blocking WAL checkpoint for bounded runtime persistence."""
+    conn = sqlite3.connect(DB_PATH, timeout=2.0, check_same_thread=False)
+    try:
+        conn.execute("PRAGMA busy_timeout=2000")
+        result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone() or (0, 0, 0)
+        return {
+            "busy": int(result[0] or 0),
+            "log_pages": int(result[1] or 0),
+            "checkpointed_pages": int(result[2] or 0),
+            "status": "PASS" if int(result[0] or 0) == 0 else "BUSY",
+        }
+    except sqlite3.Error as exc:
+        return {"status": "FAIL", "error": str(exc)[:180]}
+    finally:
+        conn.close()
 
 
 def score_band(score) -> str:
@@ -878,11 +900,114 @@ def upsert_m1_candles(sym, df, retention_days: int = 7):
     conn.commit(); conn.close()
 
 
-def set_status(key, value):
+
+_M1_HISTORY_IMPORT_MTIMES = {}
+
+
+def import_m1_history_archives(bridge_dir, retention_days: int = 7):
+    """Import throttled MT5 M1_HISTORY archives into the authoritative SQLite replay table."""
+    root = Path(str(bridge_dir or ""))
+    if not root.is_dir():
+        return {"status": "NO_BRIDGE_DIR", "files_seen": 0, "rows_imported": 0}
     conn = get_conn()
-    conn.execute("INSERT OR REPLACE INTO bot_status (key,value) VALUES (?,?)",
-                 (key, json.dumps(value) if not isinstance(value, str) else value))
-    conn.commit(); conn.close()
+    rows_total = 0
+    files_imported = 0
+    files_seen = 0
+    try:
+        for path in sorted(root.glob("rates_*_M1_HISTORY.csv")):
+            files_seen += 1
+            try:
+                mtime = path.stat().st_mtime_ns
+            except OSError:
+                continue
+            if _M1_HISTORY_IMPORT_MTIMES.get(str(path)) == mtime:
+                continue
+            name = path.name
+            prefix = "rates_"
+            suffix = "_M1_HISTORY.csv"
+            if not (name.startswith(prefix) and name.endswith(suffix)):
+                continue
+            sym = name[len(prefix):-len(suffix)].upper()
+            alias_to_canonical = {}
+            try:
+                config = json.loads(Path("/opt/cipherfx_mt5/mt5_symbols.json").read_text())
+                alias_to_canonical = {
+                    str(alias).strip().upper(): str(canonical).strip().upper()
+                    for canonical, alias in (config.get("aliases") or {}).items()
+                    if alias and canonical
+                }
+            except Exception:
+                alias_to_canonical = {}
+            sym = alias_to_canonical.get(sym, sym)
+            rows = []
+            with path.open("r", encoding="utf-8", newline="") as handle:
+                for row in csv.DictReader(handle):
+                    try:
+                        raw_ts = row.get("time_utc") or row.get("time") or ""
+                        ts = datetime.fromtimestamp(float(raw_ts), timezone.utc).isoformat()
+                        o = float(row.get("open") or 0.0)
+                        h = float(row.get("high") or 0.0)
+                        low = float(row.get("low") or 0.0)
+                        close = float(row.get("close") or 0.0)
+                        volume = float(row.get("volume") or 0.0)
+                        spread = float(row.get("spread_price") or 0.0)
+                    except (TypeError, ValueError, OverflowError):
+                        continue
+                    if min(o, h, low, close) <= 0.0:
+                        continue
+                    rows.append((sym, ts, o, h, low, close, volume, spread))
+            if rows:
+                conn.executemany(
+                    """INSERT OR IGNORE INTO m1_candles
+                       (sym,ts,open,high,low,close,volume,spread)
+                       VALUES (?,?,?,?,?,?,?,?)""",
+                    rows,
+                )
+                rows_total += len(rows)
+                files_imported += 1
+            _M1_HISTORY_IMPORT_MTIMES[str(path)] = mtime
+        cutoff = (
+            datetime.now(timezone.utc).replace(tzinfo=None)
+            - timedelta(days=max(7, int(retention_days or 7)))
+        ).isoformat()
+        conn.execute("DELETE FROM m1_candles WHERE ts < ?", (cutoff,))
+        conn.commit()
+        return {
+            "status": "OK",
+            "files_seen": files_seen,
+            "files_imported": files_imported,
+            "rows_imported": rows_total,
+            "retention_days": max(7, int(retention_days or 7)),
+        }
+    finally:
+        conn.close()
+
+
+def set_status(key, value):
+    payload = (key, json.dumps(value) if not isinstance(value, str) else value)
+    last_error = None
+    for attempt in range(5):
+        conn = None
+        try:
+            conn = get_conn()
+            conn.execute("INSERT OR REPLACE INTO bot_status (key,value) VALUES (?,?)", payload)
+            conn.commit()
+            return
+        except sqlite3.OperationalError as exc:
+            last_error = exc
+            if "locked" not in str(exc).lower():
+                raise
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            time.sleep(0.25 * (attempt + 1))
+        finally:
+            if conn is not None:
+                conn.close()
+    if last_error is not None:
+        raise last_error
 
 
 # ── Readers (called from FastAPI) ─────────────────────────────────────────────
@@ -920,14 +1045,13 @@ def read_positions(include_stale=False):
 
 def read_signals():
     conn = get_conn()
-    # Only return signals from the last 12 hours — yesterday's stale rows fall
-    # away automatically and the API returns the placeholder universe instead.
-    cutoff = (datetime.now() - timedelta(hours=12)).isoformat()
+    # Current scanner rows cover two completed M5 cycles. Older decisions are history, not live state.
+    cutoff = (datetime.now() - timedelta(minutes=7)).isoformat()
     rows = conn.execute(
         """
         SELECT * FROM signals
-        WHERE datetime(replace(updated_at, 'T', ' ')) >= datetime(replace(?, 'T', ' '))
-        ORDER BY datetime(replace(updated_at, 'T', ' ')) DESC
+        WHERE updated_at >= ?
+        ORDER BY updated_at DESC
         """,
         (cutoff,)
     ).fetchall()
@@ -975,6 +1099,40 @@ def _priority_symbols_from_env() -> list[str]:
     return symbols
 
 
+def _market_session_for_symbol(symbol: str) -> str:
+    sym = str(symbol or "").upper()
+    if sym in {"NAS100", "US30", "SPX500"}:
+        return "us_new_york"
+    if sym == "JP225":
+        return "asia_tokyo"
+    if sym in {"GER40", "UK100", "FRA40", "EU50"}:
+        return "uk_london"
+    return ""
+
+
+def _symbol_market_is_open(symbol: str, now=None) -> bool:
+    """Return whether a symbol belongs in the *current* scanner universe.
+
+    This is a display filter only. It never gates the trading engine. The
+    scanner must not present stale rows for a closed session as live signals.
+    """
+    now = now or datetime.now(timezone.utc)
+    if now.weekday() >= 5:
+        return False
+    session = _market_session_for_symbol(symbol)
+    if not session:
+        return True  # FX/metals are weekday markets in the dashboard view.
+    if session == "us_new_york":
+        local = now.astimezone(ZoneInfo("America/New_York")) if ZoneInfo else now
+        return (local.hour, local.minute) >= (9, 30) and (local.hour, local.minute) < (16, 0)
+    if session == "asia_tokyo":
+        local = now.astimezone(ZoneInfo("Asia/Tokyo")) if ZoneInfo else now
+        return (local.hour, local.minute) >= (9, 0) and (local.hour, local.minute) < (17, 0)
+    # Cipher FX dashboard convention: London opens at 10:00 SAST.
+    local = now.astimezone(_tzinfo()) if _tzinfo else now
+    return (local.hour, local.minute) >= (10, 0) and (local.hour, local.minute) < (19, 30)
+
+
 def _filter_latest_priority_signals(signals: list[dict]) -> list[dict]:
     priority = _priority_symbols_from_env()
     if not priority:
@@ -991,6 +1149,48 @@ def _filter_latest_priority_signals(signals: list[dict]) -> list[dict]:
     return sorted(latest.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True)
 
 
+def _simple_public_reason(raw) -> str:
+    value = str(raw or "").lower()
+    if "market_window_closed" in value or "markets_closed" in value or "market closed" in value or "weekend" in value:
+        return "Markets closed"
+    if "h4_no_direction" in value or "h4_score" in value:
+        return "H4 has no clear direction"
+    if "h1_not_aligned" in value or "h1_score" in value:
+        return "H1 not aligned with H4"
+    if "m15_not_aligned" in value or "m15_score" in value:
+        return "M15 structure not aligned"
+    if "m5_trigger_not_ready" in value or "m5_trigger_below" in value or "m5_break" in value or "m5_retest" in value:
+        return "Waiting for M5 break or retest"
+    if "strategy_score_below" in value:
+        return "Score below minimum"
+    if "extended" in value or "exhaust" in value or "vertical" in value or "danger" in value:
+        return "Move exhausted"
+    if "spread" in value or "volatile" in value:
+        return "Volatile market"
+    if "pullback" in value or "reclaim" in value or "continuation" in value:
+        return "Choppy market"
+    if "range" in value:
+        return "Range-bound market"
+    if "no directional" in value or "flat" in value:
+        return "Flat market"
+    if "trend" in value or "htf" in value or "alignment" in value:
+        return "Trend not aligned"
+    if "stale" in value or "missing" in value or "data_" in value:
+        return "Data updating"
+    if "1m" in value or "confirmation" in value:
+        return "Waiting for confirmation"
+    if "cost" in value:
+        return "Trading cost too high"
+    if "profile" in value or "engine policy" in value or "final_gate" in value:
+        return "Quality check"
+    if "daily" in value or "loss" in value or "risk" in value:
+        return "Risk limit"
+    if "rejected" in value:
+        return "Order declined"
+    if "not qualified" in value:
+        return "No clear setup"
+    return "No clear setup"
+
 def _engine_display_defaults(sym: str, market: str) -> dict:
     market_key = str(market or "").lower()
     if market_key == "forex":
@@ -1001,6 +1201,62 @@ def _engine_display_defaults(sym: str, market: str) -> dict:
         return {"engine": "METALS_ENGINE", "asset_class": "metal", "strategy_after": ""}
     return {"engine": "", "asset_class": "", "strategy_after": ""}
 
+
+def _public_scan_story(raw_reason, gate_ok=False, direction="", pending_setup=False,
+                       m1_status="", direct_m5=False, setup_state="",
+                       waiting_for="") -> dict:
+    """Expose the active H4/H1 -> M15 POI -> M5 -> order flow."""
+    code = str(raw_reason or "").upper()
+    state = str(setup_state or "").upper()
+    waiting = str(waiting_for or "").upper()
+    stages = [
+        {"key": "H4", "label": "Direction", "state": "inactive"},
+        {"key": "H1", "label": "Confirm", "state": "inactive"},
+        {"key": "M15", "label": "POI + Structure", "state": "inactive"},
+        {"key": "M5", "label": "Break / Retest", "state": "inactive"},
+        {"key": "ORDER", "label": "Order", "state": "inactive"},
+    ]
+
+    if any(token in code for token in ("DATA_STALE", "DATA_MISSING", "DATA_UNAVAILABLE", "INSUFFICIENT_HISTORY")):
+        return {
+            "stage": "DATA", "status": "UPDATING",
+            "story": "Market data is updating; stale candles are not used.", "progress": stages,
+        }
+
+    if state in {"ARMED", "WAITING_M5"} or "M5_BREAK_OR_RETEST" in waiting:
+        for stage in stages[:3]:
+            stage["state"] = "complete"
+        stages[3]["state"] = "current"
+        return {
+            "stage": "M5", "status": "WATCHING",
+            "story": "M5 break or retest was not present on this scan; no setup was created.",
+            "progress": stages,
+        }
+
+    if direct_m5 or state in {"CONFIRMED", "M5_TRIGGERED", "EXECUTION_PENDING", "PASS"}:
+        for stage in stages[:4]:
+            stage["state"] = "complete"
+        stages[4]["state"] = "current" if state not in {"EXECUTED"} else "complete"
+        return {
+            "stage": "ORDER", "status": "READY",
+            "story": "M5 break or retest passed; final MT5 order checks are active.",
+            "progress": stages,
+        }
+
+    current_index = 0
+    story = "H4 has no clear direction yet."
+    if "H1_" in code:
+        current_index, story = 1, "H4 found direction; H1 has not confirmed it."
+    elif "M15_" in code or "POI" in code or "CHOCH" in code or "BOS" in code:
+        current_index, story = 2, "H4 and H1 agree; M15 has not confirmed a point of interest and structure."
+    elif "M5_" in code or "TRIGGER" in code:
+        current_index, story = 3, "Higher-timeframe context is present; no live M5 break or retest is ready."
+    elif "STRATEGY_SCORE" in code:
+        current_index, story = 2, "The context or structure score did not reach the configured level."
+    for stage in stages[:current_index]:
+        stage["state"] = "complete"
+    stages[current_index]["state"] = "current"
+    return {"stage": stages[current_index]["key"], "status": "WATCHING", "story": story, "progress": stages}
 
 def _systematic_public_fields(data: dict) -> dict:
     score_breakdown = data.get("score_breakdown") if isinstance(data.get("score_breakdown"), dict) else _json_dict(data.get("score_breakdown"))
@@ -1048,6 +1304,108 @@ def _systematic_public_fields(data: dict) -> dict:
     data["cost_to_target_status"] = cost.get("cost_to_target_status") or ("unavailable" if raw_cost_to_target is None else "calculated")
     data["cost_to_target_reason"] = cost.get("cost_to_target_reason") or ("" if raw_cost_to_target is not None else "target missing")
     data["cost_usd"] = _safe_float(data.get("cost_usd") or cost.get("total_cost_usd"))
+
+    # The live signal row is the canonical current snapshot. Some replacement
+    # engine paths store detailed timeframe scores only in score_breakdown, so
+    # expose them consistently instead of falling back to older audit events.
+    def first_present(*values):
+        for value in values:
+            if value not in (None, ""):
+                return value
+        return None
+
+    metric = score_breakdown.get("score_metric") if isinstance(score_breakdown.get("score_metric"), dict) else {}
+    score_total = _safe_float(first_present(metric.get("total"), data.get("score_after"), data.get("score")))
+    score_minimum = _safe_float(first_present(metric.get("minimum"), data.get("min_score"), 70.0))
+    score_pass = (
+        score_total is not None
+        and score_minimum is not None
+        and score_total >= score_minimum
+    )
+    # A malformed/stale row must never be rendered as actionable merely
+    # because an older gate flag survived in storage.
+    if not score_pass:
+        data["gate_ok"] = 0
+        data["block_reason"] = data.get("block_reason") or "STRATEGY_SCORE_BELOW_MINIMUM"
+        if str(data.get("final_status") or "").upper() == "READY":
+            data["final_status"] = "NOT_QUALIFIED"
+    data["side"] = first_present(data.get("side"), data.get("direction"))
+    data["h4_score"] = first_present(data.get("h4_score"), score_breakdown.get("h4"), conditions.get("h4"))
+    data["h1_score"] = first_present(data.get("h1_score"), data.get("bias_1h_score"), score_breakdown.get("bias_1h"), conditions.get("bias_1h"))
+    data["m15_score"] = first_present(data.get("m15_score"), data.get("setup_15m_score"), score_breakdown.get("setup_15m"), conditions.get("setup_15m"))
+    data["m5_trigger_score"] = first_present(data.get("m5_trigger_score"), data.get("trigger_5m_score"), score_breakdown.get("trigger_5m"), conditions.get("trigger_5m"))
+    data["alignment_score"] = first_present(data.get("alignment_score"), conditions.get("alignment_score"), metric.get("HTF alignment"))
+    data["setup_quality_score"] = first_present(data.get("setup_quality_score"), conditions.get("setup_quality_score"), conditions.get("m15_setup_quality"), metric.get("M15 structure/location"))
+    data["trigger_score"] = first_present(data.get("trigger_score"), conditions.get("trigger_score"), data.get("m5_trigger_score"), metric.get("M5 trigger quality"))
+    data["setup_state"] = str(first_present(
+        data.get("setup_state"), data.get("flow_state"), data.get("state"),
+        conditions.get("setup_state"), conditions.get("flow_state"), ""
+    ) or "")
+    data["waiting_for"] = str(first_present(data.get("waiting_for"), conditions.get("waiting_for"), "") or "")
+    data["m15_setup_type"] = first_present(data.get("m15_setup_type"), conditions.get("m15_setup_type"), data.get("setup_type"))
+    data["m15_poi_types"] = first_present(data.get("m15_poi_types"), conditions.get("m15_poi_types"), [])
+    data["m15_choch"] = first_present(data.get("m15_choch"), conditions.get("m15_choch"), False)
+    data["m15_bos"] = first_present(data.get("m15_bos"), conditions.get("m15_bos"), False)
+    data["m15_retracement"] = first_present(data.get("m15_retracement"), conditions.get("m15_retracement"), False)
+    data["m5_trigger_type"] = first_present(data.get("m5_trigger_type"), conditions.get("m5_trigger_type"), "")
+    data["m5_trigger_result"] = first_present(data.get("m5_trigger_result"), conditions.get("m5_trigger_result"), "")
+    data["final_eligibility"] = first_present(data.get("final_eligibility"), conditions.get("final_eligibility"), data.get("final_status"))
+    data["execution_status"] = first_present(data.get("execution_status"), conditions.get("execution_status"), data.get("final_status"))
+    data["rejection_stage"] = first_present(data.get("rejection_stage"), conditions.get("rejection_stage"), data.get("blocked_at_step"))
+    data["rejection_reason"] = first_present(data.get("rejection_reason"), conditions.get("rejection_reason"), data.get("block_reason"))
+    data["plan_alignment"] = first_present(data.get("plan_alignment"), conditions.get("plan_alignment"))
+    data["learning_mode"] = first_present(data.get("learning_mode"), conditions.get("learning_mode")) or "SHADOW_ONLY"
+    data["m1_role"] = "not_required"
+    data["m1_status"] = "NOT_REQUIRED"
+    data["reason"] = first_present(data.get("reason"), data.get("systematic_reason"), data.get("gate"), data.get("block_reason")) or ""
+    raw_public_reason = first_present(data.get("systematic_reason"), data.get("gate"), data.get("block_reason"), data.get("reason"))
+    direct_m5 = bool(
+        bool(_safe_int(data.get("gate_ok"))) and score_pass and (
+            data.get("setup_state") in {"CONFIRMED", "M5_TRIGGERED", "EXECUTION_PENDING", "PASS"}
+            or str(conditions.get("confirmation_source") or "").upper() in {"M5_TRIGGER", "M5_BREAK_RETEST"}
+        )
+    )
+    scan_view = _public_scan_story(
+        raw_public_reason,
+        gate_ok=bool(_safe_int(data.get("gate_ok"))),
+        direction=data.get("side"),
+        pending_setup=data.get("pending_setup_created"),
+        m1_status=data.get("m1_status"),
+        direct_m5=direct_m5,
+        setup_state=data.get("setup_state"),
+        waiting_for=data.get("waiting_for"),
+    )
+    data["scan_stage"] = scan_view["stage"]
+    data["scan_status"] = scan_view["status"]
+    data["scan_story"] = scan_view["story"]
+    data["scan_progress"] = scan_view["progress"]
+    bar_times = score_breakdown.get("bar_times") if isinstance(score_breakdown.get("bar_times"), dict) else {}
+    data["score_stage"] = score_breakdown.get("score_stage") or scan_view["stage"]
+    data["scan_trigger"] = score_breakdown.get("scan_trigger") or "COMPLETED_M5"
+    data["scan_cycle_at"] = score_breakdown.get("scan_cycle_at") or data.get("updated_at")
+    data["scan_candle_times"] = {key: value for key, value in bar_times.items() if value}
+    public_reason = _simple_public_reason(raw_public_reason)
+    data["public_metric_name"] = "Cipher FX Score"
+    data["public_mode"] = "Shadow"
+    data["public_reason"] = public_reason
+    data["reason"] = public_reason
+    data["gate"] = public_reason
+    data["final_status"] = "READY" if bool(_safe_int(data.get("gate_ok"))) else public_reason
+    data["status"] = data["final_status"]
+    data["score_metric"] = {
+        "version": first_present(metric.get("version"), "cipher_fx_poi_v1"),
+        "total": first_present(metric.get("total"), data.get("score")),
+        "minimum": first_present(metric.get("minimum"), data.get("min_score")),
+        "strong": first_present(metric.get("strong"), 85.0),
+        "band": first_present(metric.get("band"), data.get("score_band"), score_band(data.get("score"))),
+        "stage": first_present(metric.get("stage"), data.get("score_stage"), data.get("scan_stage")),
+        "enforced": bool(metric.get("enforced", True)),
+        "probability": bool(metric.get("probability", False)),
+        "components": metric.get("components") if isinstance(metric.get("components"), dict) else {},
+        "maxima": metric.get("maxima") if isinstance(metric.get("maxima"), dict) else {},
+    }
+    for hidden in ("h4_bias", "h1_bias", "m15_bias", "m5_trigger_side", "m1_confirmation_side"):
+        data[hidden] = "" if hidden.endswith("_bias") or hidden.endswith("_side") else data.get(hidden, "")
     return data
 
 
@@ -1055,11 +1413,21 @@ def _date_between(value: str, start: str, end: str) -> bool:
     return bool(value) and start <= value <= end
 
 
+def _row_score_passes(row: dict) -> bool:
+    metric = row.get("score_metric") if isinstance(row.get("score_metric"), dict) else {}
+    total = _safe_float(metric.get("total") if metric.get("total") is not None else row.get("score"))
+    minimum = _safe_float(metric.get("minimum") if metric.get("minimum") is not None else row.get("min_score"))
+    if minimum is None:
+        minimum = 70.0
+    return total is not None and total >= minimum
+
+
 def _public_signal_row(row) -> dict:
     data = _systematic_public_fields(dict(row))
     updated = date_detail_for(data.get("updated_at"))
     _add_date_prefix(data, "updated", updated)
-    data["score"] = _safe_float(data.get("score"))
+    raw_score = data.get("score")
+    data["score"] = None if raw_score in (None, "") else _safe_float(raw_score)
     data["gate_ok"] = bool(_safe_int(data.get("gate_ok")))
     data["has_direction"] = bool(data.get("direction"))
     return data
@@ -1090,16 +1458,56 @@ def _score_band_table(rows, score_key="final_score") -> list[dict]:
     return out
 
 
+
+def _compact_scanner_row(row: dict) -> dict:
+    keys = (
+        "sym", "market", "direction", "side", "score", "score_band", "gate",
+        "gate_ok", "has_direction", "reason", "public_reason", "status",
+        "engine", "asset_class", "strategy", "strategy_after", "strategy_status",
+        "updated_at", "updated_label", "scan_stage", "scan_status", "scan_story",
+        "scan_progress", "scan_trigger", "scan_cycle_at", "scan_candle_times",
+        "market_session", "signal_age_seconds", "pending_setup_created", "setup_state", "waiting_for",
+        "m1_status", "h4_score", "h1_score", "m15_score", "m5_trigger_score",
+        "m15_setup_type", "m15_poi_types", "m15_choch", "m15_bos", "m15_retracement",
+        "m5_trigger_type", "m5_trigger_result", "final_status", "public_metric_name",
+        "public_mode", "score_metric",
+    )
+    compact = {key: row.get(key) for key in keys if key in row}
+    if isinstance(compact.get("score_metric"), dict):
+        metric = compact["score_metric"]
+        compact["score_metric"] = {
+            "version": metric.get("version"),
+            "total": metric.get("total"),
+            "minimum": metric.get("minimum"),
+            "strong": metric.get("strong"),
+            "band": metric.get("band"),
+            "stage": metric.get("stage"),
+            "enforced": metric.get("enforced"),
+            "probability": metric.get("probability"),
+            "components": metric.get("components") if isinstance(metric.get("components"), dict) else {},
+        }
+    return compact
+
+
+def _compact_scanner_event(row: dict) -> dict:
+    keys = (
+        "sym", "market", "direction", "side", "final_score", "score",
+        "score_band", "status", "reason", "systematic_reason", "engine",
+        "asset_class", "strategy", "created_at", "created_label", "trade_date",
+        "gate_ok", "scan_stage", "scan_story", "scan_progress",
+    )
+    return {key: row.get(key) for key in keys if key in row}
+
 def read_signal_scanner():
     today = trading_today()
     week_start, week_end = trading_week_range(today)
-    signal_cutoff = (datetime.now() - timedelta(hours=12)).isoformat()
+    signal_cutoff = (datetime.now() - timedelta(minutes=7)).isoformat()
     conn = get_conn()
     signal_rows = conn.execute(
         """
         SELECT * FROM signals
-        WHERE datetime(replace(updated_at, 'T', ' ')) >= datetime(replace(?, 'T', ' '))
-        ORDER BY datetime(replace(updated_at, 'T', ' ')) DESC
+        WHERE updated_at >= ?
+        ORDER BY updated_at DESC
         """,
         (signal_cutoff,),
     ).fetchall()
@@ -1108,7 +1516,7 @@ def read_signal_scanner():
         SELECT *
         FROM setup_events
         WHERE trade_date >= ? AND trade_date <= ?
-        ORDER BY datetime(replace(created_at, 'T', ' ')) DESC
+        ORDER BY created_at DESC
         LIMIT 500
         """,
         (week_start, week_end),
@@ -1119,7 +1527,7 @@ def read_signal_scanner():
                rejected_reason, opened_at, trade_date, status
         FROM trades
         WHERE status='rejected' AND trade_date >= ? AND trade_date <= ?
-        ORDER BY datetime(replace(opened_at, 'T', ' ')) DESC
+        ORDER BY opened_at DESC
         LIMIT 120
         """,
         (week_start, week_end),
@@ -1136,13 +1544,69 @@ def read_signal_scanner():
     scanner_status = {row["key"]: row["value"] for row in status_rows}
     configured_symbol_count = _safe_int(scanner_status.get("mt5_symbol_count")) or _safe_int(scanner_status.get("priority_scan_symbol_count"))
     signals = _filter_latest_priority_signals([_public_signal_row(row) for row in signal_rows])
+    signals = [row for row in signals if str(row.get("gate") or "").strip().lower() not in {"market_window_closed", "markets closed"}]
+    # A closed session is not a current signal. Historical data remains in
+    # SQLite and the history views, but it is excluded from this live list.
+    signals = [row for row in signals if _symbol_market_is_open(row.get("sym"))]
+    for row in signals:
+        row["market_session"] = row.get("market_session") or _market_session_for_symbol(row.get("sym"))
+        updated = _parse_dt(row.get("updated_at"))
+        row["signal_age_seconds"] = round(max(0.0, (datetime.now() - updated).total_seconds()), 1) if updated else None
+    observed_symbols = {str(row.get("sym") or "").upper() for row in signals}
+    for sym in _priority_symbols_from_env():
+        if not _symbol_market_is_open(sym):
+            continue
+        if sym in observed_symbols:
+            continue
+        session_id = _market_session_for_symbol(sym)
+        signals.append({
+            "sym": sym,
+            "market": "index_cfd_us" if session_id == "us_new_york" else "index_cfd_asia" if session_id == "asia_tokyo" else "mt5",
+            "direction": "",
+            "side": "",
+            "score": None,
+            "score_band": "",
+            "gate": "no_recent_scan",
+            "gate_ok": None,
+            "has_direction": False,
+            "reason": "no_recent_scan",
+            "public_reason": "Waiting for live scan",
+            "status": "WATCHING",
+            "engine": "INDEX_SESSION_BREAKOUT" if session_id else "",
+            "asset_class": "index" if session_id else "",
+            "strategy": "",
+            "updated_at": "",
+            "updated_label": "",
+            "scan_stage": "SESSION",
+            "scan_status": "WATCHING",
+            "scan_story": "Configured MT5 symbol; waiting for its next live scan event.",
+            "scan_progress": [
+                {"key": "H4", "label": "Direction", "state": "inactive"},
+                {"key": "H1", "label": "Confirm", "state": "inactive"},
+                {"key": "M15", "label": "POI + Structure", "state": "inactive"},
+                {"key": "M5", "label": "Break / Retest", "state": "inactive"},
+                {"key": "ORDER", "label": "Order", "state": "inactive"},
+            ],
+            "scan_trigger": "WAITING_FOR_SESSION",
+            "scan_cycle_at": "",
+            "scan_candle_times": {},
+            "market_session": session_id,
+            "pending_setup_created": False,
+            "m1_status": "",
+            "public_metric_name": "Cipher FX Score",
+            "public_mode": "Shadow",
+            "score_metric": {"version": "cipher_fx_score", "total": None, "band": ""},
+        })
     events = [_public_setup_event(row) for row in setup_rows]
     today_events = [row for row in events if row.get("trade_date") == today]
     week_events = [row for row in events if _date_between(row.get("trade_date"), week_start, week_end)]
     today_signals = [row for row in signals if trade_date_for(row.get("updated_at")) == today]
-    current_actionable = [row for row in signals if row.get("gate_ok") and row.get("direction")]
-    current_blocked = [row for row in signals if row.get("direction") and not row.get("gate_ok")]
-    current_waiting = [row for row in signals if not row.get("direction")]
+    current_actionable = [row for row in signals if row.get("gate_ok") and row.get("direction") and _row_score_passes(row)]
+    current_blocked = [
+        row for row in signals
+        if row.get("gate_ok") is False and row.get("status") not in {"WATCHING", "CLOSED"}
+    ]
+    current_waiting = [row for row in signals if str(row.get("setup_state") or "").upper() in {"ARMED", "WAITING_M5"} or str(row.get("waiting_for") or "").upper() == "M5_BREAK_OR_RETEST"]
     score_source_today = today_events or [row for row in today_signals if row.get("direction")]
     score_source_week = week_events or [row for row in signals if row.get("direction")]
 
@@ -1163,7 +1627,7 @@ def read_signal_scanner():
             "direction": row.get("direction"),
             "score": row.get("score"),
             "score_band": row.get("score_band"),
-            "reason": row.get("systematic_reason") or row.get("gate") or "blocked by scanner gate",
+            "reason": row.get("public_reason") or row.get("reason") or "No clear setup",
             "engine": row.get("engine"),
             "asset_class": row.get("asset_class"),
             "created_label": row.get("updated_label"),
@@ -1205,6 +1669,8 @@ def read_signal_scanner():
             "latest_signal_label": latest_signal_detail.get("label", ""),
             "scanned_symbols_today": len({row.get("sym") for row in today_signals if row.get("sym")}),
             "tracked_symbols": configured_symbol_count or len({row.get("sym") for row in signals if row.get("sym")}),
+            "current_universe_rows": len(signals),
+            "missing_recent_symbols": [sym for sym in _priority_symbols_from_env() if _symbol_market_is_open(sym) and sym not in {str(row.get("sym") or "").upper() for row in signals if row.get("updated_at")}],
             "current_actionable": len(current_actionable),
             "current_blocked": len(current_blocked),
             "current_waiting": len(current_waiting),
@@ -1223,11 +1689,28 @@ def read_signal_scanner():
         },
         "score_bands_today": _score_band_table(score_source_today),
         "score_bands_week": _score_band_table(score_source_week),
-        "current_signals": signals[:40],
-        "recent_events": events[:40],
+        "current_signals": [_compact_scanner_row(row) for row in signals[:40]],
+        "recent_events": [_compact_scanner_event(row) for row in events[:40]],
         "blockers": blockers[:30],
         "rejected_orders": rejected[:30],
+        "public_latest_label": "Latest Signals Overview",
     }
+
+
+def read_replay_trades(sym=None, limit=300):
+    conn = get_conn()
+    if sym:
+        rows = conn.execute(
+            'SELECT * FROM trades WHERE sym=? ORDER BY datetime(replace(COALESCE(opened_at, trade_date), "T", " ")) ASC LIMIT ?',
+            (str(sym).upper(), max(1, min(int(limit or 300), 1000))),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            'SELECT * FROM trades ORDER BY datetime(replace(COALESCE(opened_at, trade_date), "T", " ")) ASC LIMIT ?',
+            (max(1, min(int(limit or 300), 1000)),),
+        ).fetchall()
+    conn.close()
+    return [enrich_trade_dates(dict(row)) for row in rows]
 
 
 def read_trades(limit=100, today_only=False):
@@ -1436,12 +1919,23 @@ def read_deals_period(period: str = "today", limit: int = 200) -> dict:
         ).fetchall()
     conn.close()
     deals = [_deal_row_payload(row) for row in rows]
+    summary = _deals_summary(deals, clean, start, end)
+    public_keys = (
+        "id", "trade_id", "ticket", "sym", "symbol", "direction", "side",
+        "outcome", "status", "qty", "volume", "entry_price", "entry",
+        "exit_price", "exit", "price", "realized", "pnl", "profit",
+        "opened_at", "closed_at", "trade_date", "opened_date", "closed_date",
+        "opened_day", "closed_day", "opened_month_label", "trade_month_label",
+        "closed_month_label", "opened_label", "closed_label", "trade_label",
+        "duration_label",
+    )
+    public_deals = [{key: row.get(key) for key in public_keys if key in row} for row in deals]
     return {
         "period": clean,
         "start_date": start,
         "end_date": end,
-        "summary": _deals_summary(deals, clean, start, end),
-        "deals": deals,
+        "summary": summary,
+        "deals": public_deals,
     }
 
 

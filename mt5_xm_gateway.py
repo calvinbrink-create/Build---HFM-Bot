@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -74,8 +75,10 @@ class MT5Gateway:
         self.mode = "bridge"
         self._last_account_payload: dict[str, str] = {}
         self._broker_offset_cache = 0
+        self._shutdown_event = threading.Event()
 
     def connect(self) -> None:
+        self._shutdown_event.clear()
         if self.config.execution_mode in {"native", "auto"}:
             try:
                 import MetaTrader5 as mt5  # type: ignore
@@ -162,7 +165,13 @@ class MT5Gateway:
                 self._broker_offset_cache = offset
         return broker_epoch - offset
 
+    def request_shutdown(self) -> None:
+        # Set cancellation before worker joins begin. Bridge waits observe this
+        # event and unwind without waiting for their normal 45-second timeout.
+        self._shutdown_event.set()
+
     def shutdown(self) -> None:
+        self.request_shutdown()
         if self.mt5 is not None:
             try:
                 self.mt5.shutdown()
@@ -180,7 +189,42 @@ class MT5Gateway:
                 if not self.mt5.symbol_select(resolved, True):
                     raise RuntimeError(f"MT5 symbol_select failed for {resolved}: {self.mt5.last_error()}")
             return resolved
-        return self.config.resolved_symbol(symbol)
+        resolved = self.config.resolved_symbol(symbol)
+        # Bridge commands must use the broker's exact exported spelling. The
+        # terminal is case-insensitive for display, but the CSV/command
+        # contract is not: an alias such as FRA40Cash must not become
+        # FRA40CASH and then fail inside SymbolSelect.
+        rows = self._bridge_symbol_map()
+        if not rows:
+            raise RuntimeError(f"MT5 bridge symbol manifest unavailable for {resolved}")
+        key = resolved.upper()
+        row = rows.get(key)
+        if row is None:
+            raise RuntimeError(f"MT5 bridge symbol not exported: {resolved}")
+        actual = str(row.get("_broker_symbol") or resolved)
+        visible = str(row.get("visible", "1")).strip().lower() in {"1", "true", "yes"}
+        if not visible:
+            raise RuntimeError(f"MT5 bridge symbol is not visible: {actual}")
+        return actual
+
+    def validate_symbol_routing(self, symbols: list[str] | None = None) -> dict[str, dict[str, str | bool]]:
+        '''Validate canonical-to-broker aliases against the live bridge manifest.'''
+        requested = list(symbols or self.config.all_symbols())
+        result: dict[str, dict[str, str | bool]] = {}
+        for canonical in requested:
+            key = str(canonical or "").strip().upper()
+            configured = self.config.resolved_symbol(key)
+            try:
+                resolved = self.ensure_symbol(key)
+                result[key] = {"ok": True, "configured": configured, "resolved": resolved}
+            except Exception as exc:
+                result[key] = {
+                    "ok": False,
+                    "configured": configured,
+                    "resolved": "",
+                    "error": str(exc)[:180],
+                }
+        return result
 
     def account_info(self):
         if self.mode == "native":
@@ -938,10 +982,13 @@ class MT5Gateway:
             return {}
         rows: dict[str, dict[str, str]] = {}
         for _, row in df.iterrows():
-            sym = str(row.get("symbol", "")).strip().upper()
-            if not sym:
+            broker_symbol = str(row.get("symbol", "")).strip()
+            if not broker_symbol:
                 continue
-            rows[sym] = {str(k): "" if pd.isna(v) else str(v) for k, v in row.to_dict().items()}
+            key = broker_symbol.upper()
+            payload = {str(k): "" if pd.isna(v) else str(v) for k, v in row.to_dict().items()}
+            payload["_broker_symbol"] = broker_symbol
+            rows[key] = payload
         return rows
 
     def _volume_digits(self, step: float) -> int:
@@ -980,7 +1027,7 @@ class MT5Gateway:
     def _await_result(self, request_id: str) -> _BridgeResult:
         result_path = self.config.results_dir / f"result_{request_id}.txt"
         deadline = time.time() + 45
-        while time.time() < deadline:
+        while time.time() < deadline and not self._shutdown_event.is_set():
             if result_path.exists():
                 payload = self._read_key_values(result_path)
                 status = payload.get("status", "").upper()
@@ -1003,7 +1050,9 @@ class MT5Gateway:
                     currency=str(payload.get("currency", "")),
                     message=str(payload.get("message", "")),
                 )
-            time.sleep(0.05)
+            self._shutdown_event.wait(0.05)
+        if self._shutdown_event.is_set():
+            raise RuntimeError(f"MT5 bridge wait cancelled during shutdown: {request_id}")
         raise RuntimeError(f"Timed out waiting for MT5 bridge result: {request_id}")
 
     def _bridge_file_meta(self, path: Path) -> dict[str, object]:
