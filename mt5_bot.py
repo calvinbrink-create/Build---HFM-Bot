@@ -19,6 +19,7 @@ from dashboard.backend import state_store as _ss
 from mt5_xm_config import MT5RuntimeConfig
 from mt5_xm_gateway import MT5Gateway, MT5PositionView, MT5SymbolSpec
 from trading.execution_service import ExecutionRequest, ExecutionService
+from trading.state_machine import InvalidTransition, TimedRLock, transition_state
 from tick_websocket import TickWebSocketServer
 from trading.remediation import BoundedShadowWorker, build_m15_setup, evaluate_h1_structure
 from mt5_shared_utils import (
@@ -1137,7 +1138,7 @@ class XM_MT5_Bot:
             self._on_websocket_tick,
             enabled=_env_bool("MT5_WS_TICK_ENABLE", True),
         )
-        self._execution_claim_lock = threading.RLock()
+        self._execution_claim_lock = None
         self.gateway = MT5Gateway(runtime)
         # The strategy runtime owns the only entry submission boundary. The
         # service delegates to the existing gateway implementation so broker
@@ -1146,6 +1147,12 @@ class XM_MT5_Bot:
         self.state_file = Path(runtime.state_file)
         self.heartbeat_file = Path(
             os.getenv("MT5_HEARTBEAT_FILE", str(self.state_file.with_name("mt5_heartbeat.json")))
+        )
+        self._pending_state_lock = TimedRLock(
+            "pending_state", observer=self._phase2_lock_event
+        )
+        self._execution_claim_lock = TimedRLock(
+            "execution_claim", observer=self._phase2_lock_event
         )
         self.state = self._load_state()
         # The live route is completed-M5 driven. Drop the retired M1 scanner
@@ -1474,6 +1481,94 @@ class XM_MT5_Bot:
             staging.write_text(json.dumps(self.state, indent=2, default=str))
             staging.replace(self.state_file)
 
+    def _phase2_lock_event(self, payload: dict) -> None:
+        """Publish lock waits/timeouts without changing trade eligibility."""
+        try:
+            event = dict(payload or {})
+            message = " ".join(
+                f"{key}={value}" for key, value in sorted(event.items())
+            )
+            _ss.set_status("last_phase2_lock_event", message[:500])
+            self._audit_decision({
+                "event": str(event.get("event") or "LOCK_EVENT"),
+                "decision": "observe",
+                "scope": "execution_state",
+                **event,
+            })
+        except Exception:
+            pass
+
+    def _phase2_pending_lock(self) -> TimedRLock:
+        lock = getattr(self, "_pending_state_lock", None)
+        if lock is None:
+            lock = TimedRLock("pending_state", observer=self._phase2_lock_event)
+            self._pending_state_lock = lock
+        return lock
+
+    def _phase2_execution_lock(self) -> TimedRLock:
+        lock = getattr(self, "_execution_claim_lock", None)
+        if lock is None:
+            lock = TimedRLock("execution_claim", observer=self._phase2_lock_event)
+            self._execution_claim_lock = lock
+        return lock
+
+    def _record_execution_lifecycle(
+        self,
+        stage: str,
+        setup: dict | None = None,
+        sig: dict | None = None,
+        *,
+        request_id: str = "",
+        reason: str = "",
+        **fields,
+    ) -> None:
+        """Persist a bounded operational order lifecycle journal."""
+        setup = setup if isinstance(setup, dict) else {}
+        sig = sig if isinstance(sig, dict) else {}
+        key = str(
+            request_id
+            or setup.get("execution_request_id")
+            or setup.get("setup_id")
+            or sig.get("execution_request_id")
+            or sig.get("setup_id")
+            or ""
+        )
+        if not key:
+            return
+        now = datetime.utcnow().isoformat()
+        with self._state_io_lock:
+            journal = self.state.setdefault("execution_journal", {})
+            row = journal.setdefault(key, {
+                "request_id": key,
+                "setup_id": str(setup.get("setup_id") or sig.get("setup_id") or ""),
+                "symbol": str(setup.get("symbol") or sig.get("symbol") or ""),
+                "side": str(setup.get("side") or setup.get("direction") or sig.get("direction") or ""),
+                "events": [],
+                "created_at": now,
+            })
+            row["updated_at"] = now
+            row["last_stage"] = str(stage)
+            if reason:
+                row["last_reason"] = str(reason)[:240]
+            row.update({str(k): self._audit_json_safe(v) for k, v in fields.items()})
+            events = row.setdefault("events", [])
+            events.append({
+                "stage": str(stage),
+                "at": now,
+                "reason": str(reason or ""),
+                **{str(k): self._audit_json_safe(v) for k, v in fields.items()},
+            })
+            if len(events) > 32:
+                del events[:-32]
+            if len(journal) > 2048:
+                oldest = sorted(
+                    journal.items(),
+                    key=lambda item: str(item[1].get("updated_at") or ""),
+                )[:-2048]
+                for old_key, _old_row in oldest:
+                    journal.pop(old_key, None)
+            self._save_state()
+
     @property
     def open_trades(self) -> dict:
         rows = self.state.setdefault("open_trades", {})
@@ -1621,6 +1716,14 @@ class XM_MT5_Bot:
         existing_expiry = _parse_dt(setup.get("expires_at"))
         setup["expires_at"] = (min(existing_expiry, capped_expiry) if existing_expiry else capped_expiry).isoformat()
         setup.setdefault("status", self._pending_setup_status(setup))
+        if not setup.get("lifecycle_state"):
+            try:
+                setup["lifecycle_state"] = transition_state(
+                    setup.get("state_machine_state") or setup.get("state") or "WAITING_M5",
+                    setup.get("state_machine_state") or setup.get("state") or "WAITING_M5",
+                ).value
+            except InvalidTransition:
+                setup["lifecycle_state"] = "CONFIRMATION_WAIT"
         setup.setdefault("trigger_timeframe", "5M")
         setup.setdefault("waiting_for", "M5_BREAK_OR_RETEST" if str(setup.get("state") or setup.get("state_machine_state") or "").upper() in {"ARMED", "WAITING_M5"} else "")
         store = self.pending_setups
@@ -2000,6 +2103,11 @@ class XM_MT5_Bot:
         setup_id = str(setup.get("setup_id") or "")
         if not setup_id:
             return
+        try:
+            current = setup.get("lifecycle_state") or setup.get("state_machine_state") or setup.get("state")
+            setup["lifecycle_state"] = transition_state(current, str(state)).value
+        except InvalidTransition:
+            setup["lifecycle_state"] = str(state)
         history = self.state.setdefault("setup_history", {})
         history[setup_id] = {
             "setup_id": setup_id,
@@ -2031,19 +2139,43 @@ class XM_MT5_Bot:
         setup["status_updated_at"] = now.isoformat()
         state_map = {
             "confirmed_m5": "CONFIRMED",
-            "order_sent": "EXECUTION_PENDING", "entered": "EXECUTED",
-            "expired": "EXPIRED", "cancelled": "INVALIDATED",
-            "order_rejected": "REJECTED", "order_unconfirmed": "REJECTED",
+            "order_sent": "ORDER_SUBMITTED",
+            "entered": "EXECUTED",
+            "expired": "EXPIRED",
+            "cancelled": "INVALIDATED",
+            "order_rejected": "REJECTED",
+            "order_unconfirmed": "REJECTED",
+        }
+        lifecycle_map = {
+            "confirmed_m5": "ENTRY_VALIDATION",
+            "order_sent": "ORDER_SUBMITTED",
+            "entered": "EXECUTED",
+            "expired": "EXPIRED",
+            "cancelled": "INVALIDATED",
+            "order_rejected": "REJECTED",
+            "order_unconfirmed": "REJECTED",
         }
         new_state = state_map.get(status, str(setup.get("state") or "NEW"))
+        requested_lifecycle = lifecycle_map.get(status, new_state)
         old_state = str(setup.get("state") or "NEW")
-        if old_state in {"EXECUTED", "EXPIRED", "INVALIDATED", "REJECTED"} and new_state != old_state:
+        current_lifecycle = (
+            setup.get("lifecycle_state")
+            or setup.get("state_machine_state")
+            or old_state
+        )
+        try:
+            lifecycle = transition_state(current_lifecycle, requested_lifecycle)
+        except InvalidTransition as exc:
             self._audit_decision({
-                "event": "INVALID_STATE_TRANSITION", "decision": "reject",
-                "setup_id": setup.get("setup_id"), "previous_state": old_state,
-                "requested_state": new_state, "reason": "terminal setup is irreversible",
+                "event": "INVALID_STATE_TRANSITION",
+                "decision": "reject",
+                "setup_id": setup.get("setup_id"),
+                "previous_state": str(current_lifecycle),
+                "requested_state": str(requested_lifecycle),
+                "reason": str(exc),
             })
-            return
+            return False
+        setup["lifecycle_state"] = lifecycle.value
         setup["state"] = new_state
         if new_state in {"EXECUTED", "EXPIRED", "INVALIDATED", "REJECTED"}:
             setup["terminal_reason"] = reason
@@ -2061,6 +2193,7 @@ class XM_MT5_Bot:
         self._log_pending_setup_event(event, key, setup, reason, sig)
         if save:
             self._save_state()
+        return True
 
     def _remove_pending_setup(
         self,
@@ -2074,15 +2207,16 @@ class XM_MT5_Bot:
         self._set_pending_setup_status(key, setup, status, event, reason, sig, save=False)
         setup_id = str(setup.get("setup_id") or "") if isinstance(setup, dict) else ""
         symbol = str(setup.get("symbol") or "").upper() if isinstance(setup, dict) else ""
-        for candidate_key, candidate_setup in list(self.pending_setups.items()):
-            if candidate_key == key:
-                self.pending_setups.pop(candidate_key, None)
-                continue
-            if isinstance(candidate_setup, dict) and setup_id and str(candidate_setup.get("setup_id") or "") == setup_id:
-                self.pending_setups.pop(candidate_key, None)
-                continue
-            if candidate_key == symbol and isinstance(candidate_setup, dict) and setup_id and str(candidate_setup.get("setup_id") or "") == setup_id:
-                self.pending_setups.pop(candidate_key, None)
+        with self._phase2_pending_lock():
+            for candidate_key, candidate_setup in list(self.pending_setups.items()):
+                if candidate_key == key:
+                    self.pending_setups.pop(candidate_key, None)
+                    continue
+                if isinstance(candidate_setup, dict) and setup_id and str(candidate_setup.get("setup_id") or "") == setup_id:
+                    self.pending_setups.pop(candidate_key, None)
+                    continue
+                if candidate_key == symbol and isinstance(candidate_setup, dict) and setup_id and str(candidate_setup.get("setup_id") or "") == setup_id:
+                    self.pending_setups.pop(candidate_key, None)
         self._save_state()
 
     def _trade_id_in_open_state(self, trade_id: str) -> bool:
@@ -2915,7 +3049,8 @@ class XM_MT5_Bot:
         direction = str(side or sig.get("direction") or "").upper()
         now = datetime.utcnow()
         self.cleanup_expired_pending_setups(now, publish_debug=False)
-        pending_key, pending = self._active_pending_setup_for(canonical, direction, now)
+        with self._phase2_pending_lock():
+            pending_key, pending = self._active_pending_setup_for(canonical, direction, now)
         if isinstance(pending, dict):
             final_status = str(pending.get("state") or sig.get("state") or PENDING)
             reason = "SETUP_ALREADY_ACTIVE waiting for M5 break/retest" if str(sig.get("flow_state") or "").upper() == "ARMED" else "SETUP_ALREADY_ACTIVE waiting for execution"
@@ -3065,6 +3200,7 @@ class XM_MT5_Bot:
             "status": "armed" if armed_flow else "confirmed_m5" if fast_entry_mode else "waiting_m5",
             "state": "ARMED" if armed_flow else "CONFIRMED" if fast_entry_mode else "WAITING_M5",
             "state_machine_state": "ARMED" if armed_flow else "M5_TRIGGERED" if fast_entry_mode else "WAITING_M5",
+            "lifecycle_state": "CONFIRMATION_WAIT" if armed_flow or not fast_entry_mode else "ENTRY_VALIDATION",
             "armed": bool(armed_flow),
             "armed_direction": direction if armed_flow else "",
             "armed_expiry": confirmation_deadline.isoformat() if armed_flow else "",
@@ -3165,7 +3301,32 @@ class XM_MT5_Bot:
                 "expires_at": execution_deadline.isoformat(),
                 "timeout_minutes": execution_window / 60.0,
             })
-        self.pending_setups[pending_key] = setup
+        with self._phase2_pending_lock():
+            if setup_id in self.state.setdefault("setup_history", {}):
+                reason = "DUPLICATE_SUPPRESSED terminal setup already persisted"
+                self._audit_decision({
+                    "event": "DUPLICATE_SUPPRESSED",
+                    "decision": "reject",
+                    "symbol": canonical,
+                    "side": direction,
+                    "setup_id": setup_id,
+                    "reason": reason,
+                })
+                return False, reason
+            active_key, active_setup = self._active_pending_setup_for(canonical, direction, now)
+            if isinstance(active_setup, dict):
+                reason = "SETUP_ALREADY_ACTIVE concurrent setup creation suppressed"
+                self._audit_decision({
+                    "event": "DUPLICATE_SUPPRESSED",
+                    "decision": "reject",
+                    "symbol": canonical,
+                    "side": direction,
+                    "setup_id": setup_id,
+                    "pending_key": active_key,
+                    "reason": reason,
+                })
+                return False, reason
+            self.pending_setups[pending_key] = setup
         self._pending_monitor_wakeup.set()
         self._save_state()
         if isinstance(sig, dict):
@@ -3428,6 +3589,7 @@ class XM_MT5_Bot:
                 "status": "confirmed_m5",
                 "state": "CONFIRMED",
                 "state_machine_state": "M5_TRIGGERED",
+                "lifecycle_state": "ENTRY_VALIDATION",
                 "waiting_for": "",
                 "fast_entry_mode": True,
                 "confirmation_source": "M5_BREAK_RETEST",
@@ -5739,7 +5901,7 @@ class XM_MT5_Bot:
             try:
                 claim_now = datetime.utcnow()
                 claim_at = _parse_dt(pending.get("execution_claimed_at"))
-                with self._execution_claim_lock:
+                with self._phase2_execution_lock():
                     if pending.get("order_send_at") or pending.get("execution_claimed_at") or self._pending_setup_status(pending) == "order_sent":
                         claim_age = (claim_now - claim_at).total_seconds() if claim_at else 0.0
                         if pending.get("order_send_at") or claim_age < 15.0:
@@ -5762,28 +5924,73 @@ class XM_MT5_Bot:
                     pending["execution_claimed_at"] = claim_now.isoformat()
                     pending["execution_request_id"] = str(pending.get("setup_id") or pending_key)
                     sig["execution_request_id"] = pending["execution_request_id"]
-                    self._save_state()
                 risk_meta = dict(risk_meta or {})
                 risk_meta["pending_setup_id"] = pending.get("setup_id")
                 risk_meta["pending_key"] = pending_key
-                self._set_pending_setup_status(pending_key, pending, "order_sent", "ORDER_SENT", "MT5 order submission claimed", sig)
+                if self._set_pending_setup_status(
+                    pending_key,
+                    pending,
+                    "order_sent",
+                    "ORDER_SENT",
+                    "MT5 order submission claimed",
+                    sig,
+                ) is False:
+                    raise RuntimeError("invalid lifecycle transition before order submission")
+                self._record_execution_lifecycle(
+                    "CLAIMED",
+                    pending,
+                    sig,
+                    request_id=str(pending.get("execution_request_id") or ""),
+                    reason="execution claim persisted before broker submission",
+                )
                 order_result = self._place_trade(canonical, market, sig, volume, sl, tp, risk_meta)
+                self._record_execution_lifecycle(
+                    "BROKER_RESPONSE",
+                    pending,
+                    sig,
+                    request_id=str(pending.get("execution_request_id") or ""),
+                    reason="broker response received",
+                    retcode=getattr(order_result, "retcode", None) if order_result is not None else None,
+                )
                 result_ok, result_reason, result_details = self.execution_quality_engine.confirm_order_result(canonical, sig, order_result)
                 sig.setdefault("_mt5_thresholds", {})["mt5_order_result"] = result_details
                 if result_ok:
                     executed += 1
                     sig["final_status"] = EXECUTED; sig["state"] = EXECUTED
+                    self._record_execution_lifecycle(
+                        "FILLED",
+                        pending,
+                        sig,
+                        request_id=str(pending.get("execution_request_id") or ""),
+                        reason=result_reason,
+                        broker_result=self._audit_json_safe(result_details),
+                    )
                     self._remove_pending_setup(pending_key, pending, "entered", "ORDER_FILLED", result_reason, sig)
                     self.analytics_engine.record(EXECUTED, canonical, engine, str(sig.get("strategy") or ""), float(sig.get("score") or 0.0), result_reason, sig)
                 else:
                     cancelled += 1
                     sig["final_status"] = CANCELLED; sig["state"] = CANCELLED
+                    self._record_execution_lifecycle(
+                        "REJECTED",
+                        pending,
+                        sig,
+                        request_id=str(pending.get("execution_request_id") or ""),
+                        reason=result_reason,
+                        broker_result=self._audit_json_safe(result_details),
+                    )
                     self._remove_pending_setup(pending_key, pending, "order_rejected", "ORDER_REJECTED", result_reason, sig)
                     self.analytics_engine.record(CANCELLED, canonical, engine, str(sig.get("strategy") or ""), float(sig.get("score") or 0.0), result_reason, sig)
             except Exception as exc:
                 _ok, _reason, result_details = self.execution_quality_engine.confirm_order_result(canonical, sig, None, error=str(exc))
                 sig.setdefault("_mt5_thresholds", {})["mt5_order_result"] = result_details
                 error_text = str(exc)
+                self._record_execution_lifecycle(
+                    "FAILED",
+                    pending,
+                    sig,
+                    request_id=str(pending.get("execution_request_id") or ""),
+                    reason=error_text,
+                )
                 if "without broker deal/position evidence" in error_text:
                     self._remove_pending_setup(pending_key, pending, "order_unconfirmed", "ORDER_UNCONFIRMED", error_text, sig); cancelled += 1
                     self.analytics_engine.record("ORDER_UNCONFIRMED", canonical, engine, str(sig.get("strategy") or ""), float(sig.get("score") or 0.0), error_text[:240], sig)
@@ -9686,6 +9893,7 @@ class XM_MT5_Bot:
                 stop_loss=sl,
                 take_profit=tp,
                 comment=f"cipherfx-{sym}-{str(sig.get('execution_request_id') or sig.get('setup_id') or trade_id)}",
+                request_id=str(sig.get("execution_request_id") or sig.get("setup_id") or trade_id),
             )
         )
         server_response_dt = datetime.utcnow()
