@@ -8,6 +8,7 @@ import json
 import csv
 import os
 from datetime import datetime, date, timedelta, timezone
+from trading.observability import InstrumentedSQLiteConnection
 from pathlib import Path
 
 try:
@@ -325,7 +326,7 @@ def trading_month_range(today_value: str | None = None) -> tuple[str, str]:
 def get_conn():
     # Keep dashboard/trading writes bounded. A long SQLite wait must not pin the
     # trading process during a service stop or feed outage.
-    conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=5.0, check_same_thread=False, factory=InstrumentedSQLiteConnection)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA busy_timeout=5000")
     # WAL mode is initialized once; do not request a database-level mode change on every connection.
@@ -337,7 +338,7 @@ def get_conn():
 
 def checkpoint_wal() -> dict:
     """Perform a non-blocking WAL checkpoint for bounded runtime persistence."""
-    conn = sqlite3.connect(DB_PATH, timeout=2.0, check_same_thread=False)
+    conn = sqlite3.connect(DB_PATH, timeout=2.0, check_same_thread=False, factory=InstrumentedSQLiteConnection)
     try:
         conn.execute("PRAGMA busy_timeout=2000")
         result = conn.execute("PRAGMA wal_checkpoint(PASSIVE)").fetchone() or (0, 0, 0)

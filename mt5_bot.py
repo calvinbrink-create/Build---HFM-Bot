@@ -22,6 +22,7 @@ from trading.execution_service import ExecutionRequest, ExecutionService
 from trading.state_machine import InvalidTransition, TimedRLock, transition_state
 from tick_websocket import TickWebSocketServer
 from trading.remediation import BoundedShadowWorker, build_m15_setup, evaluate_h1_structure
+from trading.observability import GLOBAL_OPERATIONAL_METRICS as _OPS
 from mt5_shared_utils import (
     ACTIVE_PROBABILITY_STRATEGIES,
     CFG,
@@ -1105,6 +1106,7 @@ class XM_MT5_Bot:
         self._heartbeat_file_lock = threading.RLock()
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = None
+        self._ops_metrics = _OPS
         self._scan_stats_lock = threading.RLock()
         self._pending_monitor_stop = threading.Event()
         self._pending_monitor_wakeup = threading.Event()
@@ -1148,6 +1150,16 @@ class XM_MT5_Bot:
         self.heartbeat_file = Path(
             os.getenv("MT5_HEARTBEAT_FILE", str(self.state_file.with_name("mt5_heartbeat.json")))
         )
+        self._process_started_at = datetime.utcnow().isoformat() + "Z"
+        self._process_started_monotonic = time.monotonic()
+        self._ops_restart_count = 0
+        try:
+            previous = json.loads(self.heartbeat_file.read_text())
+            previous_telemetry = previous.get("telemetry") if isinstance(previous, dict) else {}
+            previous_service = previous_telemetry.get("service") if isinstance(previous_telemetry, dict) else {}
+            self._ops_restart_count = int(previous_service.get("restart_count") or previous.get("restart_count") or 0) + 1
+        except Exception:
+            self._ops_restart_count = 1
         self._pending_state_lock = TimedRLock(
             "pending_state", observer=self._phase2_lock_event
         )
@@ -4372,12 +4384,77 @@ class XM_MT5_Bot:
         _ss.set_status("last_housekeeping_result", "state saved; SQLite trade exports reconciled")
         print("[MT5_HOUSEKEEPING] state saved; SQLite trade exports reconciled", flush=True)
 
+    def _operational_snapshot(self) -> dict:
+        """Return diagnostics only; this snapshot never participates in gating."""
+        snapshot = self._ops_metrics.snapshot(
+            self.state_file.with_name("mt5_state.db"),
+            db_sample_seconds=5.0,
+        )
+        pending_count = len(self.pending_setups) if isinstance(self.pending_setups, dict) else 0
+        open_count = len(self.state.get("open_trades") or {}) if isinstance(self.state, dict) else 0
+        shadow_thread = getattr(self._shadow_worker, "_thread", None)
+        snapshot["workers"] = {
+            "m5_scan_alive": bool(self._m5_scan_thread and self._m5_scan_thread.is_alive()),
+            "pending_monitor_alive": bool(self._pending_monitor_thread and self._pending_monitor_thread.is_alive()),
+            "shadow_worker_alive": bool(shadow_thread and shadow_thread.is_alive()),
+        }
+        snapshot["trading"] = {
+            "active_signals": pending_count,
+            "pending_executions": pending_count,
+            "open_positions": open_count,
+            "current_state": "PENDING" if pending_count else "IDLE",
+        }
+        snapshot["event_backlog"] = {
+            "shadow_queue_depth": int(getattr(self._shadow_worker, "pending", 0) or 0),
+            "shadow_queue_dropped": int(getattr(self._shadow_worker, "dropped", 0) or 0),
+        }
+        latest_tick_epoch = 0.0
+        latest_tick_received = ""
+        with self._ws_tick_lock:
+            for tick in self._ws_tick_events.values():
+                try:
+                    epoch = float(tick.get("time_utc") or 0.0)
+                except (TypeError, ValueError):
+                    epoch = 0.0
+                if epoch >= latest_tick_epoch:
+                    latest_tick_epoch = epoch
+                    latest_tick_received = str(tick.get("_ws_received_at") or "")
+        snapshot["market_data"] = {
+            "last_tick_at": latest_tick_received or None,
+            "last_tick_age_seconds": round(max(0.0, time.time() - latest_tick_epoch), 3)
+            if latest_tick_epoch > 0.0 else None,
+            "last_m5_bar_open_utc": datetime.utcfromtimestamp(latest_tick_epoch).isoformat() + "Z"
+            if latest_tick_epoch > 0.0 else None,
+            "websocket_symbols": len(self._ws_tick_events),
+            "freshness_source": "websocket_tick_cache",
+        }
+        snapshot["service"] = {
+            "started_at": self._process_started_at,
+            "uptime_seconds": round(max(0.0, time.monotonic() - self._process_started_monotonic), 3),
+            "restart_count": int(self._ops_restart_count),
+        }
+        return snapshot
+
+    def _publish_operational_telemetry(self) -> None:
+        """Publish one structured operational snapshot to the status store."""
+        try:
+            snapshot = self._operational_snapshot()
+            # One structured write keeps telemetry out of the hot-path write storm.
+            _ss.set_status("operational_telemetry", snapshot)
+        except Exception as exc:
+            self._ops_metrics.record_event(
+                "telemetry_publish_failure",
+                error=f"{type(exc).__name__}: {str(exc)[:180]}",
+            )
+
     def _write_heartbeat(self, status: str = "RUNNING") -> None:
         payload = {
             "status": str(status),
             "pid": os.getpid(),
             "updated_at": datetime.utcnow().isoformat() + "Z",
             "state_file": str(self.state_file),
+            "restart_count": int(self._ops_restart_count),
+            "telemetry": self._operational_snapshot(),
         }
         with self._heartbeat_file_lock:
             self.heartbeat_file.parent.mkdir(parents=True, exist_ok=True)
@@ -4413,6 +4490,7 @@ class XM_MT5_Bot:
         acct = self.gateway.account_info()
         self._assert_expected_account(acct)
         self._write_heartbeat("RUNNING")
+        self._publish_operational_telemetry()
         _ss.set_status("last_heartbeat", datetime.now().isoformat())
         _ss.set_status("equity", float(getattr(acct, "equity", 0.0) or 0.0))
         _ss.set_status("balance", float(getattr(acct, "balance", 0.0) or 0.0))
@@ -9852,14 +9930,28 @@ class XM_MT5_Bot:
 
     def _submit_strategy_v1_order(self, request: ExecutionRequest):
         """Submit one already-approved strategy entry through the gateway."""
-        return self.gateway.place_market_order(
-            request.symbol,
-            request.side,
-            request.volume,
-            request.stop_loss,
-            request.take_profit,
-            request.comment,
+        started = time.perf_counter()
+        try:
+            result = self.gateway.place_market_order(
+                request.symbol,
+                request.side,
+                request.volume,
+                request.stop_loss,
+                request.take_profit,
+                request.comment,
+            )
+        except Exception as exc:
+            self._ops_metrics.record_broker_request(
+                False,
+                (time.perf_counter() - started) * 1000.0,
+                f"{type(exc).__name__}: {str(exc)[:180]}",
+            )
+            raise
+        self._ops_metrics.record_broker_request(
+            True,
+            (time.perf_counter() - started) * 1000.0,
         )
+        return result
 
     def _place_trade(self, sym: str, market: str, sig: dict, qty: float, sl: float, tp: float, risk_meta: dict | None = None):
         trade_id = f"mt5_{sym}_{datetime.now().strftime('%Y%m%d%H%M%S%f')}"
