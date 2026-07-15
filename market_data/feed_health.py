@@ -54,6 +54,24 @@ class FeedHealth:
         now = float(time.time() if received_epoch is None else received_epoch)
         with self._lock:
             record = self._records.setdefault(canonical, _TickRecord())
+            # A delayed websocket/recovery event must never move the factual
+            # market clock backwards. Without this guard an old tick can
+            # overwrite a newer tick and falsely make an otherwise healthy
+            # symbol stale again.
+            if record.last_tick_epoch > 0.0 and tick_epoch <= record.last_tick_epoch:
+                current, age = self._state_for(record, now)
+                record.state = current
+                return {
+                    "accepted": False,
+                    "changed": False,
+                    "previous_state": current,
+                    "state": current,
+                    "symbol": canonical,
+                    "last_tick_epoch": record.last_tick_epoch,
+                    "last_received_epoch": record.last_received_epoch,
+                    "age_seconds": age,
+                    "reason": "out_of_order_tick_ignored",
+                }
             previous = record.state
             record.last_tick_epoch = tick_epoch
             record.last_received_epoch = now

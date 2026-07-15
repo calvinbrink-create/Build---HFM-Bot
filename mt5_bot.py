@@ -223,6 +223,8 @@ def _bars(df):
     if df is None or len(df) == 0:
         return pd.DataFrame()
     out = df.copy()
+    if isinstance(out.index, pd.DatetimeIndex):
+        out = out[~out.index.duplicated(keep="last")].sort_index()
     if len(out) > 3:
         out = out.iloc[:-1].copy()
     return out
@@ -1933,6 +1935,16 @@ class XM_MT5_Bot:
                 low_col = columns.get("low")
                 close_col = columns.get("close")
                 if not all((open_col, high_col, low_col, close_col)):
+                    return
+                updated = updated[~updated.index.duplicated(keep="last")].sort_index()
+                if updated.empty:
+                    return
+                latest_bar = updated.index[-1]
+                if bar_time < latest_bar:
+                    _ss.set_status(
+                        f"last_m5_trigger_{canonical}",
+                        f"STALE_M5_TICK_IGNORED tick_bar={bar_time.isoformat()} cached_bar={latest_bar.isoformat()}",
+                    )
                     return
                 if updated.index[-1] == bar_time:
                     updated.at[updated.index[-1], high_col] = max(float(updated.iloc[-1][high_col]), price)
@@ -8654,8 +8666,11 @@ class XM_MT5_Bot:
         evidence = {}
         problems = []
         for label, frame in frames.items():
-            raw_latest_open = _latest_bar_dt(frame) if frame is not None and len(frame) else None
-            bars = _bars(frame)
+            ordered_frame = frame
+            if isinstance(frame, pd.DataFrame) and isinstance(frame.index, pd.DatetimeIndex):
+                ordered_frame = frame[~frame.index.duplicated(keep="last")].sort_index()
+            raw_latest_open = _latest_bar_dt(ordered_frame) if ordered_frame is not None and len(ordered_frame) else None
+            bars = _bars(ordered_frame)
             meta = dict(getattr(frame, "attrs", {}).get("bridge_rates") or {}) if frame is not None else {}
             row = {
                 "bars": int(len(bars)) if bars is not None else 0,
@@ -8770,6 +8785,8 @@ class XM_MT5_Bot:
     def _strategy_v1_frame(self, frame, label: str, completed_only: bool = False):
         if frame is None:
             return None
+        if isinstance(frame, pd.DataFrame) and isinstance(frame.index, pd.DatetimeIndex):
+            frame = frame[~frame.index.duplicated(keep="last")].sort_index()
         if completed_only and len(frame) >= 2:
             frame = frame.iloc[:-1]
         rows = []

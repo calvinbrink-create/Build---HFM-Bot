@@ -38,6 +38,15 @@ class Phase5MarketDataTests(unittest.TestCase):
         self.assertEqual(transition["state"], LIVE_DATA)
         self.assertTrue(health.entry_allowed("XAUUSD", now=1006)[0])
 
+    def test_out_of_order_tick_does_not_move_clock_backwards(self):
+        health = FeedHealth(max_age_seconds=5)
+        health.update_tick("XAUUSD", 1006, received_epoch=1006)
+        transition = health.update_tick("XAUUSD", 1000, received_epoch=1007)
+        self.assertFalse(transition["accepted"])
+        self.assertEqual(transition["reason"], "out_of_order_tick_ignored")
+        self.assertEqual(health.status("XAUUSD", now=1007)["last_tick_epoch"], 1006)
+        self.assertTrue(health.entry_allowed("XAUUSD", now=1007)[0])
+
     def test_symbol_freshness_is_independent(self):
         health = FeedHealth(max_age_seconds=5)
         health.update_tick("XAUUSD", 998, received_epoch=1000)
