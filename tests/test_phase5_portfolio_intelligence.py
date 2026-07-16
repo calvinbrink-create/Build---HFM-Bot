@@ -20,7 +20,7 @@ class Phase5PortfolioIntelligenceTests(unittest.TestCase):
                 "price_open": 1.1, "price_current": 1.101, "profit": 20, "engine": "FOREX",
             }],
             "orders": [],
-            "proposal_states": {"APPROVED": 2, "EXECUTED": 3, "REJECTED": 1},
+            "proposal_states": {"APPROVED": 2, "EXECUTED": 3, "REJECTED": 1, "CLOSED": 4},
             "closed_summaries": {
                 "FOREX": {"closed_trades": 3, "realized_pnl": 45, "wins": 2, "losses": 1},
             },

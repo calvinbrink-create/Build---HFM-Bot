@@ -20,6 +20,7 @@ TERMINAL_PROPOSAL_STATES = {
     "REJECTED",
     "EXECUTION_BLOCKED",
     "CANCELLED",
+    "CLOSED",
 }
 
 
@@ -240,7 +241,7 @@ def build_portfolio_snapshot(
             "positions": "mt5_bridge_positions",
             "orders": "mt5_bridge_orders",
             "proposals": "mt5_state.db.trade_proposals",
-            "closed_trades": "mt5_state.db.trades",
+            "closed_trades": "mt5_state.db.trade_history",
         },
         "portfolio_health": {
             "score": health_score,
