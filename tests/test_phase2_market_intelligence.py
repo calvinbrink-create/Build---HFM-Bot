@@ -15,7 +15,7 @@ from cipherfx_platform.engines import (
     ForexLearningEngine,
     IndicesLearningEngine,
     MetalsLearningEngine,
-    MarketIntelligenceEngine,
+    LearningEngine,
 )
 from cipherfx_platform.market_data import MarketDataEngine
 
@@ -50,6 +50,20 @@ class Phase2MarketIntelligenceTests(unittest.TestCase):
             "MN1", "W1", "D1", "H4", "H1", "M30", "M15", "M5", "M3", "M1"
         ].index(x)))
 
+    def test_m3_is_native_snapshot_input_not_m1_derivation(self):
+        self.assertNotIn("_m3_from_m1", inspect.getsource(MarketDataEngine))
+
+        class TrackingGateway(SnapshotGateway):
+            def __init__(self):
+                self.calls = []
+
+            def rates(self, symbol, timeframe, count):
+                self.calls.append(timeframe)
+                return super().rates(symbol, timeframe, count)
+
+        gateway = TrackingGateway()
+        MarketDataEngine(gateway, history_bars=220).snapshot("EURUSD", "forex")
+        self.assertEqual(gateway.calls.count("M3"), 1)
     def test_engines_have_independent_weights_and_thresholds(self):
         self.assertNotEqual(ForexLearningEngine.TIME_WEIGHTS, IndicesLearningEngine.TIME_WEIGHTS)
         self.assertNotEqual(IndicesLearningEngine.TIME_WEIGHTS, MetalsLearningEngine.TIME_WEIGHTS)
@@ -62,7 +76,8 @@ class Phase2MarketIntelligenceTests(unittest.TestCase):
         from cipherfx_platform import runtime
         source = inspect.getsource(runtime)
         self.assertNotIn("ScoringEngine", source)
-        self.assertNotIn("LearningEngine", source)
+        self.assertIn("LearningEngine", source)
+        self.assertNotIn("MarketIntelligenceEngine", source)
         for engine in (ForexLearningEngine, IndicesLearningEngine, MetalsLearningEngine):
             source = inspect.getsource(engine)
             self.assertNotIn("ScoringEngine", source)
@@ -72,7 +87,7 @@ class Phase2MarketIntelligenceTests(unittest.TestCase):
         snapshot = MarketDataEngine(SnapshotGateway(), history_bars=220).snapshot("EURUSD", "forex")
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            router = MarketIntelligenceEngine(db)
+            router = LearningEngine(db)
             proposal = router.propose(snapshot)
             self.assertEqual(router.last_report["engine"], "FOREX")
             self.assertEqual(set(router.last_report["scores"]), {"BUY", "SELL"})

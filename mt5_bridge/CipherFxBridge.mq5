@@ -27,19 +27,19 @@ input int TickFileMilliseconds = 250;
 bool EnableWebSocketTickEvents = true;
 input string WebSocketHost = "127.0.0.1";
 input int WebSocketPort = 8765;
-input int SlippagePoints = 20;
+int SlippagePoints = 20;
 input int MaxRateSymbolsPerCycle = 2;
 input int RateCycleMilliseconds = 15000;
 input bool ExportExtraTimeframes = true;
 input double MinLotSize = 0.00;
 input double TargetProfitPerTradeUSD = 0.00;
 input double DailyProfitTargetUSD = 1000.00;
-input double DailyLossLimitUSD = 1000.00;
-input int MaxPyramidTrades = 10;
-input int MaxPyramidTradesPerSignal = 10;
+double DailyLossLimitUSD = 3000.00;
+int MaxPyramidTrades = 10;
+int MaxPyramidTradesPerSignal = 10;
 input bool AllowSameCandlePyramids = true;
-input int MaxOpenTradesTotal = 30;
-input int MaxTradesPerDay = 60;
+int MaxOpenTradesTotal = 30;
+int MaxTradesPerDay = 100;
 input bool StopTradingAfterDailyTarget = false;
 input bool StopTradingAfterDailyLossLimit = true;
 input bool UseNetProfitTarget = false;
@@ -287,11 +287,44 @@ bool ShouldLogBridgeExportCycle()
    return false;
 }
 
+void LoadRuntimeConfig()
+{
+   string path = BRIDGE_DIR + "\\runtime_config.ini";
+   int handle = FileOpen(path, FILE_READ | FILE_TXT | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      PrintFormat("CipherFX runtime_config unavailable path=%s using compiled defaults", path);
+      return;
+   }
+   while(!FileIsEnding(handle))
+   {
+      string line = FileReadString(handle);
+      int separator = StringFind(line, "=");
+      if(separator <= 0) continue;
+      string key = StringSubstr(line, 0, separator);
+      string value = StringSubstr(line, separator + 1);
+      if(key == "DailyLossLimitUSD") DailyLossLimitUSD = StringToDouble(value);
+      else if(key == "MaxDailyTrades") MaxTradesPerDay = (int)StringToInteger(value);
+      else if(key == "MaxOpenTrades") MaxOpenTradesTotal = (int)StringToInteger(value);
+      else if(key == "MaxPyramidTrades")
+      {
+         MaxPyramidTrades = (int)StringToInteger(value);
+         MaxPyramidTradesPerSignal = (int)MaxPyramidTrades;
+      }
+      else if(key == "SlippagePoints") SlippagePoints = (int)StringToInteger(value);
+   }
+   FileClose(handle);
+   PrintFormat("CipherFX runtime_config loaded loss=%.2f daily=%d open=%d pyramid=%d slippage=%d",
+               DailyLossLimitUSD, MaxTradesPerDay, MaxOpenTradesTotal,
+               MaxPyramidTrades, SlippagePoints);
+}
+
 int OnInit()
 {
    FolderCreate(BRIDGE_DIR);
    FolderCreate(COMMANDS_DIR);
    FolderCreate(RESULTS_DIR);
+   LoadRuntimeConfig();
    MathSrand((int)(GetTickCount64() & 0x7FFFFFFF));
    // Give the Python listener time to bind after the terminal process starts.
    // This is startup-only; subsequent tick delivery remains event-driven.
@@ -1082,6 +1115,7 @@ void ExportPriorityRates(bool export_m1, bool export_m5_m15)
       {
          ExportRatesIfChanged(symbol, PERIOD_M5, "M5");
          ExportRatesIfChanged(symbol, PERIOD_M15, "M15");
+         ExportRatesIfChanged(symbol, PERIOD_M3, "M3");
       }
       // Service broker commands between symbol exports so geometry and orders
       // are not held behind the full priority-rate batch.
@@ -1214,6 +1248,13 @@ void ExportSymbols(bool export_ticks)
          PrintFormat("CipherFX bridge export symbol=%s visible=1 tick=%s M1=%s M5=%s M15=%s broker_time=%s local_time=%s", visibleSymbol, tickOk ? "OK" : "FAIL", m1Ok ? "OK" : "FAIL", m5Ok ? "OK" : "FAIL", m15Ok ? "OK" : "FAIL", TimeToString(TimeCurrent(), TIME_DATE|TIME_SECONDS), TimeToString(TimeLocal(), TIME_DATE|TIME_SECONDS));
       if(ExportExtraTimeframes)
       {
+         // The active engines score the complete context snapshot. Keep the
+         // slower context files current without putting history work on the
+         // priority tick/order path.
+         ExportRatesIfChanged(visibleSymbol, PERIOD_MN1, "MN1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_W1, "W1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_D1, "D1");
+         ExportRatesIfChanged(visibleSymbol, PERIOD_M30, "M30");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H1, "H1");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H4, "H4");
       }
@@ -1278,6 +1319,8 @@ bool ExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
       if(timeframe == PERIOD_M1)
          export_count = MathMin(export_count, 32);
       else if(timeframe == PERIOD_M5)
+         export_count = MathMin(export_count, 100);
+      else if(timeframe == PERIOD_M3)
          export_count = MathMin(export_count, 100);
       else if(timeframe == PERIOD_M15)
          export_count = MathMin(export_count, 100);

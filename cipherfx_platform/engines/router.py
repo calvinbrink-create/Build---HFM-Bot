@@ -7,8 +7,8 @@ from .indices import IndicesLearningEngine
 from .metals import MetalsLearningEngine
 
 
-class MarketIntelligenceEngine:
-    """Routes each outcome back to only the engine that originated it."""
+class LearningEngine:
+    """Single proposal authority over the independent asset learning engines."""
 
     def __init__(self, database: DatabaseLayer | None = None):
         self.engines = {

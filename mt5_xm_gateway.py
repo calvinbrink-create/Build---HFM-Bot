@@ -103,10 +103,26 @@ class MT5Gateway:
                 raise RuntimeError(f"MT5 login failed: {mt5.last_error()}")
         self.mt5 = mt5
 
+    def _write_bridge_runtime_config(self) -> None:
+        rows = {
+            "DailyLossLimitUSD": self.config.daily_loss_limit_usd,
+            "MaxDailyTrades": self.config.max_daily_trades,
+            "MaxOpenTrades": self.config.max_open_trades,
+            "MaxTradesPerSymbol": self.config.max_trades_per_symbol,
+            "MaxPyramidTrades": self.config.max_pyramid_trades,
+            "SlippagePoints": self.config.slippage_points,
+            "Magic": self.config.magic,
+        }
+        path = self.config.bridge_dir / "runtime_config.ini"
+        temporary = Path(str(path) + ".tmp")
+        temporary.write_text(chr(10).join(f"{key}={value}" for key, value in rows.items()) + chr(10))
+        temporary.replace(path)
+
     def _connect_bridge(self) -> None:
         self.config.bridge_dir.mkdir(parents=True, exist_ok=True)
         self.config.commands_dir.mkdir(parents=True, exist_ok=True)
         self.config.results_dir.mkdir(parents=True, exist_ok=True)
+        self._write_bridge_runtime_config()
         self._write_bridge_symbol_universe()
         deadline = time.time() + 90
         while time.time() < deadline:
@@ -947,6 +963,7 @@ class MT5Gateway:
         text = str(timeframe or "M15").upper()
         aliases = {
             "1": "M1", "M1": "M1",
+            "3": "M3", "M3": "M3",
             "5": "M5", "M5": "M5",
             "15": "M15", "M15": "M15",
             "30": "M30", "M30": "M30",
@@ -954,12 +971,20 @@ class MT5Gateway:
             "240": "H4", "H4": "H4",
             "1440": "D1", "D1": "D1",
             "10080": "W1", "W1": "W1",
-            "MN1": "MN", "MN": "MN",
+            "MN1": "MN1", "MN": "MN1",
         }
-        return aliases.get(text, "M15")
+        label = aliases.get(text)
+        if label is None:
+            raise ValueError(f"Unsupported active timeframe: {timeframe}")
+        return label
 
     def _native_timeframe(self, label: str):
         assert self.mt5 is not None
+        if label == "M3":
+            native_m3 = getattr(self.mt5, "TIMEFRAME_M3", None)
+            if native_m3 is None:
+                raise RuntimeError("MT5 Python package does not expose native TIMEFRAME_M3")
+            return native_m3
         mapping = {
             "M1": self.mt5.TIMEFRAME_M1,
             "M5": self.mt5.TIMEFRAME_M5,
@@ -969,7 +994,7 @@ class MT5Gateway:
             "H4": self.mt5.TIMEFRAME_H4,
             "D1": self.mt5.TIMEFRAME_D1,
             "W1": self.mt5.TIMEFRAME_W1,
-            "MN": self.mt5.TIMEFRAME_MN1,
+            "MN1": self.mt5.TIMEFRAME_MN1,
         }
         return mapping[label]
 

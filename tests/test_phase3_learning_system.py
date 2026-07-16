@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import inspect
 import json
 import sqlite3
@@ -11,7 +12,7 @@ from types import SimpleNamespace
 
 from cipherfx_platform.contracts import Candle, ExecutionResult, Frame, MarketSnapshot, Tick, TradeProposal
 from cipherfx_platform.database import DatabaseLayer
-from cipherfx_platform.engines import MarketIntelligenceEngine
+from cipherfx_platform.engines import LearningEngine
 from cipherfx_platform.execution import ExecutionEngine
 from cipherfx_platform.feedback import LearningFeedbackEngine
 from cipherfx_platform.management import TradeManagementEngine
@@ -102,7 +103,7 @@ class Phase3LearningSystemTests(unittest.TestCase):
     def test_closed_trade_updates_only_originating_engine(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            intelligence = MarketIntelligenceEngine(db)
+            intelligence = LearningEngine(db)
             feedback = LearningFeedbackEngine(db, intelligence.record_outcome)
             metrics = {
                 "spread": 1.2,
@@ -139,7 +140,7 @@ class Phase3LearningSystemTests(unittest.TestCase):
     def test_expired_proposal_is_recorded_without_mutating_proposal_payload(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            intelligence = MarketIntelligenceEngine(db)
+            intelligence = LearningEngine(db)
             feedback = LearningFeedbackEngine(db, intelligence.record_outcome)
             proposal = make_proposal("expired-fx")
             db.save_proposal(proposal)
@@ -214,7 +215,7 @@ class Phase3LearningSystemTests(unittest.TestCase):
     def test_closed_broker_position_reaches_feedback_once(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            intelligence = MarketIntelligenceEngine(db)
+            intelligence = LearningEngine(db)
             feedback = LearningFeedbackEngine(db, intelligence.record_outcome)
             proposal = make_proposal("filled-fx")
             db.save_proposal(proposal)
@@ -243,6 +244,48 @@ class Phase3LearningSystemTests(unittest.TestCase):
                     (proposal.proposal_id,),
                 ).fetchone()[0]
             self.assertEqual(status, "CLOSED")
+
+    def test_feedback_is_idempotent_and_engine_scoped(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            learning = LearningEngine(db)
+            feedback = LearningFeedbackEngine(db, learning.record_outcome)
+            metrics = {
+                "spread": 1.0,
+                "volatility": 1.4,
+                "session": "New York",
+                "entry_timing_seconds": 1.2,
+                "exit_timing_seconds": 20.0,
+                "holding_time_seconds": 90.0,
+                "drawdown": -3.0,
+                "profit": 15.0,
+                "false_positive": False,
+                "false_negative": False,
+                "missed_trade": False,
+            }
+            feedback.record_closed_trade("same-trade", "EURUSD", "BUY", 15.0, 10.0, "TP", asset_class="forex", metrics=metrics)
+            feedback.record_closed_trade("same-trade", "EURUSD", "BUY", 15.0, 10.0, "TP", asset_class="forex", metrics=metrics)
+            with sqlite3.connect(db.path) as conn:
+                history = conn.execute("SELECT COUNT(*) FROM trade_history").fetchone()[0]
+                learning_rows = conn.execute("SELECT COUNT(*) FROM learning_metrics").fetchone()[0]
+                performance = conn.execute("SELECT COUNT(*) FROM engine_performance WHERE engine='FOREX'").fetchone()[0]
+                other_engines = conn.execute("SELECT COUNT(*) FROM engine_performance WHERE engine<>'FOREX'").fetchone()[0]
+            self.assertEqual((history, learning_rows, performance, other_engines), (1, 1, 1, 0))
+
+    def test_database_does_not_replace_an_immutable_proposal(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            original = make_proposal("immutable")
+            altered = replace(original, entry_price=9.99, score=1.0, reasoning=("altered",))
+            db.save_proposal(original)
+            db.save_proposal(altered)
+            with sqlite3.connect(db.path) as conn:
+                row = conn.execute(
+                    "SELECT entry_price,score,payload_json FROM trade_proposals WHERE proposal_id='immutable'"
+                ).fetchone()
+            self.assertEqual(row[0], original.entry_price)
+            self.assertEqual(row[1], original.score)
+            self.assertNotIn("altered", row[2])
 
     def test_management_does_not_contain_analysis_authority(self):
         source = inspect.getsource(TradeManagementEngine)
