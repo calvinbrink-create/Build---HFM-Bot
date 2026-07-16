@@ -577,11 +577,14 @@ export function TradingDashboard() {
 
   useEffect(() => {
     let cancelled = false;
+    let inFlight = false;
     async function loadLive() {
+      if (cancelled || inFlight) return;
+      inFlight = true;
       try {
         setApiError("");
         const sessionToken = await ensureToken();
-        const [nextStatus, nextTerminal, nextSymbols, nextTrades, nextOrders, nextScanner, nextAudit, nextMarketHours, nextVisual, nextIntelligence, nextTodayDeals, nextWeekDeals, nextMonthDeals] = await Promise.all([
+        const [nextStatus, nextTerminal, nextSymbols, nextOrders, nextScanner, nextAudit, nextMarketHours, nextVisual, nextIntelligence, nextTodayDeals, nextWeekDeals, nextMonthDeals] = await Promise.all([
           h("GET", "/status", null, sessionToken).catch((error) => {
             setApiError(describeApiError(error, "Status MT5 feed unavailable"));
             return null;
@@ -591,7 +594,6 @@ export function TradingDashboard() {
             return null;
           }),
           h("GET", "/symbols", null, sessionToken).catch(() => []),
-          h("GET", "/trades?limit=1&include_history=false", null, sessionToken).catch(() => []),
           h("GET", "/orders", null, sessionToken).catch(() => []),
           h("GET", "/scanner", null, sessionToken).catch(() => null),
           h("GET", "/audit/summary", null, sessionToken).catch(() => null),
@@ -630,9 +632,7 @@ export function TradingDashboard() {
           time: formatDateTimeLabel(row.time_setup || row.time) || row.time_setup || row.time || "Pending",
         })));
         setPositions(normalizePositionRows(nextTerminal?.positions));
-        const closedTradeRows = Array.isArray(nextMonthDeals?.deals) && nextMonthDeals.deals.length
-          ? nextMonthDeals.deals
-          : (nextTrades || []);
+        const closedTradeRows = Array.isArray(nextMonthDeals?.deals) ? nextMonthDeals.deals : [];
         setDeals(closedTradeRows.map((row, index) => {
           const openedAt = row.opened_at || "";
           const closedAt = row.closed_at || row.trade_date || "";
@@ -662,10 +662,12 @@ export function TradingDashboard() {
         }));
       } catch (error) {
         if (!cancelled) setApiError(describeApiError(error, "MT5 API load failed"));
+      } finally {
+        inFlight = false;
       }
     }
     loadLive();
-    const id = window.setInterval(loadLive, 10000);
+    const id = window.setInterval(loadLive, 3000);
     return () => {
       cancelled = true;
       window.clearInterval(id);
@@ -1348,6 +1350,28 @@ export function TradingDashboard() {
 
   function renderSnapshotWorkspace(mode = "desktop") {
     const compact = mode === "mobile";
+    const go = (tab, group) => {
+      if (group) {
+        setSymbolGroupFilter(group);
+        setMobileGroupFilter(group);
+      }
+      if (!compact) {
+        setDesktopTab(tab);
+        return;
+      }
+      if (tab === "watchlist") {
+        setWatchlistMode("market");
+        setMobileTab("quotes");
+      } else if (tab === "positions") {
+        setMobileHistoryTab("positions");
+        setMobileTab("history");
+      } else if (tab === "history") {
+        setMobileHistoryTab("deals");
+        setMobileTab("history");
+      } else {
+        setMobileTab(tab);
+      }
+    };
     const ticks = Array.isArray(marketFeed?.ticks) ? marketFeed.ticks : [];
     const liveTicks = ticks.filter((row) => row.status === "LIVE_DATA" && row.bid !== null && row.ask !== null);
     const staleTicks = ticks.filter((row) => row.status === "STALE_MARKET_DATA");
@@ -1399,7 +1423,7 @@ export function TradingDashboard() {
               <div><span>Open positions</span><strong>{count(positions.length)}</strong></div>
               <div><span>Free margin</span><strong>{money(terminal?.account?.free_margin)}</strong></div>
             </div>
-            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("positions")}>Open position monitor <ChevronDown size={14} /></button>
+            <button className="snapshot-link" type="button" onClick={() => go("positions")}>Open position monitor <ChevronDown size={14} /></button>
           </section>
           <section className="snapshot-panel">
             <div className="snapshot-panel-head"><strong>Trade record</strong><span>SQLite reconciled history</span></div>
@@ -1410,7 +1434,7 @@ export function TradingDashboard() {
                 ["This month", dealSummaries.month],
               ].map(([label, row]) => <div key={label}><span>{label}</span><strong>{count(row?.total_trades)}</strong><em>{money(row?.pnl)}</em></div>)}
             </div>
-            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("history")}>Open history <ChevronDown size={14} /></button>
+            <button className="snapshot-link" type="button" onClick={() => go("history")}>Open history <ChevronDown size={14} /></button>
           </section>
           <section className="snapshot-panel snapshot-decision">
             <div className="snapshot-panel-head"><strong>Current decision path</strong><span>Live scan records</span></div>
@@ -1421,20 +1445,20 @@ export function TradingDashboard() {
                 <div className="snapshot-stage-line">{["H4", "H1", "M15", "M5", "ORDER"].map((stage) => <span key={stage} className={selectedSignal.scan_progress?.find((item) => item.key === stage)?.state || "inactive"}>{stage}</span>)}</div>
               </div>
             ) : <div className="snapshot-empty">No current scored scan row is available from SQLite.</div>}
-            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("scanner")}>Open live scan <ChevronDown size={14} /></button>
+            <button className="snapshot-link" type="button" onClick={() => go("scanner")}>Open live scan <ChevronDown size={14} /></button>
           </section>
         </div>
         <section className="snapshot-panel snapshot-markets">
           <div className="snapshot-panel-head"><strong>Market coverage</strong><span>{count(liveSymbols.filter((item) => item.visible).length)} symbols confirmed by MT5</span></div>
-          <div className="snapshot-market-grid">{groups.map((item) => <button type="button" className="snapshot-market" key={item.group} onClick={() => { setSymbolGroupFilter(item.group); setDesktopTab("watchlist"); }}><span>{item.group}</span><strong>{item.live}/{item.total || "--"}</strong><em>{item.live ? "quotes live" : "no fresh quotes"}</em></button>)}</div>
+          <div className="snapshot-market-grid">{groups.map((item) => <button type="button" className="snapshot-market" key={item.group} onClick={() => go("watchlist", item.group)}><span>{item.group}</span><strong>{item.live}/{item.total || "--"}</strong><em>{item.live ? "quotes live" : "no fresh quotes"}</em></button>)}</div>
         </section>
         <section className="snapshot-panel snapshot-next">
           <div className="snapshot-panel-head"><strong>Read the dashboard in order</strong><span>Each view has one job</span></div>
           <div className="snapshot-route">
-            <button type="button" onClick={() => setDesktopTab("scanner")}><b>1</b><span><strong>Scan</strong><em>See the current symbol story and the exact stage.</em></span></button>
-            <button type="button" onClick={() => setDesktopTab("intelligence")}><b>2</b><span><strong>Intel</strong><em>See planning, learning and validation records.</em></span></button>
-            <button type="button" onClick={() => setDesktopTab("positions")}><b>3</b><span><strong>Positions</strong><em>See what MT5 actually has open now.</em></span></button>
-            <button type="button" onClick={() => setDesktopTab("history")}><b>4</b><span><strong>History</strong><em>See closed trades and recorded outcomes.</em></span></button>
+            <button type="button" onClick={() => go("scanner")}><b>1</b><span><strong>Scan</strong><em>See the current symbol story and the exact stage.</em></span></button>
+            <button type="button" onClick={() => go("intelligence")}><b>2</b><span><strong>Intel</strong><em>See planning, learning and validation records.</em></span></button>
+            <button type="button" onClick={() => go("positions")}><b>3</b><span><strong>Positions</strong><em>See what MT5 actually has open now.</em></span></button>
+            <button type="button" onClick={() => go("history")}><b>4</b><span><strong>History</strong><em>See closed trades and recorded outcomes.</em></span></button>
           </div>
         </section>
       </div>
@@ -1463,7 +1487,7 @@ export function TradingDashboard() {
       items: liveSymbols.filter((item) => item.market === label),
     }));
     return (
-      <div className={"scanner-workspace" + (compact ? " mobile-scanner" : "")}>
+      <div className={"scanner-workspace snapshot-like-workspace" + (compact ? " mobile-scanner" : "")}>
         <div className="workspace-header scanner-header">
           <div><h3>Live Scan</h3><span>Live MT5 symbols · {compactCount(scannerSummary.tracked_symbols || liveSymbols.length)}</span></div>
           <div className={"scanner-state " + (marketClosed ? "blocked" : actionable > 0 ? "active" : "")}><Activity size={16} /><strong>{currentGate}</strong></div>
@@ -1614,7 +1638,7 @@ export function TradingDashboard() {
       return String(value || "No price area recorded");
     };
     return (
-      <div className={"intelligence-workspace" + (compact ? " mobile-intelligence" : "")}>
+      <div className={"intelligence-workspace snapshot-like-workspace" + (compact ? " mobile-intelligence" : "")}>
         <div className="workspace-header intelligence-header">
           <div><h3>Planning & Learning</h3><span>What MT5 planned, learned and recorded</span></div>
           <div className="intelligence-source"><Sparkles size={16} /><strong>LIVE MT5</strong><span>Mode: {humanStatus(overview.mode || "SHADOW")}</span></div>
@@ -1690,7 +1714,7 @@ export function TradingDashboard() {
     const sessions = market.sessions || [];
     const anyMarketOpen = market.global_status === "OPEN";
     return (
-      <div className="market-hours-workspace">
+      <div className="market-hours-workspace snapshot-like-workspace">
         <div className="workspace-header"><div><h3>Market Hours</h3><span>Live session status - SAST</span></div><div className={"market-hours-state " + (anyMarketOpen ? "open" : "closed")}><span className="market-status-dot" />{anyMarketOpen ? "MARKETS OPEN" : "MARKETS CLOSED"}</div></div>
         <div className="market-session-grid">{sessions.map((session) => <div className={"market-session-row " + (session.open ? "open" : "closed")} key={session.id}><span className="market-status-dot" /><div><strong>{session.label}</strong><em>{session.region}</em></div><span className="market-session-hours">{session.hours_sast}</span><span className="market-session-status">{session.open ? "OPEN" : "CLOSED"}<small>{session.open ? "live" : session.reason}</small></span><span className="market-next-open">Next: {session.next_open_sast}</span></div>)}</div>
         <div className="market-hours-foot">Current VPS time: {formatDateTimeLabel(market.now_sast)} - Schedule adjusts for regional daylight time and is displayed in SAST.</div>
@@ -1702,7 +1726,7 @@ export function TradingDashboard() {
   function renderDeskUtilityPanel() {
     if (desktopTab === "calendar") {
       return (
-        <div className="info-panel">
+        <div className="info-panel snapshot-like-workspace">
           <h3>Market Sessions</h3>
           <p>Live session status for {selected.symbol || "the selected market"}. Times are SAST.</p>
           <div className="info-list">
@@ -1735,7 +1759,7 @@ export function TradingDashboard() {
     }
     if (desktopTab === "news") {
       return (
-        <div className="info-panel">
+        <div className="info-panel snapshot-like-workspace">
           <h3>News</h3>
           <p>Live market headlines for {selected.symbol}.</p>
           <div className="info-list news-list">
@@ -1762,7 +1786,7 @@ export function TradingDashboard() {
     const currentCandle = replayCandles[cursor];
     const progress = replayCandles.length ? Math.round(((cursor + 1) / replayCandles.length) * 100) : 0;
     return (
-      <div className={"replay-workspace" + (compact ? " replay-mobile" : "")}>
+      <div className={"replay-workspace snapshot-like-workspace" + (compact ? " replay-mobile" : "")}>
         <div className="workspace-header replay-header">
           <div>
             <h3>Trade Replay</h3>
@@ -1814,7 +1838,7 @@ export function TradingDashboard() {
 
   function renderTradeWorkspace(mode = "chart") {
     return (
-      <div className={`chart-and-trade${mode === "watchlist" ? " watchlist-focus" : ""}${mode === "trade" ? " trade-focus" : ""}`}>
+      <div className={`chart-and-trade snapshot-like-workspace${mode === "watchlist" ? " watchlist-focus" : ""}${mode === "trade" ? " trade-focus" : ""}`}>
         <div className="chart-panel">
           <div className="order-banner">
             <button type="button" className="price-box sell" disabled={busyAction === "trade-sell"} onClick={() => submitTrade("sell")}>
@@ -1906,7 +1930,7 @@ export function TradingDashboard() {
 
   function renderWatchlistWorkspace() {
     return (
-      <div className="workspace-card">
+      <div className="workspace-card snapshot-like-workspace">
         <div className="workspace-header">
           <h3>Market Watch</h3>
           <span>{activeWatchlist.length} active / {liveSymbols.length} available</span>
@@ -1959,11 +1983,11 @@ export function TradingDashboard() {
 
   function renderPositionsWorkspace() {
     return (
-      <div className="workspace-card positions-workspace">
+      <div className="workspace-card positions-workspace snapshot-like-workspace">
         <div className="workspace-header">
           <div>
             <h3>Open Positions</h3>
-            <span>{positions.length} live position(s) · tracking MT5 open P&L by symbol</span>
+            <span>{positions.length} live position(s) - MT5 bridge snapshot - live account poll</span>
           </div>
           <strong className={totals.openPnl >= 0 ? "pnl-profit" : "pnl-loss"}>{formatSignedUsd(totals.openPnl)}</strong>
         </div>
@@ -2037,10 +2061,10 @@ export function TradingDashboard() {
 
   function renderOrdersWorkspace() {
     return (
-      <div className="workspace-card">
+      <div className="workspace-card snapshot-like-workspace">
         <div className="workspace-header">
           <h3>Pending Orders</h3>
-          <span>{orders.length} order(s)</span>
+          <span>{orders.length} order(s) - MT5 bridge snapshot</span>
         </div>
         <div className="workspace-stack">
           {orders.length ? orders.map((row) => (
@@ -2082,10 +2106,10 @@ export function TradingDashboard() {
 
   function renderHistoryWorkspace() {
     return (
-      <div className="workspace-card">
+      <div className="workspace-card snapshot-like-workspace">
         <div className="workspace-header">
           <h3>Deals History</h3>
-          <span>{deals.length} deal row(s)</span>
+          <span>{deals.length} closed deal row(s) - SQLite reconciled MT5 history</span>
         </div>
         {renderDealPeriodSummary()}
         <div className="workspace-stack">

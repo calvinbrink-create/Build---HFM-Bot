@@ -3860,3 +3860,132 @@ button {
   .snapshot-panel { padding: 11px; }
   .snapshot-value-grid strong { font-size: 15px; }
 }
+
+
+/* Snapshot system applied to every workspace */
+.snapshot-like-workspace {
+  min-width: 0;
+  padding: 14px;
+  border: 1px solid var(--border);
+  border-radius: 7px;
+  background: rgba(14, 18, 24, .88);
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .12);
+}
+.snapshot-like-workspace > .workspace-header {
+  min-height: 42px;
+  margin: 0;
+  padding: 0 0 11px;
+  border-bottom: 1px solid rgba(74, 85, 101, .46);
+}
+.snapshot-like-workspace > .workspace-header h3,
+.snapshot-like-workspace .workspace-header h3 {
+  margin: 0;
+  color: var(--text);
+  font-size: 16px;
+  letter-spacing: .01em;
+}
+.snapshot-like-workspace > .workspace-header span,
+.snapshot-like-workspace .workspace-header span {
+  color: var(--muted);
+  font-size: 10px;
+}
+.snapshot-like-workspace .scanner-card,
+.snapshot-like-workspace .position-metric,
+.snapshot-like-workspace .info-card,
+.snapshot-like-workspace .market-session-row,
+.snapshot-like-workspace .position-card,
+.snapshot-like-workspace .replay-trade-row,
+.snapshot-like-workspace .scanner-story-row,
+.snapshot-like-workspace .intelligence-card,
+.snapshot-like-workspace .plan-row,
+.snapshot-like-workspace .learning-row {
+  border: 1px solid rgba(74, 85, 101, .55);
+  border-radius: 5px;
+  background: rgba(7, 9, 13, .62);
+}
+.snapshot-like-workspace .scanner-card,
+.snapshot-like-workspace .position-metric {
+  padding: 11px;
+}
+.snapshot-like-workspace .scanner-card strong,
+.snapshot-like-workspace .position-metric strong {
+  font-size: 19px;
+}
+.snapshot-like-workspace .scanner-section-title {
+  margin-top: 0;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(74, 85, 101, .36);
+}
+.snapshot-like-workspace .scanner-story-row,
+.snapshot-like-workspace .position-card,
+.snapshot-like-workspace .replay-trade-row {
+  box-shadow: none;
+}
+.snapshot-like-workspace .empty-state {
+  min-height: 48px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed rgba(126, 137, 154, .35);
+  border-radius: 5px;
+  color: var(--muted);
+  background: rgba(7, 9, 13, .42);
+}
+.snapshot-like-workspace button:not(.icon-btn):not(.toolbar-btn),
+.snapshot-like-workspace .info-card {
+  transition: border-color .16s ease, background .16s ease, transform .16s ease;
+}
+.snapshot-like-workspace button:not(.icon-btn):not(.toolbar-btn):hover,
+.snapshot-like-workspace .info-card:hover {
+  border-color: rgba(244, 179, 23, .7);
+  background: rgba(244, 179, 23, .07);
+  transform: translateY(-1px);
+}
+.snapshot-like-workspace .market-hours-foot,
+.snapshot-like-workspace .workspace-source,
+.snapshot-like-workspace .replay-summary,
+.snapshot-like-workspace .intelligence-footer {
+  color: var(--muted);
+  font-size: 10px;
+}
+.chart-and-trade.snapshot-like-workspace {
+  padding: 0;
+  overflow: hidden;
+}
+.chart-and-trade.snapshot-like-workspace .chart-panel,
+.chart-and-trade.snapshot-like-workspace .ticket-panel {
+  border-color: rgba(74, 85, 101, .55);
+  background: rgba(7, 9, 13, .42);
+}
+.market-hours-workspace.snapshot-like-workspace,
+.replay-workspace.snapshot-like-workspace {
+  display: grid;
+  gap: 12px;
+}
+.scanner-workspace.snapshot-like-workspace,
+.intelligence-workspace.snapshot-like-workspace {
+  display: grid;
+  gap: 12px;
+}
+@media (max-width: 760px) {
+  .snapshot-like-workspace {
+    padding: 11px;
+    border-radius: 6px;
+  }
+  .snapshot-like-workspace > .workspace-header {
+    min-height: 38px;
+    padding-bottom: 9px;
+  }
+  .snapshot-like-workspace > .workspace-header h3,
+  .snapshot-like-workspace .workspace-header h3 {
+    font-size: 14px;
+  }
+  .snapshot-like-workspace .scanner-card strong,
+  .snapshot-like-workspace .position-metric strong {
+    font-size: 16px;
+  }
+  .snapshot-like-workspace .scanner-metrics,
+  .snapshot-like-workspace .position-tracker-grid,
+  .snapshot-like-workspace .replay-summary {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
