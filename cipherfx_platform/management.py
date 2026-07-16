@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import statistics
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -81,6 +82,16 @@ class TradeManagementEngine:
         return (float(position.price_open) - float(position.price_current)) / risk
 
     @staticmethod
+    def _price_volatility(history: list[float]) -> float | None:
+        if len(history) < 3:
+            return None
+        changes = [
+            float(history[index]) - float(history[index - 1])
+            for index in range(1, len(history))
+        ]
+        return float(statistics.pstdev(changes)) if changes else None
+
+    @staticmethod
     def _rank(current_r: float | None, drawdown_r: float, spread_jump: bool) -> str:
         if current_r is None:
             return "CRITICAL"
@@ -126,6 +137,9 @@ class TradeManagementEngine:
         state["last_action"] = action
         state["last_action_reason"] = reason
         state["last_action_at"] = datetime.now(timezone.utc).isoformat()
+        action_log = list(state.get("action_log", []))
+        action_log.append(dict(payload, action_at=state["last_action_at"]))
+        state["action_log"] = action_log[-100:]
 
     def _close(self, position, state: dict[str, Any], reason: str, metrics: dict[str, Any]) -> None:
         try:
@@ -207,25 +221,37 @@ class TradeManagementEngine:
             )
 
     def _initial_state(self, position, now: datetime) -> dict[str, Any]:
+        baseline = self.database.position_baseline(int(position.ticket)) or {}
+        entry = float(baseline.get("entry_price") or position.price_open)
+        initial_sl = float(baseline.get("stop_loss") or position.sl)
+        initial_tp = float(baseline.get("take_profit") or position.tp)
         return {
             "ticket": int(position.ticket),
             "symbol": position.symbol,
             "side": position.direction,
-            "initial_entry": float(position.price_open),
-            "initial_sl": float(position.sl),
-            "initial_tp": float(position.tp),
+            "initial_entry": entry,
+            "initial_sl": initial_sl,
+            "initial_tp": initial_tp,
+            "initial_risk_amount": float(baseline.get("initial_risk") or 0.0),
             "first_seen_at": now.isoformat(),
             "last_seen_at": now.isoformat(),
             "last_price": float(position.price_current),
+            "price_history": [float(position.price_current)],
             "last_spread_points": None,
             "mfe_r": 0.0,
             "mae_r": 0.0,
             "last_managed_sl": float(position.sl),
             "close_requested": False,
             "last_action": "NONE",
+            "action_log": [],
         }
 
-    def _monitor_position(self, position, total_positions: int) -> dict[str, Any]:
+    def _monitor_position(
+        self,
+        position,
+        total_positions: int,
+        portfolio: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         now = datetime.now(timezone.utc)
         state = self.database.load_management_state(int(position.ticket))
         if not state:
@@ -248,11 +274,49 @@ class TradeManagementEngine:
         peak_r = max(float(state.get("mfe_r", 0.0)), float(current_r or 0.0))
         adverse_r = min(float(state.get("mae_r", 0.0)), float(current_r or 0.0))
         drawdown_r = max(0.0, peak_r - float(current_r or 0.0))
+        price_history = [
+            float(value) for value in state.get("price_history", [])
+            if isinstance(value, (int, float))
+        ]
+        price_history.append(float(position.price_current))
+        price_history = price_history[-120:]
+        volatility = self._price_volatility(price_history)
+        previous_r = state.get("last_r")
+        velocity_r = (
+            float(current_r) - float(previous_r)
+            if current_r is not None and previous_r is not None
+            else 0.0
+        )
+        previous_velocity = float(state.get("last_velocity_r", 0.0) or 0.0)
+        profit_acceleration_r = velocity_r - previous_velocity
+        recent_changes = [
+            price_history[index] - price_history[index - 1]
+            for index in range(max(1, len(price_history) - 4), len(price_history))
+        ]
+        favorable_changes = [
+            change if str(position.direction).upper() == "BUY" else -change
+            for change in recent_changes
+        ]
+        favorable_change_count = sum(change > 0 for change in favorable_changes)
+        trend_continuation = (
+            "FAVORABLE"
+            if favorable_changes and favorable_change_count >= len(favorable_changes) / 2
+            else "ADVERSE"
+            if favorable_changes
+            else "UNKNOWN"
+        )
         try:
             opened_at = position.time
             time_in_trade = max(0.0, (now - opened_at).total_seconds())
         except Exception:
             time_in_trade = 0.0
+        time_decay = (
+            "NEGATIVE"
+            if time_in_trade >= 300 and (current_r or 0.0) <= 0.0
+            else "POSITIVE"
+            if (current_r or 0.0) > 0.0
+            else "NEUTRAL"
+        )
 
         metrics = {
             "ticket": int(position.ticket),
@@ -275,9 +339,17 @@ class TradeManagementEngine:
             "price_risk_exposure": abs(float(position.price_open) - initial_sl) * float(position.volume),
             "portfolio_open_positions": total_positions,
             "session": self._session(now),
-            "volatility": None,
+            "volatility": volatility,
             "liquidity_event": "SPREAD_EXPANSION" if spread_jump else None,
-            "market_momentum": "POSITION_PRICE_ONLY",
+            "momentum": favorable_delta,
+            "market_momentum": trend_continuation,
+            "trend_continuation": trend_continuation,
+            "profit_velocity_r": velocity_r,
+            "profit_acceleration_r": profit_acceleration_r,
+            "time_decay": time_decay,
+            "market_behavior": "SPREAD_EXPANSION" if spread_jump else trend_continuation,
+            "initial_risk_amount": float(state.get("initial_risk_amount", 0.0) or 0.0),
+            "account": dict(portfolio or {}),
         }
         rank = self._rank(current_r, drawdown_r, spread_jump)
         metrics["rank"] = rank
@@ -334,6 +406,10 @@ class TradeManagementEngine:
                 "mfe_r": peak_r,
                 "mae_r": adverse_r,
                 "last_profit": float(position.profit),
+                "price_history": price_history,
+                "last_r": current_r,
+                "last_velocity_r": velocity_r,
+                "last_profit_acceleration_r": profit_acceleration_r,
                 "last_metrics": metrics,
                 "rank": rank,
                 "time_in_trade_seconds": time_in_trade,
@@ -345,7 +421,25 @@ class TradeManagementEngine:
 
     def monitor(self):
         positions = self.gateway.positions()
-        metrics = [self._monitor_position(position, len(positions)) for position in positions]
+        try:
+            account = self.gateway.account_info()
+            portfolio = {
+                "equity": float(getattr(account, "equity", 0.0) or 0.0),
+                "balance": float(getattr(account, "balance", 0.0) or 0.0),
+                "margin": float(getattr(account, "margin", 0.0) or 0.0),
+                "free_margin": float(getattr(account, "free_margin", 0.0) or 0.0),
+                "margin_level": float(getattr(account, "margin_level", 0.0) or 0.0),
+            }
+        except Exception:
+            portfolio = {}
+        metrics = [
+            self._monitor_position(position, len(positions), portfolio)
+            for position in positions
+        ]
+        portfolio["open_positions"] = len(positions)
+        portfolio["portfolio_heat_usd"] = sum(
+            float(item.get("initial_risk_amount", 0.0) or 0.0) for item in metrics
+        )
         self.database.status("open_positions", metrics)
         self.database.status("position_intelligence", metrics)
         self.database.event(
@@ -355,6 +449,8 @@ class TradeManagementEngine:
                 "risk_exposure_price": sum(
                     float(item.get("price_risk_exposure", 0.0) or 0.0) for item in metrics
                 ),
+                "portfolio_heat_usd": portfolio["portfolio_heat_usd"],
+                "portfolio": portfolio,
                 "critical": sum(item.get("rank") == "CRITICAL" for item in metrics),
                 "danger": sum(item.get("rank") == "DANGER" for item in metrics),
             },

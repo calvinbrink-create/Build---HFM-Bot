@@ -214,12 +214,20 @@ class LearningFeedbackEngine:
                     holding_time = max(0.0, (closed_at - opened).total_seconds())
             except ValueError:
                 pass
+            management_state = self.database.load_management_state(ticket) or {}
+            last_metrics = management_state.get("last_metrics") or {}
             metrics = self._metrics(
                 {
                     "holding_time_seconds": holding_time,
                     "entry_timing_seconds": entry_delay,
                     "exit_timing_seconds": holding_time,
                     "profit": pnl,
+                    "mfe_r": management_state.get("mfe_r"),
+                    "mae_r": abs(float(management_state.get("mae_r", 0.0) or 0.0)),
+                    "drawdown_r": last_metrics.get("drawdown_r"),
+                    "management_rank": management_state.get("rank"),
+                    "management_actions": management_state.get("action_log", []),
+                    "management_state_updated_at": management_state.get("last_seen_at"),
                 },
                 pnl,
             )
@@ -236,6 +244,7 @@ class LearningFeedbackEngine:
                 metrics=metrics,
             )
             self.database.mark_trade_closed(row["proposal_id"], closed_at, pnl)
+            self.database.mark_position_closed(ticket, closed_at, pnl)
             reconciled += 1
         if reconciled:
             self.database.event("CLOSED_TRADES_RECONCILED", {"count": reconciled})

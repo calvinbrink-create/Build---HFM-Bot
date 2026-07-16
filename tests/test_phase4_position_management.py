@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 import sqlite3
 import tempfile
 import unittest
@@ -8,7 +9,9 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
+from cipherfx_platform.contracts import ExecutionResult, TradeProposal
 from cipherfx_platform.database import DatabaseLayer
+from cipherfx_platform.feedback import LearningFeedbackEngine
 from cipherfx_platform.management import TradeManagementEngine
 from mt5_xm_gateway import MT5SymbolSpec
 
@@ -119,6 +122,162 @@ class Phase4PositionManagementTests(unittest.TestCase):
                     "SELECT payload_json FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ACTION'"
                 ).fetchone()[0]
             self.assertIn("UNMANAGED_POSITION_NO_STOP", reason)
+
+
+    def test_management_accumulates_intelligence_and_actions(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = ManagementGateway(self.position(current=1.05))
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            gateway.position.price_current = 1.08
+            gateway.position.profit = 8.0
+            manager.monitor()
+            with sqlite3.connect(db.path) as conn:
+                state_json = conn.execute(
+                    "SELECT state_json FROM position_management WHERE position_ticket=77"
+                ).fetchone()[0]
+            state = json.loads(state_json)
+            metrics = state["last_metrics"]
+            self.assertGreaterEqual(state["mfe_r"], 0.8)
+            self.assertIsNotNone(metrics["volatility"])
+            self.assertIn("momentum", metrics)
+            self.assertIn("profit_acceleration_r", metrics)
+            self.assertIn("trend_continuation", metrics)
+            self.assertGreaterEqual(len(state["price_history"]), 3)
+            self.assertGreaterEqual(len(state["action_log"]), 1)
+
+    def test_restart_restores_original_proposal_geometry(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            created = datetime.now(timezone.utc)
+            proposal = TradeProposal(
+                "proposal-77",
+                "TEST",
+                "forex",
+                "BUY",
+                1.0,
+                0.9,
+                1.3,
+                0.1,
+                "FOREX",
+                80.0,
+                {"context": 20.0},
+                created,
+                created + timedelta(minutes=5),
+                context={"engine": "FOREX"},
+                confidence=80.0,
+                probability=80.0,
+                risk_amount=10.0,
+            )
+            result = ExecutionResult(
+                "proposal-77",
+                "FILLED",
+                "TEST",
+                "BUY",
+                1.0,
+                order_ticket=100,
+                deal_ticket=101,
+                position_ticket=77,
+                fill_price=1.0,
+                filled_at=created,
+                initial_risk=10.0,
+            )
+            db.save_proposal(proposal)
+            db.save_execution_result(proposal, result)
+            gateway = ManagementGateway(self.position(sl=1.04, current=1.05))
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            with sqlite3.connect(db.path) as conn:
+                state_json = conn.execute(
+                    "SELECT state_json FROM position_management WHERE position_ticket=77"
+                ).fetchone()[0]
+            state = json.loads(state_json)
+            self.assertEqual(state["initial_entry"], 1.0)
+            self.assertEqual(state["initial_sl"], 0.9)
+            self.assertEqual(state["initial_tp"], 1.3)
+            self.assertEqual(state["initial_risk_amount"], 10.0)
+
+    def test_closed_trade_feedback_contains_management_history(self):
+        class ClosedGateway:
+            def positions(self):
+                return []
+
+            def deals_for_position(self, ticket):
+                return [
+                    SimpleNamespace(
+                        time_utc=(datetime.now(timezone.utc) - timedelta(seconds=30)).timestamp(),
+                        profit=12.0,
+                        swap=0.0,
+                        commission=0.0,
+                    )
+                ]
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            created = datetime.now(timezone.utc) - timedelta(minutes=2)
+            proposal = TradeProposal(
+                "proposal-closed",
+                "TEST",
+                "forex",
+                "BUY",
+                1.0,
+                0.9,
+                1.3,
+                0.1,
+                "FOREX",
+                80.0,
+                {"context": 20.0},
+                created,
+                created + timedelta(minutes=5),
+                context={"engine": "FOREX"},
+                confidence=80.0,
+                probability=80.0,
+                risk_amount=10.0,
+            )
+            result = ExecutionResult(
+                "proposal-closed",
+                "FILLED",
+                "TEST",
+                "BUY",
+                1.0,
+                order_ticket=110,
+                deal_ticket=111,
+                position_ticket=88,
+                fill_price=1.0,
+                filled_at=created,
+                initial_risk=10.0,
+            )
+            db.save_proposal(proposal)
+            db.save_execution_result(proposal, result)
+            closed_position = self.position()
+            closed_position.ticket = 88
+            db.save_position(closed_position)
+            db.save_management_state(
+                88,
+                {
+                    "mfe_r": 1.2,
+                    "mae_r": -0.3,
+                    "rank": "STRONG",
+                    "last_seen_at": datetime.now(timezone.utc).isoformat(),
+                    "last_metrics": {"drawdown_r": 0.2},
+                    "action_log": [{"action": "MODIFY_SL", "reason": "BREAK_EVEN"}],
+                },
+            )
+            feedback = LearningFeedbackEngine(db)
+            self.assertEqual(feedback.reconcile_closed_trades(ClosedGateway()), 1)
+            with sqlite3.connect(db.path) as conn:
+                row = conn.execute(
+                    "SELECT metrics_json FROM trade_history WHERE trade_id='proposal-closed'"
+                ).fetchone()[0]
+                state = conn.execute(
+                    "SELECT state FROM positions WHERE position_ticket=88"
+                ).fetchone()[0]
+            metrics = json.loads(row)
+            self.assertEqual(metrics["mfe_r"], 1.2)
+            self.assertEqual(metrics["management_rank"], "STRONG")
+            self.assertEqual(metrics["management_actions"][0]["action"], "MODIFY_SL")
+            self.assertEqual(state, "CLOSED")
 
 
 if __name__ == "__main__":

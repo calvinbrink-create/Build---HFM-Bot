@@ -491,6 +491,16 @@ class DatabaseLayer:
                 (str(proposal_id),),
             )
 
+    def mark_position_closed(self, position_ticket: int, closed_at: datetime, pnl: float) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                UPDATE positions SET state='CLOSED', profit=?, updated_at=?
+                WHERE position_ticket=?
+                """,
+                (float(pnl), closed_at.isoformat(), int(position_ticket)),
+            )
+
     def record_trade_history(
         self,
         trade_id: str,
@@ -605,6 +615,28 @@ class DatabaseLayer:
             }
             for r in rows
         ]
+
+    def position_baseline(self, position_ticket: int) -> dict[str, Any] | None:
+        """Return immutable entry geometry for an executed position."""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT e.proposal_id,e.initial_risk,p.entry_price,p.stop_loss,p.take_profit,
+                       p.asset_class,p.side
+                FROM executions e
+                JOIN trade_proposals p ON p.proposal_id=e.proposal_id
+                WHERE e.position_ticket=? AND e.status IN ('FILLED','CLOSED')
+                LIMIT 1
+                """,
+                (int(position_ticket),),
+            ).fetchone()
+        if not row:
+            return None
+        keys = (
+            "proposal_id", "initial_risk", "entry_price", "stop_loss",
+            "take_profit", "asset_class", "side",
+        )
+        return dict(zip(keys, row))
 
     def load_management_state(self, position_ticket: int) -> dict[str, Any] | None:
         with self._lock, self._connect() as conn:
