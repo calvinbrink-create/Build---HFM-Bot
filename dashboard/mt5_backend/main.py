@@ -560,10 +560,35 @@ def _optional_float(value):
     return number if math.isfinite(number) else None
 
 
+def _timestamp_age_seconds(value, fallback_mtime=None):
+    """Return age from the MT5 timestamp, falling back to file mtime only when
+    the bridge tick file does not carry a timestamp."""
+    parsed = None
+    try:
+        raw = str(value or "").strip()
+        numeric = float(raw) if raw else None
+        if numeric is not None and numeric > 1000000000:
+            # Bridge timestamps are Unix UTC epochs. Do not apply the
+            # dashboard's broker-date display offset to freshness math.
+            return max(0.0, time.time() - numeric)
+    except (TypeError, ValueError):
+        pass
+    try:
+        parsed = db._parse_dt(value) if value not in (None, "") else None
+    except Exception:
+        parsed = None
+    if parsed is not None:
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return max(0.0, (datetime.now(timezone.utc) - parsed.astimezone(timezone.utc)).total_seconds())
+    if fallback_mtime is not None:
+        return max(0.0, time.time() - float(fallback_mtime))
+    return None
+
+
 def _live_bridge_ticks(symbols: list[str] | None = None) -> list[dict]:
-    """Read quote files only; this endpoint never reads bot state or synthetic data."""
+    """Read quote files only and expose an explicit live/stale contract."""
     wanted = {str(item or "").strip().upper() for item in (symbols or []) if str(item or "").strip()}
-    # The dashboard requests canonical names; MT5 writes broker aliases.
     wanted.update(_resolve_symbol_code(item).upper() for item in list(wanted))
     rows = []
     for path in sorted(_bridge_dir().glob("tick_*.txt")):
@@ -575,18 +600,22 @@ def _live_bridge_ticks(symbols: list[str] | None = None) -> list[dict]:
         ask = _optional_float(raw.get("ask"))
         last = _optional_float(raw.get("last"))
         try:
-            age = max(0.0, time.time() - path.stat().st_mtime)
+            mtime = path.stat().st_mtime
         except OSError:
-            age = None
+            mtime = None
+        tick_time = raw.get("time") or raw.get("time_utc") or raw.get("timestamp") or None
+        age = _timestamp_age_seconds(tick_time, mtime)
+        fresh = age is not None and age <= 5.0
         rows.append({
             "symbol": resolved,
             "bid": bid,
             "ask": ask,
             "last": last,
             "spread": (ask - bid) if bid is not None and ask is not None else None,
-            "time": raw.get("time") or None,
+            "time": tick_time,
             "age_seconds": round(age, 3) if age is not None else None,
-            "fresh": age is not None and age <= 5.0,
+            "fresh": fresh,
+            "status": "LIVE_DATA" if fresh else "STALE_MARKET_DATA",
             "source": "mt5_bridge_tick",
         })
     return rows
@@ -642,10 +671,6 @@ def _usd_zar_rate() -> dict:
         except Exception:
             rate = 0.0
 
-    if rate <= 0:
-        rate = _finite(os.getenv("USDZAR_FALLBACK_RATE", "16.21"), digits=4)
-        source = "fallback"
-
     data = {
         "pair": "USD/ZAR",
         "rate": rate,
@@ -676,44 +701,6 @@ def _symbol_group(symbol: str) -> str:
     return "CFDs"
 
 
-def _fallback_mid_price(symbol: str) -> float:
-    code = str(symbol or "").strip().upper()
-    for tick in _terminal_ticks([code]):
-        bid = _finite(tick.get("bid"), digits=8)
-        ask = _finite(tick.get("ask"), digits=8)
-        if bid and ask:
-            return round((bid + ask) / 2, 8)
-        if bid:
-            return bid
-    explicit = {
-        "EURUSD": 1.112,
-        "GBPUSD": 1.303,
-        "USDJPY": 157.2,
-        "XAUUSD": 2350.0,
-        "XAGUSD": 29.3,
-        "BTCUSD": 64250.0,
-        "ETHUSD": 3450.0,
-        "NAS100": 19950.0,
-        "US30": 39250.0,
-        "SPX500": 5480.0,
-        "GER40": 18400.0,
-        "UK100": 8250.0,
-    }
-    if code in explicit:
-        return explicit[code]
-    seed = sum((idx + 7) * ord(char) for idx, char in enumerate(code))
-    group = _symbol_group(code)
-    if group == "Forex":
-        return round(0.75 + (seed % 85) / 100, 5)
-    if group == "Metals":
-        return round(22 + (seed % 9) * 250, 2)
-    if group == "Crypto":
-        return round(900 + (seed % 60) * 950, 2)
-    if group == "Indices":
-        return round(2500 + (seed % 40) * 440, 2)
-    if group == "Energies":
-        return round(55 + (seed % 28), 2)
-    return round(35 + (seed % 140) * 2.8, 2)
 
 
 def _timeframe_seconds(timeframe: str) -> int:
@@ -730,47 +717,6 @@ def _timeframe_seconds(timeframe: str) -> int:
     }.get(str(timeframe or "M15").upper(), 900)
 
 
-def _synthetic_candles(symbol: str, limit: int, timeframe: str) -> list[dict]:
-    code = str(symbol or "EURUSD").strip().upper()
-    count = max(30, min(int(limit or 120), 300))
-    step = _timeframe_seconds(timeframe)
-    end_ts = int(time.time()) // step * step
-    base = _fallback_mid_price(code)
-    group = _symbol_group(code)
-    if group == "Forex":
-        amp = 0.0018 if "JPY" not in code else 0.18
-    elif group == "Metals":
-        amp = max(0.4, base * 0.0025)
-    elif group == "Crypto":
-        amp = max(15.0, base * 0.006)
-    elif group == "Indices":
-        amp = max(8.0, base * 0.0035)
-    elif group == "Energies":
-        amp = max(0.16, base * 0.004)
-    else:
-        amp = max(0.12, base * 0.006)
-    seed = sum((idx + 11) * ord(char) for idx, char in enumerate(code))
-    rows: list[dict] = []
-    prev_close = base
-    for idx in range(count):
-        offset = idx - count + 1
-        ts = end_ts + offset * step
-        wave = math.sin((seed + idx) * 0.217) + math.sin((seed + idx) * 0.071) * 0.55
-        close = max(base * 0.05, base + wave * amp + (idx - count / 2) * amp * 0.012)
-        open_price = prev_close
-        high = max(open_price, close) + amp * (0.18 + ((seed + idx) % 7) / 45)
-        low = min(open_price, close) - amp * (0.18 + ((seed + idx * 3) % 7) / 45)
-        prev_close = close
-        rows.append({
-            "ts": str(ts),
-            "open": _finite(open_price, digits=8),
-            "high": _finite(high, digits=8),
-            "low": _finite(low, digits=8),
-            "close": _finite(close, digits=8),
-            "volume": float(80 + ((seed + idx * 17) % 520)),
-            "source": "fallback_chart",
-        })
-    return rows
 
 
 def _overlay_live_tick(rows: list[dict], symbol: str) -> list[dict]:
@@ -803,10 +749,9 @@ def _overlay_live_tick(rows: list[dict], symbol: str) -> list[dict]:
 def _candle_payload(row: dict, source: str = "mt5_bridge") -> dict:
     raw_time = row.get("time") or row.get("ts")
     time_detail = db.date_detail_for(raw_time)
-    try:
-        age_seconds = max(0.0, time.time() - float(raw_time))
-    except (TypeError, ValueError):
-        age_seconds = None
+    age_seconds = _timestamp_age_seconds(raw_time)
+    freshness_limit = _live_candle_age_limit("M1")
+    fresh = age_seconds is not None and age_seconds <= freshness_limit
     return {
         "ts": time_detail.get("iso") or row.get("time", ""),
         "time_label": time_detail.get("label", ""),
@@ -820,7 +765,8 @@ def _candle_payload(row: dict, source: str = "mt5_bridge") -> dict:
         "bar_age_seconds": round(age_seconds, 3) if age_seconds is not None else None,
         "tick_time": row.get("tick_time"),
         "quote_age_seconds": row.get("quote_age_seconds"),
-        "fresh": age_seconds is not None and age_seconds <= _live_candle_age_limit("M1"),
+        "fresh": fresh,
+        "status": "LIVE_DATA" if fresh else "STALE_MARKET_DATA",
     }
 
 
@@ -875,63 +821,67 @@ def _orders() -> list[dict]:
 
 
 def _symbols() -> list[dict]:
+    """Return only symbols confirmed by the live MT5 bridge manifest.
+
+    The dashboard may show a canonical alias, but it must never manufacture a
+    symbol from the static strategy catalogue when MT5 has not exported it.
+    """
     bridge_rows = _read_csv(_bridge_dir() / "symbols.csv")
     visible_overrides = _load_visible_overrides()
+    manifest_filter = bool(visible_overrides)
     tick_visible = {path.stem.replace("tick_", "").upper() for path in _bridge_dir().glob("tick_*.txt")}
     catalog = {row["symbol"]: row for row in _load_symbol_catalog()}
     aliases = _symbol_aliases()
     allowlist = _dashboard_symbol_allowlist()
     result: dict[str, dict] = {}
     for row in bridge_rows:
-        symbol = str(row.get("symbol", "")).strip().upper()
-        if not symbol:
+        broker_symbol = str(row.get("symbol", "")).strip().upper()
+        if not broker_symbol or (manifest_filter and broker_symbol not in visible_overrides):
             continue
-        result[symbol] = {
-            "symbol": symbol,
-            "visible": str(row.get("visible", "0")).strip() in {"1", "true", "True"} or symbol in visible_overrides,
-            "description": row.get("description", "") or catalog.get(symbol, {}).get("description", ""),
-            "path": row.get("path", "") or catalog.get(symbol, {}).get("path", ""),
+        result[broker_symbol] = {
+            "symbol": broker_symbol, "resolved_symbol": broker_symbol,
+            "visible": str(row.get("visible", "0")).strip().lower() in {"1", "true"} or broker_symbol in visible_overrides,
+            "description": row.get("description", ""), "path": row.get("path", ""),
+            "digits": row.get("digits", ""), "volume_min": row.get("volume_min", ""),
+            "volume_step": row.get("volume_step", ""), "trade_mode": row.get("trade_mode", ""),
+            "source": "mt5_symbols.csv",
         }
     for canonical, resolved in aliases.items():
-        resolved_key = str(resolved or "").strip().upper()
-        broker_row = result.get(resolved_key, {})
-        catalog_row = catalog.get(canonical, {})
-        if not broker_row and not catalog_row:
+        canonical_key = str(canonical).strip().upper()
+        resolved_key = str(resolved).strip().upper()
+        if canonical_key not in catalog and canonical_key not in visible_overrides:
             continue
-        result[canonical] = {
-            "symbol": canonical,
-            "resolved_symbol": resolved,
-            "visible": bool(broker_row.get("visible")) or canonical in visible_overrides or resolved_key in visible_overrides or resolved_key in tick_visible,
-            "description": catalog_row.get("description") or broker_row.get("description", ""),
-            "path": broker_row.get("path") or catalog_row.get("path", ""),
+        if manifest_filter and canonical_key not in visible_overrides and resolved_key not in visible_overrides:
+            continue
+        broker_row = result.get(resolved_key)
+        if not broker_row and resolved_key not in tick_visible:
+            continue
+        catalog_row = catalog.get(canonical_key, {})
+        source_row = broker_row or {
+            "symbol": resolved_key, "resolved_symbol": resolved_key, "visible": True,
+            "description": catalog_row.get("description", ""), "path": catalog_row.get("path", ""),
+            "source": "mt5_tick",
         }
-    for symbol, row in catalog.items():
-        resolved = aliases.get(symbol, symbol)
-        resolved_key = str(resolved or "").strip().upper()
-        result.setdefault(symbol, {
-            "symbol": symbol,
-            "resolved_symbol": resolved if resolved != symbol else symbol,
-            "visible": symbol in visible_overrides or resolved_key in visible_overrides or resolved_key in tick_visible,
-            "description": row.get("description", ""),
-            "path": row.get("path", ""),
-        })
+        result[canonical_key] = {
+            **source_row, "symbol": canonical_key, "resolved_symbol": resolved_key,
+            "visible": bool(source_row.get("visible")) or canonical_key in visible_overrides or resolved_key in visible_overrides or resolved_key in tick_visible,
+            "description": catalog_row.get("description") or source_row.get("description", ""),
+            "path": source_row.get("path") or catalog_row.get("path", ""),
+        }
     if allowlist:
-        filtered: dict[str, dict] = {}
-        for symbol, row in result.items():
-            resolved = str(row.get("resolved_symbol") or aliases.get(symbol, symbol) or symbol).strip().upper()
-            if symbol in allowlist or resolved in allowlist:
-                row["visible"] = True
-                filtered[symbol] = row
-        result = filtered
-    elif result and not any(row.get("visible") for row in result.values()):
-        for symbol in {
-            "EURUSD", "GBPUSD", "USDJPY", "USDCHF", "USDCAD", "AUDUSD", "NZDUSD",
-            "XAUUSD", "XAGUSD", "BTCUSD", "ETHUSD", "NAS100", "US30", "GER40",
-            "UK100", "SPX500",
-        }:
-            if symbol in result:
-                result[symbol]["visible"] = True
-    return list(result.values())
+        allowed = set(allowlist)
+        result = {symbol: row for symbol, row in result.items()
+                  if symbol in allowed or str(row.get("resolved_symbol") or "").upper() in allowed}
+        for row in result.values():
+            row["visible"] = True
+
+    # Present one row per canonical instrument. The broker alias remains in
+    # resolved_symbol so every displayed quote can still be traced to MT5.
+    alias_targets = {str(value or "").strip().upper() for value in aliases.values() if str(value or "").strip()}
+    for broker_symbol in alias_targets:
+        if broker_symbol not in allowlist:
+            result.pop(broker_symbol, None)
+    return sorted(result.values(), key=lambda row: (not bool(row.get("visible")), row["symbol"]))
 
 
 def _activity() -> dict:
@@ -1604,8 +1554,6 @@ def intelligence_runtime():
     except Exception:
         return {"status": "UNAVAILABLE", "raw": raw}
 
-
-@app.get("/api/audit/summary", dependencies=[Depends(_session_user)])
 
 @app.get("/api/audit/summary", dependencies=[Depends(_session_user)])
 def audit_summary():

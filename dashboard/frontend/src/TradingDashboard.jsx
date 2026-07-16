@@ -12,6 +12,7 @@ import {
   Grip,
   History,
   LineChart,
+  LayoutDashboard,
   List,
   MonitorSmartphone,
   Newspaper,
@@ -67,6 +68,7 @@ function safeStorageRemove(key) {
 }
 
 const DESKTOP_TABS = [
+  { id: "snapshot", label: "Snapshot", icon: LayoutDashboard },
   { id: "market-hours", label: "Market Hours", icon: Clock3 },
   { id: "watchlist", label: "Watchlist", icon: List },
   { id: "chart", label: "Chart", icon: LineChart },
@@ -82,6 +84,7 @@ const DESKTOP_TABS = [
 ];
 
 const MOBILE_TABS = [
+  { id: "snapshot", label: "Snapshot", icon: LayoutDashboard },
   { id: "quotes", label: "Quotes", icon: TrendingUp },
   { id: "chart", label: "Chart", icon: BarChart3 },
   { id: "replay", label: "Replay", icon: History },
@@ -92,7 +95,7 @@ const MOBILE_TABS = [
 ];
 
 const TIMEFRAMES = ["M1", "M5", "M15", "H1", "H4", "D1"];
-const SYMBOL_GROUP_NAMES = ["All", "Forex", "Metals", "CFDs", "Crypto"];
+const SYMBOL_GROUP_NAMES = ["All", "Forex", "Indices", "Metals"];
 const DISPLAY_TIME_ZONE = "Africa/Johannesburg";
 const DISPLAY_TZ_LABEL = "SAST";
 
@@ -465,8 +468,8 @@ function WatchlistTable({ symbols, activeSymbols, selectedSymbol, onSelect, onTo
 }
 
 export function TradingDashboard() {
-  const [desktopTab, setDesktopTab] = useState("chart");
-  const [mobileTab, setMobileTab] = useState("chart");
+  const [desktopTab, setDesktopTab] = useState("snapshot");
+  const [mobileTab, setMobileTab] = useState("snapshot");
   const [selectedSymbol, setSelectedSymbol] = useState("EURUSD");
   const [timeframe, setTimeframe] = useState("M15");
   const [mobileTimeframe, setMobileTimeframe] = useState("M15");
@@ -869,7 +872,8 @@ export function TradingDashboard() {
         spread: liveNumber(tick.spread),
         tickTime: tick.time || tick.time_utc || tick.timestamp || "",
         quoteAgeSeconds: liveNumber(tick.age_seconds),
-        fresh: tick.fresh !== false,
+        fresh: tick.fresh === true,
+        feedStatus: tick.status || (tick.fresh === true ? "LIVE_DATA" : "STALE_MARKET_DATA"),
         visible: row.visible !== false && (row.visible === true || activeSymbols.includes(symbol) || DEFAULT_ACTIVE_SYMBOLS.includes(symbol)),
       };
     }).filter((row) => row.symbol);
@@ -920,7 +924,7 @@ export function TradingDashboard() {
     setActiveSymbols((current) => {
       const known = new Set(liveSymbols.map((item) => item.symbol));
       const kept = current.filter((symbol) => known.has(symbol));
-      const seeded = kept.length ? kept : DEFAULT_ACTIVE_SYMBOLS.filter((symbol) => known.has(symbol));
+      const seeded = kept.length ? kept : liveSymbols.filter((item) => item.visible).map((item) => item.symbol);
       return sameSymbols(current, seeded) ? current : seeded;
     });
     if (!liveSymbols.find((item) => item.symbol === selectedSymbol)) {
@@ -1339,6 +1343,102 @@ export function TradingDashboard() {
     if (event === "ORDER_SENT") return "Order sent";
     if (event === "ORDER_REJECTED" || event === "ORDER_REJECTED_RECORDED") return "Order declined";
     return "Trade update";
+  }
+
+
+  function renderSnapshotWorkspace(mode = "desktop") {
+    const compact = mode === "mobile";
+    const ticks = Array.isArray(marketFeed?.ticks) ? marketFeed.ticks : [];
+    const liveTicks = ticks.filter((row) => row.status === "LIVE_DATA" && row.bid !== null && row.ask !== null);
+    const staleTicks = ticks.filter((row) => row.status === "STALE_MARKET_DATA");
+    const feedStatus = !ticks.length ? "UNAVAILABLE" : liveTicks.length ? (staleTicks.length ? "PARTIAL" : "LIVE") : "STALE";
+    const feedClass = feedStatus === "LIVE" ? "pos" : feedStatus === "PARTIAL" ? "gold" : "neg";
+    const currentRows = Array.isArray(scanner?.current_signals) ? scanner.current_signals : [];
+    const scoreRows = currentRows.filter((row) => row.score !== null && row.score !== undefined && Number.isFinite(Number(row.score)));
+    const selectedSignal = scoreRows.find((row) => String(row.sym || row.symbol || "").toUpperCase() === selected.symbol) || scoreRows[0];
+    const statusLabel = status?.mt5_connected === true ? "CONNECTED" : status?.mt5_connected === false ? "OFFLINE" : "UNKNOWN";
+    const display = (value, formatter = (item) => String(item)) => value === null || value === undefined || value === "" ? "--" : formatter(value);
+    const count = (value) => display(value, (item) => compactCount(item));
+    const money = (value) => display(value, (item) => formatSignedUsd(item));
+    const age = (value) => display(value, (item) => formatAgeLabel(item));
+    const sourceTime = marketFeed?.generated_at || status?.last_scan || terminal?.updated_at;
+    const groups = ["Forex", "Indices", "Metals"].map((group) => {
+      const items = liveSymbols.filter((item) => item.market === group);
+      const live = items.filter((item) => item.fresh && item.bid !== null).length;
+      return { group, total: items.length, live };
+    });
+    return (
+      <div className={"snapshot-workspace" + (compact ? " snapshot-mobile" : "")}>
+        <div className="snapshot-hero">
+          <div>
+            <span className="snapshot-kicker">Cipher FX - MT5 control room</span>
+            <h2>Live operating picture</h2>
+            <p>One concise view of broker connection, feed freshness, current decisions and real account activity.</p>
+          </div>
+          <div className="snapshot-hero-status">
+            <span className={"status-dot " + (statusLabel === "CONNECTED" ? "live" : "offline")} />
+            <strong>MT5 {statusLabel}</strong>
+            <small>{sourceTime ? formatDateTimeLabel(sourceTime) : "Update time unavailable"}</small>
+          </div>
+        </div>
+        <div className="snapshot-grid">
+          <section className="snapshot-panel snapshot-connection">
+            <div className="snapshot-panel-head"><strong>System truth</strong><span>Authoritative sources</span></div>
+            <div className="snapshot-fact-list">
+              <div><span>MT5 terminal</span><b className={statusLabel === "CONNECTED" ? "pos" : "neg"}>{statusLabel}</b><em>{status?.server || terminal?.account?.server || "Server unavailable"}</em></div>
+              <div><span>Market feed</span><b className={feedClass}>{feedStatus}</b><em>{liveTicks.length}/{ticks.length || "--"} quotes fresh - threshold 5s</em></div>
+              <div><span>State database</span><b className="pos">MT5 STATE</b><em>{intelligenceOverview?.source || "mt5_state.db"}</em></div>
+              <div><span>Dashboard update</span><b>{age(sourceTime)}</b><em>API snapshot, not strategy state</em></div>
+            </div>
+          </section>
+          <section className="snapshot-panel">
+            <div className="snapshot-panel-head"><strong>Account now</strong><span>MT5 positions only</span></div>
+            <div className="snapshot-value-grid">
+              <div><span>Equity</span><strong>{money(terminal?.account?.equity ?? status?.equity)}</strong></div>
+              <div><span>Open P/L</span><strong className={totals.openPnl >= 0 ? "pos" : "neg"}>{money(totals.openPnl)}</strong></div>
+              <div><span>Open positions</span><strong>{count(positions.length)}</strong></div>
+              <div><span>Free margin</span><strong>{money(terminal?.account?.free_margin)}</strong></div>
+            </div>
+            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("positions")}>Open position monitor <ChevronDown size={14} /></button>
+          </section>
+          <section className="snapshot-panel">
+            <div className="snapshot-panel-head"><strong>Trade record</strong><span>SQLite reconciled history</span></div>
+            <div className="snapshot-value-grid">
+              {[
+                ["Today", dealSummaries.today],
+                ["This week", dealSummaries.week],
+                ["This month", dealSummaries.month],
+              ].map(([label, row]) => <div key={label}><span>{label}</span><strong>{count(row?.total_trades)}</strong><em>{money(row?.pnl)}</em></div>)}
+            </div>
+            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("history")}>Open history <ChevronDown size={14} /></button>
+          </section>
+          <section className="snapshot-panel snapshot-decision">
+            <div className="snapshot-panel-head"><strong>Current decision path</strong><span>Live scan records</span></div>
+            {selectedSignal ? (
+              <div className="snapshot-decision-body">
+                <div className="snapshot-decision-title"><strong>{selectedSignal.sym || selectedSignal.symbol}</strong><b className={String(selectedSignal.direction || selectedSignal.side).toUpperCase() === "BUY" ? "pos" : "neg"}>{String(selectedSignal.direction || selectedSignal.side || "WATCH").toUpperCase()}</b><em>Score {display(selectedSignal.score, (item) => Number(item).toFixed(0))}</em></div>
+                <p>{selectedSignal.scan_story || selectedSignal.public_reason || selectedSignal.reason || "The latest MT5 scan has no public explanation."}</p>
+                <div className="snapshot-stage-line">{["H4", "H1", "M15", "M5", "ORDER"].map((stage) => <span key={stage} className={selectedSignal.scan_progress?.find((item) => item.key === stage)?.state || "inactive"}>{stage}</span>)}</div>
+              </div>
+            ) : <div className="snapshot-empty">No current scored scan row is available from SQLite.</div>}
+            <button className="snapshot-link" type="button" onClick={() => setDesktopTab("scanner")}>Open live scan <ChevronDown size={14} /></button>
+          </section>
+        </div>
+        <section className="snapshot-panel snapshot-markets">
+          <div className="snapshot-panel-head"><strong>Market coverage</strong><span>{count(liveSymbols.filter((item) => item.visible).length)} symbols confirmed by MT5</span></div>
+          <div className="snapshot-market-grid">{groups.map((item) => <button type="button" className="snapshot-market" key={item.group} onClick={() => { setSymbolGroupFilter(item.group); setDesktopTab("watchlist"); }}><span>{item.group}</span><strong>{item.live}/{item.total || "--"}</strong><em>{item.live ? "quotes live" : "no fresh quotes"}</em></button>)}</div>
+        </section>
+        <section className="snapshot-panel snapshot-next">
+          <div className="snapshot-panel-head"><strong>Read the dashboard in order</strong><span>Each view has one job</span></div>
+          <div className="snapshot-route">
+            <button type="button" onClick={() => setDesktopTab("scanner")}><b>1</b><span><strong>Scan</strong><em>See the current symbol story and the exact stage.</em></span></button>
+            <button type="button" onClick={() => setDesktopTab("intelligence")}><b>2</b><span><strong>Intel</strong><em>See planning, learning and validation records.</em></span></button>
+            <button type="button" onClick={() => setDesktopTab("positions")}><b>3</b><span><strong>Positions</strong><em>See what MT5 actually has open now.</em></span></button>
+            <button type="button" onClick={() => setDesktopTab("history")}><b>4</b><span><strong>History</strong><em>See closed trades and recorded outcomes.</em></span></button>
+          </div>
+        </section>
+      </div>
+    );
   }
 
   function renderScannerWorkspace(mode = "desktop") {
@@ -2176,6 +2276,7 @@ export function TradingDashboard() {
             </div>
 
             <div className="center-workspace">
+              {desktopTab === "snapshot" && renderSnapshotWorkspace("desktop")}
               {desktopTab === "watchlist" && renderWatchlistWorkspace()}
               {desktopTab === "chart" && renderTradeWorkspace("chart")}
               {desktopTab === "replay" && renderReplayWorkspace("desktop")}
@@ -2320,6 +2421,10 @@ export function TradingDashboard() {
               <em>{formatZar(totals.equity, usdZarRate, { compact: true })}</em>
             </div>
           </div>
+
+          {mobileTab === "snapshot" && (
+            <div className="mobile-screen snapshot-screen">{renderSnapshotWorkspace("mobile")}</div>
+          )}
 
           {mobileTab === "quotes" && (
             <div className="mobile-screen">
