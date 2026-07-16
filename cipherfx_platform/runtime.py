@@ -21,6 +21,7 @@ from .execution import ExecutionEngine
 from .feedback import LearningFeedbackEngine
 from .management import TradeManagementEngine
 from .market_data import MarketDataEngine, MarketDataError
+from portfolio_intelligence import PortfolioIntelligenceEngine
 
 LOG = logging.getLogger("cipherfx.platform")
 
@@ -68,6 +69,9 @@ class ModularTradingRuntime:
         self.execution = ExecutionEngine(self.gateway, self.config, self.database)
         self.management = TradeManagementEngine(self.gateway, self.database)
         self.feedback = LearningFeedbackEngine(self.database, self.learning.record_outcome)
+        self.portfolio_intelligence = PortfolioIntelligenceEngine()
+        self._last_portfolio_event_at = 0.0
+        self._last_portfolio_event_signature = ""
         self.heartbeat_path = Path(
             os.getenv(
                 "MT5_HEARTBEAT_FILE",
@@ -150,6 +154,101 @@ class ModularTradingRuntime:
             )
         return len(expired)
 
+    def _publish_portfolio_intelligence(self) -> None:
+        """Publish portfolio facts without participating in any trade decision."""
+        try:
+            account = self.gateway.account_info()
+            account_payload = dict(vars(account)) if hasattr(account, "__dict__") else {}
+            positions = [
+                {
+                    "ticket": position.ticket,
+                    "symbol": position.symbol,
+                    "side": position.direction,
+                    "volume": position.volume,
+                    "price_open": position.price_open,
+                    "price_current": position.price_current,
+                    "sl": position.sl,
+                    "tp": position.tp,
+                    "profit": position.profit,
+                }
+                for position in self.gateway.positions()
+            ]
+            orders = [
+                {
+                    "ticket": order.ticket,
+                    "symbol": order.symbol,
+                    "side": order.side,
+                    "volume": order.volume,
+                    "price_open": order.price_open,
+                    "sl": order.sl,
+                    "tp": order.tp,
+                    "state": order.state,
+                }
+                for order in self.gateway.orders()
+            ]
+            feed = self.market_data.live_tick_status()
+            operational = {
+                "mt5_connected": bool(getattr(account, "terminal_connected", False)),
+                "trade_allowed": bool(getattr(account, "trade_allowed", False)),
+                "account_trade_allowed": bool(getattr(account, "account_trade_allowed", False)),
+                "bridge_mode": self.gateway.mode,
+                "market_data": feed,
+                "stale_tick_count": len(feed.get("stale_symbols", [])),
+                "websocket": {
+                    "running": self.websocket.running,
+                    "connected_clients": self.websocket.connected_clients,
+                    "received_events": self.websocket.received_events,
+                },
+            }
+            snapshot = self.portfolio_intelligence.snapshot(
+                account=account_payload,
+                positions=positions,
+                orders=orders,
+                proposal_states=self.database.portfolio_proposal_states(),
+                closed_summaries=self.database.portfolio_closed_summaries(),
+                operational=operational,
+            )
+            self.database.status("portfolio_intelligence", snapshot)
+            signature = json.dumps(
+                {
+                    "health": snapshot["portfolio_health"],
+                    "open_positions": snapshot["exposure"]["open_positions"],
+                    "pending_proposals": snapshot["proposals"]["pending"],
+                },
+                sort_keys=True,
+            )
+            now = time.monotonic()
+            if (
+                signature != self._last_portfolio_event_signature
+                or now - self._last_portfolio_event_at >= 30.0
+            ):
+                self.database.event(
+                    "PORTFOLIO_INTELLIGENCE",
+                    {
+                        "health": snapshot["portfolio_health"],
+                        "risk": snapshot.get("risk", {}),
+                        "open_positions": snapshot["exposure"]["open_positions"],
+                        "pending_proposals": snapshot["proposals"]["pending"],
+                    },
+                )
+                self._last_portfolio_event_signature = signature
+                self._last_portfolio_event_at = now
+        except Exception as exc:
+            LOG.exception("portfolio intelligence publication failed")
+            self.database.status(
+                "portfolio_intelligence",
+                {
+                    "contract_version": "portfolio-intelligence-v1",
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "UNAVAILABLE",
+                    "reason": str(exc),
+                    "authority": {
+                        "informational_only": True,
+                        "trade_decision_authority": False,
+                    },
+                },
+            )
+
     def run_once(self, *, perform_scan: bool = True) -> dict[str, int]:
         summary = {
             "symbols": 0,
@@ -224,6 +323,7 @@ class ModularTradingRuntime:
         self.management.monitor()
         summary["closed"] = self.feedback.reconcile_closed_trades(self.gateway)
         summary["expired"] = self._expire_feedback()
+        self._publish_portfolio_intelligence()
         if perform_scan and summary["filled"]:
             self._record_lifecycle("ORDER_EXECUTED", "one or more orders filled", filled=summary["filled"])
         if perform_scan:

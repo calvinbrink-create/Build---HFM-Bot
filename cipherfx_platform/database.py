@@ -200,6 +200,46 @@ class DatabaseLayer:
                 (str(key), self._json(value), self._now()),
             )
 
+    def portfolio_proposal_states(self) -> dict[str, int]:
+        """Read proposal lifecycle counts without changing proposal state."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT state, COUNT(*) FROM trade_proposals GROUP BY state"
+            ).fetchall()
+        return {str(state).upper(): int(count) for state, count in rows}
+
+    def portfolio_closed_summaries(self) -> dict[str, dict[str, Any]]:
+        """Read aggregate closed-trade facts for portfolio reporting only."""
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT engine, COUNT(*) AS closed_trades,
+                       SUM(pnl) AS realized_pnl,
+                       SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                       SUM(CASE WHEN pnl < 0 THEN 1 ELSE 0 END) AS losses
+                FROM engine_performance GROUP BY engine
+                """
+            ).fetchall()
+            if not rows:
+                rows = conn.execute(
+                    """
+                    SELECT asset_class, COUNT(*) AS closed_trades,
+                           SUM(realized_pnl) AS realized_pnl,
+                           SUM(CASE WHEN realized_pnl > 0 THEN 1 ELSE 0 END) AS wins,
+                           SUM(CASE WHEN realized_pnl < 0 THEN 1 ELSE 0 END) AS losses
+                    FROM trade_history GROUP BY asset_class
+                    """
+                ).fetchall()
+        return {
+            str(engine).upper(): {
+                "closed_trades": int(closed_trades or 0),
+                "realized_pnl": round(float(realized_pnl or 0.0), 2),
+                "wins": int(wins or 0),
+                "losses": int(losses or 0),
+            }
+            for engine, closed_trades, realized_pnl, wins, losses in rows
+        }
+
     def execution(
         self,
         proposal_id,
