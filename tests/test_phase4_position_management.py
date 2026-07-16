@@ -37,6 +37,11 @@ class ManagementGateway:
         return SimpleNamespace(retcode=10009)
 
 
+
+
+class FailingManagementGateway(ManagementGateway):
+    def modify_position(self, ticket, symbol, sl, tp):
+        raise RuntimeError("broker 4756")
 class Phase4PositionManagementTests(unittest.TestCase):
     def position(self, *, sl=0.9, current=1.05):
         return SimpleNamespace(
@@ -70,6 +75,19 @@ class Phase4PositionManagementTests(unittest.TestCase):
             self.assertEqual(event, "POSITION_MANAGEMENT_ACTION")
             self.assertIn('"mfe_r":0.5', state)
             self.assertIn('"rank":"STRONG"', state)
+
+    def test_failed_stop_modification_is_not_repeated_each_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = FailingManagementGateway(self.position())
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            manager.monitor()
+            with sqlite3.connect(db.path) as conn:
+                errors = conn.execute(
+                    "SELECT COUNT(*) FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ERROR'"
+                ).fetchone()[0]
+            self.assertEqual(errors, 1)
 
     def test_management_is_not_a_market_or_entry_engine(self):
         source = inspect.getsource(TradeManagementEngine)

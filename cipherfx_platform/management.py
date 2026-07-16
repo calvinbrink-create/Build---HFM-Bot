@@ -34,6 +34,9 @@ class TradeManagementEngine:
             0.05, float(os.getenv("MT5_MANAGEMENT_TRAIL_DISTANCE_R", "0.25"))
         )
         self.early_exit_r = float(os.getenv("MT5_MANAGEMENT_EARLY_EXIT_R", "-0.75"))
+        self.modify_retry_seconds = max(
+            5.0, float(os.getenv("MT5_MANAGEMENT_MODIFY_RETRY_SECONDS", "30"))
+        )
 
     def _profile(self, symbol: str) -> dict[str, Any]:
         key = str(symbol).upper()
@@ -97,14 +100,14 @@ class TradeManagementEngine:
             return "STRONG"
         return "EXCELLENT"
 
-    def _spread(self, symbol: str) -> tuple[float | None, float | None]:
+    def _quote(self, symbol: str):
         try:
             _, tick = self.gateway.symbol_tick(symbol)
             spec = self.gateway.symbol_info(symbol)
             points = (float(tick.ask) - float(tick.bid)) / max(float(spec.point), 1e-12)
-            return points, float(tick.ask if tick.ask else tick.bid)
+            return points, float(tick.bid), float(tick.ask), spec
         except Exception:
-            return None, None
+            return None, None, None, None
 
     def _action(self, position, state: dict[str, Any], action: str, reason: str, **extra):
         payload = {
@@ -143,9 +146,41 @@ class TradeManagementEngine:
             )
 
     def _modify(self, position, state: dict[str, Any], new_sl: float, reason: str, metrics):
+        now = datetime.now(timezone.utc)
         try:
-            self.gateway.modify_position(int(position.ticket), position.symbol, float(new_sl), float(position.tp))
+            spec = self.gateway.symbol_info(position.symbol)
+            normalizer = getattr(self.gateway, "normalize_price", None)
+            if normalizer is None:
+                digits = max(0, int(getattr(spec, "digits", 8) or 8))
+                normalizer = lambda value, price: round(float(price), digits)
+            new_sl = float(normalizer(spec, new_sl))
+            minimum_distance = float(getattr(spec, "stops_level", 0) or 0) * float(
+                getattr(spec, "point", 0.0) or 0.0
+            )
+            _, bid, ask, _ = self._quote(position.symbol)
+            if minimum_distance > 0 and bid is not None and ask is not None:
+                if position.direction == "BUY":
+                    new_sl = min(new_sl, float(bid) - minimum_distance)
+                else:
+                    new_sl = max(new_sl, float(ask) + minimum_distance)
+                new_sl = float(normalizer(spec, new_sl))
+            failed_target = state.get("last_failed_sl")
+            failed_at = state.get("last_modify_attempt_at")
+            if failed_target is not None and failed_at:
+                try:
+                    age = (now - datetime.fromisoformat(str(failed_at))).total_seconds()
+                except ValueError:
+                    age = self.modify_retry_seconds
+                if age < self.modify_retry_seconds and abs(float(failed_target) - new_sl) <= max(
+                    float(getattr(spec, "point", 0.0) or 0.0), 1e-12
+                ):
+                    return
+            self.gateway.modify_position(
+                int(position.ticket), position.symbol, float(new_sl), float(position.tp)
+            )
             state["last_managed_sl"] = float(new_sl)
+            state.pop("last_failed_sl", None)
+            state.pop("last_modify_error", None)
             self._action(
                 position,
                 state,
@@ -155,6 +190,9 @@ class TradeManagementEngine:
                 metrics=metrics,
             )
         except Exception as exc:
+            state["last_failed_sl"] = float(new_sl)
+            state["last_modify_attempt_at"] = now.isoformat()
+            state["last_modify_error"] = f"{type(exc).__name__}:{str(exc)[:180]}"
             self.database.event(
                 "POSITION_MANAGEMENT_ERROR",
                 {
@@ -162,7 +200,8 @@ class TradeManagementEngine:
                     "symbol": position.symbol,
                     "action": "MODIFY_SL",
                     "reason": reason,
-                    "error": f"{type(exc).__name__}:{str(exc)[:180]}",
+                    "error": state["last_modify_error"],
+                    "retry_after_seconds": self.modify_retry_seconds,
                 },
                 symbol=position.symbol,
             )
@@ -195,7 +234,7 @@ class TradeManagementEngine:
         initial_sl = float(state.get("initial_sl", 0.0) or 0.0)
         current_r = self._r_multiple(position, initial_sl)
         previous_price = float(state.get("last_price", position.price_current) or position.price_current)
-        spread_points, _ = self._spread(position.symbol)
+        spread_points, bid, ask, spec = self._quote(position.symbol)
         previous_spread = state.get("last_spread_points")
         spread_jump = (
             spread_points is not None
