@@ -154,6 +154,12 @@ class DatabaseLayer:
                     created_at TEXT NOT NULL,
                     metrics_json TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS position_management(
+                    position_ticket INTEGER PRIMARY KEY,
+                    symbol TEXT NOT NULL,
+                    state_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE INDEX IF NOT EXISTS idx_platform_events_time ON platform_events(event_time);
                 CREATE INDEX IF NOT EXISTS idx_platform_exec_created ON platform_executions(created_at);
                 CREATE INDEX IF NOT EXISTS idx_proposals_state_expiry ON trade_proposals(state, expires_at);
@@ -599,6 +605,37 @@ class DatabaseLayer:
             }
             for r in rows
         ]
+
+    def load_management_state(self, position_ticket: int) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT state_json FROM position_management WHERE position_ticket=?",
+                (int(position_ticket),),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            return json.loads(row[0])
+        except (TypeError, json.JSONDecodeError):
+            return None
+
+    def save_management_state(self, position_ticket: int, state: dict[str, Any]) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO position_management(position_ticket,symbol,state_json,updated_at)
+                VALUES(?,?,?,?)
+                ON CONFLICT(position_ticket) DO UPDATE SET
+                    symbol=excluded.symbol,state_json=excluded.state_json,
+                    updated_at=excluded.updated_at
+                """,
+                (
+                    int(position_ticket),
+                    str(state.get("symbol", "")),
+                    self._json(state),
+                    self._now(),
+                ),
+            )
 
     def expired_proposals(self, now: datetime | None = None) -> list[dict[str, Any]]:
         stamp = (now or datetime.now(timezone.utc)).isoformat()

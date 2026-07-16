@@ -162,7 +162,7 @@ class ModularTradingRuntime:
                 LOG.exception("symbol cycle failed for %s", canonical)
                 self.database.event("RUNTIME_ERROR", {"error": str(exc)}, symbol=canonical)
 
-        self.management.snapshot()
+        self.management.monitor()
         summary["closed"] = self.feedback.reconcile_closed_trades(self.gateway)
         summary["expired"] = self._expire_feedback()
         self.database.status(
