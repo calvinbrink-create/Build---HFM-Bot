@@ -87,5 +87,8 @@ class MetalsLearningEngine:
         pid=hashlib.sha256(f"{self.ENGINE}|{snapshot.symbol}|{side}|{c.timestamp.isoformat()}".encode()).hexdigest()[:24];created=utc_now();confidence=round(min(99,max(1,raw)),2);probability=round(min(95,max(5,50+(raw-50)*0.72)),2)
         return TradeProposal(pid,snapshot.symbol,"metal",side,entry,entry-stop_distance if side=="BUY" else entry+stop_distance,entry+target_distance if side=="BUY" else entry-target_distance,0.0,"METALS",raw,{"timeframes":scores[side],"features":features[side][0],"adaptive_adjustment":adj},created,created+timedelta(seconds=20),{"engine":self.ENGINE,"asset_class":"metal"},confidence,probability,tuple(features[side][1]),stop_distance)
 
-    def record_outcome(self,trade_id,symbol,result_r,pnl):
-        if self.database:self.database.record_engine_outcome(self.ENGINE,trade_id,symbol,result_r,pnl)
+    def record_outcome(self, trade_id, symbol, result_r, pnl, metrics=None):
+        if self.database:
+            self.database.record_engine_outcome(
+                self.ENGINE, trade_id, symbol, result_r, pnl, metrics=metrics or {}
+            )

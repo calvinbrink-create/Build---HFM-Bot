@@ -32,7 +32,7 @@ class Phase2ExecutionBoundaryTests(unittest.TestCase):
                                "INDICES", 70, {}, now, now + timedelta(seconds=30))
             first = engine.submit(p)
             second = engine.submit(p)
-            self.assertEqual(first.status, "REJECTED")
+            self.assertEqual(first.status, "EXECUTION_BLOCKED")
             self.assertIn("BROKER_ERROR", first.reason)
             self.assertEqual(second.status, "DUPLICATE_SUPPRESSED")
 

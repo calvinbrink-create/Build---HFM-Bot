@@ -112,5 +112,8 @@ class ForexLearningEngine:
         confidence=round(min(99.0,max(1.0,raw)),2); probability=round(min(95.0,max(5.0,50.0+(raw-50.0)*0.75)),2)
         return TradeProposal(pid,snapshot.symbol,"forex",side,entry,entry-stop_distance if side=="BUY" else entry+stop_distance,entry+target_distance if side=="BUY" else entry-target_distance,0.0,"FOREX",raw,{"timeframes":scores[side],"features":feature_scores[side][0],"adaptive_adjustment":adjustment},created,created+timedelta(seconds=30),{"engine":self.ENGINE,"asset_class":"forex"},confidence,probability,tuple(feature_scores[side][1]),stop_distance)
 
-    def record_outcome(self, trade_id, symbol, result_r, pnl):
-        if self.database:self.database.record_engine_outcome(self.ENGINE,trade_id,symbol,result_r,pnl)
+    def record_outcome(self, trade_id, symbol, result_r, pnl, metrics=None):
+        if self.database:
+            self.database.record_engine_outcome(
+                self.ENGINE, trade_id, symbol, result_r, pnl, metrics=metrics or {}
+            )

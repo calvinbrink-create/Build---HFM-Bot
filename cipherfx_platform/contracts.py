@@ -131,6 +131,7 @@ class ExecutionResult:
     reason: str = ""
     submitted_at: datetime = field(default_factory=utc_now)
     filled_at: datetime | None = None
+    initial_risk: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -142,3 +143,4 @@ class FeedbackRecord:
     realized_pnl: float
     closed_at: datetime
     exit_reason: str
+    metrics: dict[str, Any] = field(default_factory=dict)

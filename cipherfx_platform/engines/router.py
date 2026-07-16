@@ -8,7 +8,7 @@ from .metals import MetalsLearningEngine
 
 
 class MarketIntelligenceEngine:
-    """Routes snapshots to exactly one independent asset engine."""
+    """Routes each outcome back to only the engine that originated it."""
 
     def __init__(self, database: DatabaseLayer | None = None):
         self.engines = {
@@ -24,5 +24,26 @@ class MarketIntelligenceEngine:
         self.last_report = dict(engine.last_report)
         return proposal
 
-    def record_outcome(self, asset_class: str, trade_id: str, symbol: str, result_r: float, pnl: float) -> None:
-        self.engines[asset_class].record_outcome(trade_id, symbol, result_r, pnl)
+    def record_outcome(
+        self,
+        asset_class: str,
+        trade_id: str,
+        symbol: str,
+        result_r: float,
+        pnl: float,
+        metrics: dict | None = None,
+    ) -> None:
+        self.engines[asset_class].record_outcome(
+            trade_id, symbol, result_r, pnl, metrics=metrics or {}
+        )
+
+    def record_expired(
+        self,
+        asset_class: str,
+        proposal_id: str,
+        symbol: str,
+        metrics: dict | None = None,
+    ) -> None:
+        self.engines[asset_class].record_outcome(
+            f"expired:{proposal_id}", symbol, 0.0, 0.0, metrics=metrics or {"missed_trade": True}
+        )

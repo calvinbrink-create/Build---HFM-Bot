@@ -5,8 +5,22 @@ class TradeManagementEngine:
     """Open-position management only; no market analysis."""
     def __init__(self,gateway:MT5Gateway,database:DatabaseLayer):self.gateway=gateway;self.database=database
     def snapshot(self):
-        positions=self.gateway.positions()
-        self.database.status("open_positions",[{"ticket":p.ticket,"symbol":p.symbol,"side":p.direction,"volume":p.volume,"profit":p.profit} for p in positions])
+        positions = self.gateway.positions()
+        for position in positions:
+            self.database.save_position(position)
+        self.database.status(
+            "open_positions",
+            [
+                {
+                    "ticket": position.ticket,
+                    "symbol": position.symbol,
+                    "side": position.direction,
+                    "volume": position.volume,
+                    "profit": position.profit,
+                }
+                for position in positions
+            ],
+        )
         return positions
     def close(self,ticket:int):
         for p in self.gateway.positions():
