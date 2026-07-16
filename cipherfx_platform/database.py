@@ -401,29 +401,54 @@ class DatabaseLayer:
 
     def save_position(self, position, proposal_id: str | None = None) -> None:
         with self._lock, self._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            if "position_ticket" in columns:
+                conn.execute(
+                    """
+                    INSERT INTO positions(
+                        position_ticket,proposal_id,symbol,side,volume,entry_price,current_price,
+                        profit,opened_at,updated_at,state
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
+                    ON CONFLICT(position_ticket) DO UPDATE SET
+                        proposal_id=COALESCE(excluded.proposal_id,positions.proposal_id),
+                        current_price=excluded.current_price, profit=excluded.profit,
+                        volume=excluded.volume, updated_at=excluded.updated_at, state=excluded.state
+                    """,
+                    (
+                        int(position.ticket),
+                        proposal_id,
+                        str(position.symbol),
+                        str(position.direction),
+                        float(position.volume),
+                        float(position.price_open),
+                        float(position.price_current),
+                        float(position.profit),
+                        self._dt(position.time),
+                        self._now(),
+                        "OPEN",
+                    ),
+                )
+                return
+            # Preserve the pre-Phase-3 operational positions table used by the
+            # existing dashboard while keeping the same current position data.
             conn.execute(
                 """
-                INSERT INTO positions(
-                    position_ticket,proposal_id,symbol,side,volume,entry_price,current_price,
-                    profit,opened_at,updated_at,state
+                INSERT OR REPLACE INTO positions(
+                    sym,market,direction,qty,entry,current,sl,tp,atr,unrealized,updated_at
                 ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(position_ticket) DO UPDATE SET
-                    proposal_id=COALESCE(excluded.proposal_id,positions.proposal_id),
-                    current_price=excluded.current_price, profit=excluded.profit,
-                    volume=excluded.volume, updated_at=excluded.updated_at, state=excluded.state
                 """,
                 (
-                    int(position.ticket),
-                    proposal_id,
+                    str(position.symbol),
                     str(position.symbol),
                     str(position.direction),
                     float(position.volume),
                     float(position.price_open),
                     float(position.price_current),
+                    float(position.sl),
+                    float(position.tp),
+                    0.0,
                     float(position.profit),
-                    self._dt(position.time),
                     self._now(),
-                    "OPEN",
                 ),
             )
 
