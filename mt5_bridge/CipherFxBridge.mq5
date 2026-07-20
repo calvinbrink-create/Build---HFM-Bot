@@ -34,12 +34,12 @@ input bool ExportExtraTimeframes = true;
 input double MinLotSize = 0.00;
 input double TargetProfitPerTradeUSD = 0.00;
 input double DailyProfitTargetUSD = 1000.00;
-double DailyLossLimitUSD = 3000.00;
+double DailyLossLimitUSD = 5000.00;
 int MaxPyramidTrades = 10;
 int MaxPyramidTradesPerSignal = 10;
 input bool AllowSameCandlePyramids = true;
 int MaxOpenTradesTotal = 30;
-int MaxTradesPerDay = 100;
+int MaxTradesPerDay = 1000;
 input bool StopTradingAfterDailyTarget = false;
 input bool StopTradingAfterDailyLossLimit = true;
 input bool UseNetProfitTarget = false;
@@ -870,7 +870,7 @@ void ExportPositions()
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "ticket", "symbol", "direction", "volume", "price_open", "price_current", "sl", "tp", "profit", "time_broker", "time_utc", "broker_utc_offset_seconds");
+   FileWrite(handle, "ticket", "symbol", "direction", "volume", "price_open", "price_current", "sl", "tp", "profit", "time_broker", "time_utc", "broker_utc_offset_seconds", "magic");
    for(int i = 0; i < PositionsTotal(); i++)
    {
       ulong ticket = PositionGetTicket(i);
@@ -889,7 +889,8 @@ void ExportPositions()
          DoubleToString(PositionGetDouble(POSITION_PROFIT), 2),
          IntegerToString((int)PositionGetInteger(POSITION_TIME)),
          IntegerToString((int)PositionGetInteger(POSITION_TIME) - BrokerUtcOffsetSeconds()),
-         IntegerToString(BrokerUtcOffsetSeconds())
+         IntegerToString(BrokerUtcOffsetSeconds()),
+         IntegerToString((int)PositionGetInteger(POSITION_MAGIC))
       );
    }
    FileClose(handle);
@@ -902,7 +903,7 @@ void ExportOrders()
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "ticket", "symbol", "order_type", "side", "volume", "price_open", "sl", "tp", "state", "time_setup_broker", "time_setup_utc", "broker_utc_offset_seconds");
+   FileWrite(handle, "ticket", "symbol", "order_type", "side", "volume", "price_open", "sl", "tp", "state", "time_setup_broker", "time_setup_utc", "broker_utc_offset_seconds", "magic");
    for(int i = 0; i < OrdersTotal(); i++)
    {
       ulong ticket = OrderGetTicket(i);
@@ -923,7 +924,8 @@ void ExportOrders()
          EnumToString((ENUM_ORDER_STATE)OrderGetInteger(ORDER_STATE)),
          IntegerToString((int)OrderGetInteger(ORDER_TIME_SETUP)),
          IntegerToString((int)OrderGetInteger(ORDER_TIME_SETUP) - BrokerUtcOffsetSeconds()),
-         IntegerToString(BrokerUtcOffsetSeconds())
+         IntegerToString(BrokerUtcOffsetSeconds()),
+         IntegerToString((int)OrderGetInteger(ORDER_MAGIC))
       );
    }
    FileClose(handle);
@@ -932,14 +934,15 @@ void ExportOrders()
 
 void ExportDeals()
 {
-   datetime from = TimeCurrent() - (7 * 24 * 60 * 60);
+   // Export complete terminal history so dashboard reconciliation cannot hide older MT5 closes.
+   datetime from = 0;
    datetime to = TimeCurrent();
    if(!HistorySelect(from, to)) return;
    string final_path = BRIDGE_DIR + "\\deals.csv";
    string temp_path = final_path + ".tmp";
    int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
    if(handle == INVALID_HANDLE) return;
-   FileWrite(handle, "deal", "position_id", "symbol", "price", "profit", "swap", "commission", "net_profit", "time_broker", "time_utc", "broker_utc_offset_seconds");
+   FileWrite(handle, "deal", "position_id", "order", "symbol", "deal_type", "deal_entry", "deal_reason", "magic", "comment", "volume", "price", "profit", "swap", "commission", "net_profit", "time_broker", "time_utc", "broker_utc_offset_seconds");
    int total = HistoryDealsTotal();
    for(int i = 0; i < total; i++)
    {
@@ -953,7 +956,14 @@ void ExportDeals()
          handle,
          (string)deal,
          (string)HistoryDealGetInteger(deal, DEAL_POSITION_ID),
+         (string)HistoryDealGetInteger(deal, DEAL_ORDER),
          HistoryDealGetString(deal, DEAL_SYMBOL),
+         EnumToString((ENUM_DEAL_TYPE)HistoryDealGetInteger(deal, DEAL_TYPE)),
+         EnumToString((ENUM_DEAL_ENTRY)HistoryDealGetInteger(deal, DEAL_ENTRY)),
+         EnumToString((ENUM_DEAL_REASON)HistoryDealGetInteger(deal, DEAL_REASON)),
+         (string)HistoryDealGetInteger(deal, DEAL_MAGIC),
+         HistoryDealGetString(deal, DEAL_COMMENT),
+         DoubleToString(HistoryDealGetDouble(deal, DEAL_VOLUME), 8),
          DoubleToString(HistoryDealGetDouble(deal, DEAL_PRICE), 8),
          DoubleToString(profit, 2),
          DoubleToString(swap, 2),

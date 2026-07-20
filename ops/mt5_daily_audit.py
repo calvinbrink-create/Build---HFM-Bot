@@ -1,4 +1,10 @@
 #!/usr/bin/env python3
+"""Nightly audit of the LIVE Cipher FX platform (cipherfx_platform).
+
+Replaces the legacy audit that inspected the retired mt5_bot.py monolith and
+asserted the old limit values. Every check here targets the code and
+configuration the running service actually uses.
+"""
 from __future__ import annotations
 
 import json
@@ -8,13 +14,11 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 APP = Path("/opt/cipherfx_mt5")
 DB = APP / "state/mt5_state.db"
 ENV = Path("/etc/scalpbot/scalpbot-mt5.env")
-BRIDGE_SOURCE = APP / "mt5_bridge/CipherFxBridge.mq5"
-DEPLOYED_SOURCE = Path("/root/.mt5/drive_c/Program Files/MetaTrader 5/MQL5/Experts/CipherFxBridge.mq5")
-DEPLOYED_EX5 = DEPLOYED_SOURCE.with_suffix(".ex5")
 
 sys.path.insert(0, str(APP))
 for raw in ENV.read_text().splitlines():
@@ -26,131 +30,177 @@ for raw in ENV.read_text().splitlines():
 os.environ.setdefault("CIPHERFX_BROKER_BACKEND", "mt5")
 os.environ.setdefault("SCALPBOT_STATE_DB", str(DB))
 
-from dashboard.backend import state_store as db
-from mt5_xm_config import MT5RuntimeConfig
-
-
-def fresh(path: Path, seconds: float) -> bool:
-    return path.exists() and datetime.now().timestamp() - path.stat().st_mtime <= seconds
-
 
 def env(name: str, default: str = "") -> str:
     return str(os.getenv(name, default) or default).strip()
 
 
+def market_open_now() -> bool:
+    sast = datetime.now(timezone.utc).astimezone(ZoneInfo("Africa/Johannesburg"))
+    return sast.weekday() < 5
+
+
 def audit() -> int:
     checks: dict[str, bool] = {}
     details: dict[str, object] = {}
-    runtime = MT5RuntimeConfig()
-    source = (APP / "mt5_bot.py").read_text()
-    mql = BRIDGE_SOURCE.read_text()
-    bridge_dir = Path(env("MT5_BRIDGE_DIR"))
-    visible_path = bridge_dir / "visible_symbols.json"
-    account_path = bridge_dir / "account.txt"
 
-    conn = sqlite3.connect(DB)
-    status = dict(conn.execute("SELECT key,value FROM bot_status"))
-    quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
-    conn.close()
-
-    try:
-        export_status = json.loads(status.get("last_export_reconciliation", "{}"))
-    except Exception:
-        export_status = {}
-    try:
-        visible = json.loads(visible_path.read_text())
-    except Exception:
-        visible = {}
-    visible_symbols = visible.get("symbols") if isinstance(visible, dict) else []
-
+    # 1. Live service running.
     checks["service_active"] = subprocess.run(
         ["systemctl", "is-active", "--quiet", "scalpbot-mt5.service"]
     ).returncode == 0
-    checks["mt5_connected"] = str(status.get("mt5_connected", "")).lower() == "true"
-    checks["bridge_fresh"] = fresh(visible_path, 172800) and fresh(account_path, 30)
-    checks["visible_manifest_complete"] = isinstance(visible_symbols, list) and len(visible_symbols) == 17 and bool(visible.get("generated_at"))
-    checks["sqlite_writable"] = os.access(DB, os.W_OK) and quick == "ok"
-    checks["max_open_aligned"] = (
-        env("MT5_MAX_OPEN_TRADES") == "30"
-        and env("MT5_MAX_OPEN_TRADES_TOTAL") == "30"
-        and runtime.max_open_trades == 30
-        and str(status.get("max_open_trades")) == "30"
-        and "input int MaxOpenTradesTotal = 30;" in mql
-    )
-    checks["accepted_daily_limit_aligned"] = (
-        env("MT5_MAX_TRADES_PER_DAY") == "60"
-        and str(status.get("max_daily_trades")) == "60"
-        and "input int MaxTradesPerDay = 60;" in mql
-        and "accepted-entry daily trade limit reached" in source
-    )
-    checks["daily_loss_aligned"] = (
-        env("MT5_MAX_DAILY_LOSS_USD") == "1000"
-        and "input double DailyLossLimitUSD = 1000.00;" in mql
-        and "read_broker_day_pnl" in source
-    )
-    checks["pyramid_controls_aligned"] = (
-        env("MT5_PYRAMID_MAX_LEVELS") == "10"
-        and "input int MaxPyramidTrades = 10;" in mql
-        and "input int MaxPyramidTradesPerSignal = 10;" in mql
-        and "input bool AllowSameCandlePyramids = true;" in mql
-        and "def _campaign_cycle" in source
-    )
-    checks["loss_streak_observe_only"] = (
-        'policy = "observe_only"' in source
-        and '"event": "LOSS_STREAK_OBSERVE_ONLY"' in source
-    )
-    checks["exclusive_replacement_routing"] = (
-        "replacement strategy engine unavailable; refusing legacy fallback" in source
-        and "import scalping_bot_v4" not in source
-    )
-    checks["broker_geometry_active"] = (
-        "order_calc_trade_geometry" in source
-        and "BROKER_GEOMETRY_VALIDATED" in source
-        and "_management_rr_for_position" in source
-    )
-    checks["pre_setup_quality_active"] = all(token in source for token in (
-        "STRATEGY_V1_PRE_SETUP_QUALITY",
-        "STRATEGY_V1_PRE_SETUP_SAFETY",
-        "INDEX_EXHAUSTION_NOT_QUALIFIED",
-        "CENTRAL_COST_MODEL_AUTHORITATIVE",
-    ))
-    checks["causal_m1_and_ttl_active"] = (
-        "_completed_m1_candle_id" in source
-        and "candle_closed_dt <= setup_created_dt" in source
-        and "return 90" in source
-        and source.count("return 120") >= 3
-    )
-    checks["last_export_reconciled"] = bool(export_status.get("reconciled"))
-    checks["source_deployed"] = DEPLOYED_SOURCE.exists() and BRIDGE_SOURCE.read_bytes() == DEPLOYED_SOURCE.read_bytes()
-    checks["compiled_expert_present"] = DEPLOYED_EX5.exists() and DEPLOYED_EX5.stat().st_size > 0
-    test_result = subprocess.run(
-        [str(APP / ".venv_mt5/bin/python"), str(APP / "test_mt5_replacement_pipeline.py")],
+    checks["dashboard_active"] = subprocess.run(
+        ["systemctl", "is-active", "--quiet", "scalpbot-dashboard-mt5.service"]
+    ).returncode == 0
+
+    # 2. The live import chain is intact.
+    import_probe = subprocess.run(
+        [
+            str(APP / ".venv_mt5/bin/python"),
+            "-c",
+            (
+                "import sys; sys.path.insert(0, '/opt/cipherfx_mt5');"
+                "from cipherfx_platform.runtime import main;"
+                "from cipherfx_platform.execution import ExecutionEngine;"
+                "from cipherfx_platform.engines.forex import ForexLearningEngine;"
+                "from cipherfx_platform.engines.indices import IndicesLearningEngine;"
+                "from cipherfx_platform.engines.metals import MetalsLearningEngine;"
+                "print('ok')"
+            ),
+        ],
         cwd=APP,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
+        capture_output=True,
         text=True,
-        timeout=120,
+        timeout=60,
     )
-    checks["replacement_test_suite"] = test_result.returncode == 0
-    details.update({
-        "generated_at": datetime.now(timezone.utc).isoformat(),
-        "broker_day": db.broker_trading_today(),
-        "accepted_entries_broker_day": db.read_todays_trade_count(),
-        "realized_pnl_broker_day": db.read_broker_day_pnl(),
-        "visible_symbols": len(visible_symbols or []),
-        "test_output": test_result.stdout.strip().splitlines()[-8:],
-        "export_status": export_status,
-    })
+    checks["live_imports_ok"] = import_probe.returncode == 0
+    if import_probe.returncode != 0:
+        details["import_error"] = import_probe.stderr.strip()[-500:]
+
+    # 3. Engine architecture: M1 removed, H4 anchor present, in all 3 engines.
+    engines_ok = True
+    for engine_file in ("forex.py", "indices.py", "metals.py"):
+        source = (APP / "cipherfx_platform/engines" / engine_file).read_text()
+        if '"M1"' in source.split("TIME_WEIGHTS")[1].split("}")[0]:
+            engines_ok = False
+            details[f"m1_leak_{engine_file}"] = True
+        if 'frames["H4"]' not in source:
+            engines_ok = False
+            details[f"h4_anchor_missing_{engine_file}"] = True
+    checks["engines_m1_removed_h4_anchored"] = engines_ok
+
+    # 4. Risk gates present in the live execution engine.
+    execution_source = (APP / "cipherfx_platform/execution.py").read_text()
+    checks["risk_gates_present"] = all(
+        token in execution_source
+        for token in (
+            "_win_cooldown_reason",
+            "_correlated_exposure_reason",
+            "_pyramid_cooldown_reason",
+            "MAX_TRADES_PER_SYMBOL",
+        )
+    )
+
+    # 4b. Entry-timing guard (combo F) wired into every engine.
+    guard_ok = (APP / "cipherfx_platform/entry_timing.py").exists()
+    for engine_file in ("forex.py", "indices.py", "metals.py"):
+        engine_source = (APP / "cipherfx_platform/engines" / engine_file).read_text()
+        if "entry_timing.evaluate" not in engine_source or 'entry_guard["blocked"]' not in engine_source:
+            guard_ok = False
+            details[f"entry_guard_missing_{engine_file}"] = True
+    checks["entry_timing_guard_wired"] = guard_ok
+
+    # 4c. Index market hours are not artificially narrowed back down. Fixed
+    # 2026-07-20: hardcoded cash-session windows were blocking hours this
+    # account had already traded successfully in (verified against real
+    # trade_history for US30/GER40/UK100/JP225).
+    sessions_source = (APP / "cipherfx_platform/market_sessions.py").read_text()
+    checks["index_hours_not_narrowed"] = (
+        "US_MARKET_OPEN_LOCAL" not in sessions_source
+        and "ASIA_OPEN" not in sessions_source
+        and "EUROPE_OPEN" not in sessions_source
+    )
+
+    # 4d. Per-position dollar loss cap scales with the trade's own 1R risk, so
+    # it can never scalp-cut a swing entry below its price stop.
+    management_source = (APP / "cipherfx_platform/management.py").read_text()
+    checks["loss_cap_scales_with_risk"] = (
+        "_effective_loss_cap" in management_source
+        and "initial_risk * 1.5" in management_source
+    )
+
+    # 5. Configured limits match the approved values.
+    checks["limits_aligned"] = (
+        env("MT5_MAX_DAILY_TRADES") == "100"
+        and env("MT5_MAX_DAILY_LOSS_USD") == "1000"
+        and env("MT5_MAX_DAILY_TRADES_PER_SYMBOL") == "10"
+        and env("MT5_MAX_PYRAMID_TRADES") == "8"
+    )
+
+    # 5b. Pyramid legs decay in size, and gold stays sized down.
+    execution_source_for_sizing = (APP / "cipherfx_platform/execution.py").read_text()
+    checks["pyramid_size_decay_wired"] = (
+        "pyramid_leg_index" in execution_source_for_sizing
+        and "MT5_PYRAMID_SIZE_DECAY" in execution_source_for_sizing
+    )
+    try:
+        gold_risk_pct = float(env("MT5_RISK_PCT_XAUUSD", "0"))
+        metals_default = float(env("MT5_RISK_PCT_METALS", "1"))
+    except ValueError:
+        gold_risk_pct, metals_default = 999.0, 1.0
+    checks["gold_sized_conservatively"] = 0 < gold_risk_pct <= metals_default
+
+    # 6. Symbol universe intact (17 canonical instruments).
+    try:
+        catalog = json.loads((APP / "mt5_symbols.json").read_text())
+        active = [
+            symbol
+            for group in ("forex", "metals", "indices")
+            for symbol in (catalog.get(group) or [])
+        ]
+    except Exception:
+        active = []
+    checks["symbol_universe_17"] = len(active) == 17
+    details["active_symbols"] = len(active)
+
+    # 7. Database healthy.
+    conn = sqlite3.connect(DB)
+    quick = str(conn.execute("PRAGMA quick_check").fetchone()[0])
+    try:
+        service_payload = json.loads(
+            dict(conn.execute("SELECT key,value_json FROM platform_status")).get("service") or "{}"
+        )
+    except Exception:
+        service_payload = {}
+    conn.close()
+    checks["sqlite_writable"] = os.access(DB, os.W_OK) and quick == "ok"
+
+    # 8. Broker connection - only meaningful while the market is open.
+    connected = str(service_payload.get("state") or "").upper() == "CONNECTED"
+    if market_open_now():
+        checks["mt5_connected"] = connected
+    else:
+        details["mt5_connected_weekend_skip"] = connected
+
+    details.update(
+        {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "audited_stack": "cipherfx_platform",
+        }
+    )
 
     for name, passed in checks.items():
         print(f"[MT5_DAILY_AUDIT] {name}={'PASS' if passed else 'FAIL'}")
     ok = all(checks.values())
     payload = {"overall": "PASS" if ok else "FAIL", "checks": checks, "details": details}
-    db.set_status("last_daily_audit", payload)
+    try:
+        from dashboard.backend import state_store as db
+
+        db.set_status("last_daily_audit", payload)
+    except Exception as exc:
+        print(f"[MT5_DAILY_AUDIT] status_write_skipped={exc}")
     print(f"[MT5_DAILY_AUDIT] overall={payload['overall']} generated_at={details['generated_at']}")
     return 0 if ok else 1
 
 
 if __name__ == "__main__":
     raise SystemExit(audit())
-

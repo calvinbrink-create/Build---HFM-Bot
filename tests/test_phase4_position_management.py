@@ -45,6 +45,19 @@ class ManagementGateway:
 class FailingManagementGateway(ManagementGateway):
     def modify_position(self, ticket, symbol, sl, tp):
         raise RuntimeError("broker 4756")
+
+
+class MissingExportManagementGateway(ManagementGateway):
+    def symbol_tick(self, symbol):
+        raise RuntimeError(f"MT5 bridge symbol not exported: {symbol}")
+
+    def symbol_info(self, symbol):
+        raise RuntimeError(f"MT5 bridge symbol not exported: {symbol}")
+
+
+class FailingCloseGateway(ManagementGateway):
+    def close_position(self, position):
+        raise RuntimeError("broker close failure")
 class Phase4PositionManagementTests(unittest.TestCase):
     def position(self, *, sl=0.9, current=1.05):
         return SimpleNamespace(
@@ -61,13 +74,15 @@ class Phase4PositionManagementTests(unittest.TestCase):
         )
 
     def test_monitor_persists_intelligence_and_trails_profitable_position(self):
+        # r=1.3 clears the new trail_start_r=1.2 (raised from 0.5) but stays
+        # below profit_take_r=1.5, so this exercises the trail-modify path.
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            gateway = ManagementGateway(self.position())
+            gateway = ManagementGateway(self.position(sl=0.9, current=1.13))
             manager = TradeManagementEngine(gateway, db)
             manager.monitor()
             self.assertEqual(len(gateway.modified), 1)
-            self.assertAlmostEqual(gateway.modified[0][2], 1.025)
+            self.assertAlmostEqual(gateway.modified[0][2], 1.105)
             with sqlite3.connect(db.path) as conn:
                 state = conn.execute(
                     "SELECT state_json FROM position_management WHERE position_ticket=77"
@@ -76,13 +91,54 @@ class Phase4PositionManagementTests(unittest.TestCase):
                     "SELECT event_type FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ACTION'"
                 ).fetchone()[0]
             self.assertEqual(event, "POSITION_MANAGEMENT_ACTION")
-            self.assertIn('"mfe_r":0.5', state)
-            self.assertIn('"rank":"STRONG"', state)
+            parsed_state = json.loads(state)
+            self.assertAlmostEqual(parsed_state["mfe_r"], 1.3)
+            self.assertEqual(parsed_state["rank"], "EXCELLENT")
+
+    def test_profitable_position_is_closed_at_configured_profit_take(self):
+        # r=1.6 clears the new profit_take_r=1.5 (raised from 0.6).
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = ManagementGateway(self.position(sl=0.9, current=1.16))
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            self.assertEqual(gateway.closed, [77])
+            with sqlite3.connect(db.path) as conn:
+                payload = conn.execute(
+                    "SELECT payload_json FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ACTION'"
+                ).fetchone()[0]
+            self.assertIn("PROFIT_TAKE_R_REACHED", payload)
+
+    def test_missing_export_stop_modification_is_not_repeated_each_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = MissingExportManagementGateway(self.position(sl=0.9, current=1.13))
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            manager.monitor()
+            with sqlite3.connect(db.path) as conn:
+                errors = conn.execute(
+                    "SELECT COUNT(*) FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ERROR'"
+                ).fetchone()[0]
+            self.assertEqual(errors, 1)
+
+    def test_failed_close_is_not_repeated_each_scan(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = FailingCloseGateway(self.position(sl=0.9, current=1.16))
+            manager = TradeManagementEngine(gateway, db)
+            manager.monitor()
+            manager.monitor()
+            with sqlite3.connect(db.path) as conn:
+                errors = conn.execute(
+                    "SELECT COUNT(*) FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ERROR'"
+                ).fetchone()[0]
+            self.assertEqual(errors, 1)
 
     def test_failed_stop_modification_is_not_repeated_each_scan(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            gateway = FailingManagementGateway(self.position())
+            gateway = FailingManagementGateway(self.position(sl=0.9, current=1.13))
             manager = TradeManagementEngine(gateway, db)
             manager.monitor()
             manager.monitor()
@@ -110,6 +166,21 @@ class Phase4PositionManagementTests(unittest.TestCase):
         ):
             self.assertNotIn(forbidden, source)
 
+    def test_configured_open_position_loss_cap_closes_before_unmanaged_loss_grows(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            gateway = ManagementGateway(self.position(sl=0.9, current=0.93))
+            gateway.position.profit = -160.0
+            manager = TradeManagementEngine(gateway, db)
+            manager.profiles = {"TEST": {"max_open_position_loss_usd": 150.0}}
+            manager.monitor()
+            self.assertEqual(gateway.closed, [77])
+            with sqlite3.connect(db.path) as conn:
+                payload = conn.execute(
+                    "SELECT payload_json FROM platform_events WHERE event_type='POSITION_MANAGEMENT_ACTION'"
+                ).fetchone()[0]
+            self.assertIn("MAX_OPEN_POSITION_LOSS", payload)
+
     def test_unmanaged_position_is_closed_and_logged(self):
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
@@ -125,12 +196,15 @@ class Phase4PositionManagementTests(unittest.TestCase):
 
 
     def test_management_accumulates_intelligence_and_actions(self):
+        # r=1.3 then r=1.6 clears the new trail_start_r=1.2 and then
+        # profit_take_r=1.5 (raised from 0.5/0.6) so an action is still
+        # recorded on each pass.
         with tempfile.TemporaryDirectory() as tmp:
             db = DatabaseLayer(Path(tmp) / "platform.db")
-            gateway = ManagementGateway(self.position(current=1.05))
+            gateway = ManagementGateway(self.position(sl=0.9, current=1.13))
             manager = TradeManagementEngine(gateway, db)
             manager.monitor()
-            gateway.position.price_current = 1.08
+            gateway.position.price_current = 1.16
             gateway.position.profit = 8.0
             manager.monitor()
             with sqlite3.connect(db.path) as conn:

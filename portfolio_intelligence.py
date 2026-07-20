@@ -83,6 +83,7 @@ def _risk_status(
     margin_utilization: float | None,
     equity: float | None,
     unrealized_pnl: float | None,
+    realized_pnl: float | None,
 ) -> str:
     if not connected:
         return "CRITICAL"
@@ -92,6 +93,12 @@ def _risk_status(
         return "HIGH"
     if margin_utilization is not None and margin_utilization >= 0.50:
         return "ELEVATED"
+    if equity and realized_pnl is not None:
+        realized_ratio = realized_pnl / abs(equity)
+        if realized_ratio <= -0.10:
+            return "HIGH"
+        if realized_ratio <= -0.02:
+            return "ELEVATED"
     if equity and unrealized_pnl is not None and unrealized_pnl / abs(equity) <= -0.02:
         return "ELEVATED"
     return "NORMAL"
@@ -152,6 +159,14 @@ def build_portfolio_snapshot(
         net_volume += volume if side == "BUY" else -volume if side == "SELL" else 0.0
     stale_ticks = int(operational.get("stale_tick_count") or 0)
     connected = bool(operational.get("mt5_connected"))
+    realized_pnl = round(
+        sum(
+            _number(summary.get("realized_pnl", summary.get("pnl")), 0.0) or 0.0
+            for summary in closed_summaries.values()
+            if isinstance(summary, dict)
+        ),
+        2,
+    )
     health_score = 100
     if not connected:
         health_score -= 45
@@ -164,6 +179,18 @@ def build_portfolio_snapshot(
             health_score -= 30
         elif margin_utilization >= 0.50:
             health_score -= 15
+    if equity and realized_pnl < 0:
+        realized_loss_ratio = abs(realized_pnl) / abs(equity)
+        if realized_loss_ratio >= 0.50:
+            health_score -= 45
+        elif realized_loss_ratio >= 0.25:
+            health_score -= 35
+        elif realized_loss_ratio >= 0.10:
+            health_score -= 25
+        elif realized_loss_ratio >= 0.05:
+            health_score -= 15
+        elif realized_loss_ratio >= 0.02:
+            health_score -= 8
     if equity and unrealized_pnl / abs(equity) <= -0.02:
         health_score -= 15
     health_score = max(0, min(100, int(health_score)))
@@ -202,14 +229,7 @@ def build_portfolio_snapshot(
         margin_utilization=margin_utilization,
         equity=equity,
         unrealized_pnl=unrealized_pnl,
-    )
-    realized_pnl = round(
-        sum(
-            _number(summary.get("realized_pnl", summary.get("pnl")), 0.0) or 0.0
-            for summary in closed_summaries.values()
-            if isinstance(summary, dict)
-        ),
-        2,
+        realized_pnl=realized_pnl,
     )
     current_drawdown = round(max(0.0, -unrealized_pnl), 2)
     current_drawdown_pct = (
@@ -290,6 +310,10 @@ def build_portfolio_snapshot(
         "performance": {
             "closed_summaries": closed_summaries,
             "realized_pnl": realized_pnl,
+            "realized_loss_ratio": (
+                round(abs(realized_pnl) / abs(equity), 6)
+                if realized_pnl < 0 and equity and equity > 0 else 0.0
+            ),
             "unrealized_pnl": unrealized_pnl,
         },
         "correlation": {

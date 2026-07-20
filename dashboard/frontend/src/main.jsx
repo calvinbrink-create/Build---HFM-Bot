@@ -87,6 +87,7 @@ function hasValidDashboardSession(dashboardId = currentDashboardId()) {
 
 function clearDashboardSession() {
   safeStorageRemove(AUTH_KEY);
+  safeStorageRemove("cipherfx_mt5_mode");
   Object.values(DASHBOARDS).forEach((dashboard) => safeStorageRemove(dashboard.tokenKey));
 }
 
@@ -132,6 +133,9 @@ function LoginPage({ activeDashboard, onLogin }) {
   const [busy, setBusy] = React.useState(false);
   const [error, setError] = React.useState("");
   const [warning, setWarning] = React.useState("");
+  const [mt5Mode, setMt5Mode] = React.useState(() => safeStorageGet("cipherfx_mt5_mode") || "demo");
+  const [mt5Account, setMt5Account] = React.useState("");
+  const [mt5AccountPassword, setMt5AccountPassword] = React.useState("");
   const target = DASHBOARDS[activeDashboard] || DASHBOARDS.ibkr;
 
   async function submit(event) {
@@ -141,25 +145,37 @@ function LoginPage({ activeDashboard, onLogin }) {
     setWarning("");
     try {
       const credentials = { email: email.trim(), password };
-      const entries = Object.entries(DASHBOARDS);
-      const results = await Promise.allSettled(entries.map(([, dashboard]) => loginDashboard(dashboard, credentials)));
-      const currentIndex = entries.findIndex(([id]) => id === activeDashboard);
-      const currentResult = results[currentIndex];
-      if (currentResult?.status !== "fulfilled") {
-        throw currentResult?.reason || new Error("Login failed");
+      if (activeDashboard === "mt5") {
+        const endpoint = mt5Mode === "live" ? "/mt5-api/live-login" : "/mt5-api/login";
+        const body = mt5Mode === "live"
+          ? { ...credentials, account: mt5Account.trim(), account_password: mt5AccountPassword }
+          : credentials;
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        if (!response.ok) throw new Error(await response.text().catch(() => "MT5 login failed"));
+        const data = await response.json();
+        if (!data.token) throw new Error("MT5 did not return a session token");
+        safeStorageSet(DASHBOARDS.mt5.tokenKey, data.token);
+        safeStorageSet("cipherfx_mt5_mode", mt5Mode);
+        safeStorageSet(AUTH_KEY, JSON.stringify({
+          email: credentials.email,
+          expiresAt: Date.now() + AUTH_TTL_MS,
+          dashboards: ["mt5"],
+        }));
+        setMt5AccountPassword("");
+        onLogin();
+      } else {
+        await loginDashboard(DASHBOARDS.ibkr, credentials);
+        safeStorageSet(AUTH_KEY, JSON.stringify({
+          email: credentials.email,
+          expiresAt: Date.now() + AUTH_TTL_MS,
+          dashboards: ["ibkr"],
+        }));
+        onLogin();
       }
-      const available = entries
-        .filter(([, dashboard]) => Boolean(safeStorageGet(dashboard.tokenKey)))
-        .map(([id]) => id);
-      safeStorageSet(AUTH_KEY, JSON.stringify({
-        email: credentials.email,
-        expiresAt: Date.now() + AUTH_TTL_MS,
-        dashboards: available,
-      }));
-      if (results.some((result) => result.status === "rejected")) {
-        setWarning("Logged into this dashboard. The other dashboard will ask again if its API is offline.");
-      }
-      onLogin();
     } catch (err) {
       setError("Login failed. Check the email and password, then try again.");
     } finally {
@@ -173,7 +189,7 @@ function LoginPage({ activeDashboard, onLogin }) {
         <div className="dashboard-login-brand">
           <img src={logoSrc} alt="Cipher FX" className="dashboard-login-logo" />
           <strong>{target.title}</strong>
-          <p>One secure login for MT5 and IBKR dashboards. Your browser session stays active for 24 hours.</p>
+          <p>{activeDashboard === "mt5" ? "Choose Demo or Live MT5 mode. Live account credentials stay on the protected server." : "Secure access to the IBKR dashboard. Your browser session stays active for 24 hours."}</p>
         </div>
         <div className="dashboard-login-tabs" aria-label="Dashboard chooser">
           {Object.entries(DASHBOARDS).map(([id, dashboard]) => (
@@ -211,6 +227,27 @@ function LoginPage({ activeDashboard, onLogin }) {
               required
             />
           </label>
+          {activeDashboard === "mt5" && (
+            <>
+              <div className="mt5-mode-switch" aria-label="MT5 account mode">
+                <button type="button" className={mt5Mode === "demo" ? "active" : ""} onClick={() => { setMt5Mode("demo"); setMt5AccountPassword(""); }}>Demo mode</button>
+                <button type="button" className={mt5Mode === "live" ? "active" : ""} onClick={() => setMt5Mode("live")}>Live mode</button>
+              </div>
+              {mt5Mode === "live" && (
+                <div className="mt5-live-fields">
+                  <p>Live credentials are sent to the protected server and are never stored in this browser.</p>
+                  <label>
+                    <span>MT5 account</span>
+                    <input inputMode="numeric" type="text" value={mt5Account} onChange={(event) => setMt5Account(event.target.value)} autoComplete="off" required />
+                  </label>
+                  <label>
+                    <span>MT5 account password</span>
+                    <input type="password" value={mt5AccountPassword} onChange={(event) => setMt5AccountPassword(event.target.value)} autoComplete="off" required />
+                  </label>
+                </div>
+              )}
+            </>
+          )}
           {error && <div className="dashboard-login-message error">{error}</div>}
           {warning && <div className="dashboard-login-message">{warning}</div>}
           <button type="submit" disabled={busy}>
@@ -255,8 +292,7 @@ function DashboardAuthGate() {
 
   return (
     <>
-      <DashboardSwitcher activeDashboard={activeDashboard} onLogout={handleLogout} />
-      <Component />
+      <Component onLogout={handleLogout} />
     </>
   );
 }

@@ -1,2 +1,33 @@
 <!doctype html>
-<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0"/><title>Cipher FX MT5</title></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+<html lang="en"><head><meta charset="UTF-8"/><meta name="viewport" content="width=device-width,initial-scale=1.0,viewport-fit=cover"/><title>Cipher FX MT5</title>
+<!-- Declares this as a real standalone PWA rather than letting iOS fall
+     back to its untested/legacy Safari bookmark mode when "Add to Home
+     Screen" is used - that fallback mode is the source of the horizontal
+     shift seen only on the home-screen icon, never in a normal Safari tab. -->
+<meta name="apple-mobile-web-app-capable" content="yes"/>
+<meta name="mobile-web-app-capable" content="yes"/>
+<meta name="apple-mobile-web-app-status-bar-style" content="black"/>
+<meta name="apple-mobile-web-app-title" content="Cipher FX"/>
+<meta name="theme-color" content="#05080e"/>
+<link rel="apple-touch-icon" href="/dashboard/mt5/apple-touch-icon.png"/>
+<link rel="manifest" href="/dashboard/mt5/manifest.webmanifest"/>
+<script>
+  // iOS Safari (especially a fresh PWA launch from the home screen) can
+  // report an incorrect 100dvh on the very first paint, before it finishes
+  // settling the dynamic toolbar - any later reflow (tapping a tab) then
+  // "fixes" it, which is why the app looks cut off only on cold open.
+  // Measure the real viewport height in JS instead of trusting the CSS
+  // unit alone, and keep it updated as the toolbar/orientation changes.
+  (function () {
+    function setAppHeight() {
+      document.documentElement.style.setProperty("--app-vh", window.innerHeight + "px");
+    }
+    setAppHeight();
+    window.addEventListener("resize", setAppHeight);
+    window.addEventListener("orientationchange", setAppHeight);
+    window.addEventListener("pageshow", setAppHeight);
+    document.addEventListener("visibilitychange", function () {
+      if (document.visibilityState === "visible") setAppHeight();
+    });
+  })();
+</script></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>

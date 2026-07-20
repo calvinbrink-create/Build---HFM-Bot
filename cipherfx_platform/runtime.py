@@ -21,6 +21,7 @@ from .execution import ExecutionEngine
 from .feedback import LearningFeedbackEngine
 from .management import TradeManagementEngine
 from .market_data import MarketDataEngine, MarketDataError
+from .planning import PremarketPlanningEngine
 from portfolio_intelligence import PortfolioIntelligenceEngine
 
 LOG = logging.getLogger("cipherfx.platform")
@@ -69,6 +70,12 @@ class ModularTradingRuntime:
         self.execution = ExecutionEngine(self.gateway, self.config, self.database)
         self.management = TradeManagementEngine(self.gateway, self.database)
         self.feedback = LearningFeedbackEngine(self.database, self.learning.record_outcome)
+        self.planning = PremarketPlanningEngine(
+            self.database,
+            self.learning,
+            self.config,
+            interval_seconds=float(os.getenv("MT5_PREMARKET_PLAN_INTERVAL_SECONDS", "300")),
+        )
         self.portfolio_intelligence = PortfolioIntelligenceEngine()
         self._last_portfolio_event_at = 0.0
         self._last_portfolio_event_signature = ""
@@ -81,6 +88,7 @@ class ModularTradingRuntime:
         self._stop = False
         self._last_market_feed_persist_at = 0.0
         self._last_db_checkpoint_at = 0.0
+        self._last_planning_at = 0.0
         self._lifecycle_state = "IDLE"
 
     def _record_lifecycle(self, state: str, reason: str = "", **details) -> bool:
@@ -116,6 +124,33 @@ class ModularTradingRuntime:
     def stop(self, *_args) -> None:
         self._stop = True
         self.gateway.request_shutdown()
+
+    def _wait_for_initial_feed(self) -> bool:
+        """Avoid consuming the first scan before the live WebSocket has a tick."""
+        timeout = max(
+            5.0,
+            min(120.0, float(os.getenv("MT5_STARTUP_HEALTH_GRACE_SECONDS", "90"))),
+        )
+        deadline = time.monotonic() + timeout
+        last_status = {}
+        while not self._stop and time.monotonic() < deadline:
+            last_status = self.market_data.live_tick_status()
+            if int(last_status.get("fresh_symbols", 0) or 0) > 0:
+                self.database.event(
+                    "MARKET_FEED_READY",
+                    {"fresh_symbols": last_status.get("fresh_symbols", 0)},
+                )
+                return True
+            time.sleep(0.2)
+        self.database.event(
+            "MARKET_FEED_STARTUP_TIMEOUT",
+            {
+                "timeout_seconds": timeout,
+                "fresh_symbols": last_status.get("fresh_symbols", 0),
+                "stale_symbols": last_status.get("stale_symbols", []),
+            },
+        )
+        return False
 
     @staticmethod
     def _payload(report: dict, proposal=None) -> dict:
@@ -154,6 +189,31 @@ class ModularTradingRuntime:
             )
         return len(expired)
 
+    def _position_engine(self, symbol: str) -> str:
+        """Attribute an open position from symbol metadata only."""
+        canonical = self.config.canonical_symbol(symbol)
+        group = self.config.group_for_symbol(canonical)
+        if group in {"forex", "indices", "metals"}:
+            return {"forex": "FOREX", "indices": "INDICES", "metals": "METALS"}[group]
+        try:
+            info = self.gateway.symbol_info(symbol)
+            text = " ".join(
+                str(value or "") for value in (
+                    getattr(info, "path", ""),
+                    getattr(info, "description", ""),
+                    symbol,
+                )
+            ).upper()
+        except Exception:
+            text = str(symbol or "").upper()
+        if any(token in text for token in ("METAL", "XAU", "XAG", "GOLD", "SILVER")):
+            return "METALS"
+        if any(token in text for token in ("FOREX", "FX", "CURRENCY")):
+            return "FOREX"
+        if any(token in text for token in ("INDEX", "INDICES", "CASH", "GER40", "UK100", "US30", "US100", "US500")):
+            return "INDICES"
+        return "UNATTRIBUTED"
+
     def _publish_portfolio_intelligence(self) -> None:
         """Publish portfolio facts without participating in any trade decision."""
         try:
@@ -170,6 +230,10 @@ class ModularTradingRuntime:
                     "sl": position.sl,
                     "tp": position.tp,
                     "profit": position.profit,
+                    "engine": self._position_engine(position.symbol),
+                    "risk_amount": float(
+                        (self.database.position_baseline(position.ticket) or {}).get("initial_risk") or 0.0
+                    ),
                 }
                 for position in self.gateway.positions()
             ]
@@ -324,6 +388,34 @@ class ModularTradingRuntime:
         summary["closed"] = self.feedback.reconcile_closed_trades(self.gateway)
         summary["expired"] = self._expire_feedback()
         self._publish_portfolio_intelligence()
+        now_monotonic = time.monotonic()
+        if now_monotonic - self._last_planning_at >= self.planning.interval_seconds:
+            try:
+                planning = self.planning.refresh()
+                self.database.status("planning", planning)
+                self.database.event(
+                    "PREMARKET_PLANS_REFRESHED",
+                    {
+                        "target_market_date": planning.get("target_market_date"),
+                        "symbols": planning.get("symbols", 0),
+                        "planned": planning.get("planned", 0),
+                        "watching": planning.get("watching", 0),
+                        "waiting_for_snapshot": planning.get("waiting_for_snapshot", 0),
+                    },
+                )
+            except Exception as exc:
+                LOG.exception("premarket planning refresh failed")
+                self.database.status(
+                    "planning",
+                    {
+                        "status": "ERROR",
+                        "source": "persisted_market_snapshots",
+                        "reason": str(exc),
+                        "planned_at": datetime.now(timezone.utc).isoformat(),
+                    },
+                )
+            finally:
+                self._last_planning_at = now_monotonic
         if perform_scan and summary["filled"]:
             self._record_lifecycle("ORDER_EXECUTED", "one or more orders filled", filled=summary["filled"])
         if perform_scan:
@@ -357,7 +449,7 @@ class ModularTradingRuntime:
                 },
             )
             self._last_market_feed_persist_at = now_monotonic
-        if perform_scan and time.monotonic() - self._last_db_checkpoint_at >= 300.0:
+        if time.monotonic() - self._last_db_checkpoint_at >= 300.0:
             checkpoint = self.database.checkpoint()
             self.database.status("database_health", checkpoint)
             self._last_db_checkpoint_at = time.monotonic()
@@ -369,6 +461,7 @@ class ModularTradingRuntime:
             raise RuntimeError("live WebSocket tick listener failed to start")
         try:
             self.gateway.connect()
+            self._wait_for_initial_feed()
             self._write_heartbeat("RUNNING")
             self.database.status(
                 "service",

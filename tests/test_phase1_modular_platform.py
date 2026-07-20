@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -101,6 +102,31 @@ class Phase1ModularPlatformTests(unittest.TestCase):
             self.assertEqual(len(gateway.calls), 1)
             duplicate = engine.submit(proposal())
             self.assertEqual(duplicate.status, "DUPLICATE_SUPPRESSED")
+
+    def test_order_placed_without_deal_is_not_reported_as_filled(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            class PlacedOnlyGateway(FakeGateway):
+                def place_market_order(self, *args):
+                    self.calls.append(args)
+                    return args[0], 1.1001, SimpleNamespace(retcode=10008, order=77, deal=0, position=0, comment="placed")
+
+            db_path = Path(tmp) / "platform.db"
+            db = DatabaseLayer(db_path)
+            config = SimpleNamespace(
+                max_daily_trades=30, max_open_trades=30,
+                dry_run=False, trade_mode="live",
+            )
+            gateway = PlacedOnlyGateway()
+            engine = ExecutionEngine(gateway, config, db)
+            result = engine.submit(proposal())
+            self.assertEqual(result.status, "REJECTED")
+            self.assertIsNone(result.filled_at)
+            self.assertIn("BROKER_ORDER_PLACED_NOT_FILLED", result.reason)
+            with sqlite3.connect(db_path) as conn:
+                row = conn.execute("SELECT status, response_json, deal_ticket FROM executions WHERE proposal_id=?", (proposal().proposal_id,)).fetchone()
+            self.assertEqual(row[0], "REJECTED")
+            self.assertIn("BROKER_ORDER_PLACED_NOT_FILLED", row[1])
+            self.assertEqual(int(row[2] or 0), 0)
 
     def test_feedback_only_consumes_trade_outcome(self):
         with tempfile.TemporaryDirectory() as tmp:

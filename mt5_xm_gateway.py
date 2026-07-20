@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import math
 import threading
 import time
@@ -12,6 +13,8 @@ from types import SimpleNamespace
 import pandas as pd
 
 from mt5_xm_config import MT5RuntimeConfig
+
+LOG = logging.getLogger("cipherfx.gateway")
 
 
 @dataclass
@@ -151,11 +154,15 @@ class MT5Gateway:
             return 0
         payload = self._read_key_values(self.config.bridge_dir / "account.txt")
         raw = payload.get("broker_utc_offset_seconds")
+        if raw in (None, ""):
+            # No reading at all this time - keep the last known-good offset
+            # rather than treating "missing" the same as "genuinely zero".
+            return int(self._broker_offset_cache)
         try:
-            value = int(float(raw)) if raw not in (None, "") else 0
-        except Exception:
-            value = 0
-        if abs(value) <= 14 * 3600 and value != 0:
+            value = int(float(raw))
+        except (TypeError, ValueError):
+            return int(self._broker_offset_cache)
+        if abs(value) <= 14 * 3600:
             self._broker_offset_cache = value
         return int(self._broker_offset_cache)
 
@@ -334,6 +341,78 @@ class MT5Gateway:
         result.attrs["bridge_rates"] = bridge_meta
         return result
 
+    def _bridge_position_symbol(self, symbol: str) -> str:
+        """Resolve a broker symbol for an already-open bridge position only."""
+        resolved = self.config.resolved_symbol(symbol)
+        rows = self._bridge_symbol_map()
+        row = rows.get(resolved.upper())
+        if row is not None:
+            return str(row.get("_broker_symbol") or resolved)
+        path = self.config.bridge_dir / "positions.csv"
+        if not path.exists():
+            raise RuntimeError(f"MT5 bridge position not found: {resolved}")
+        frame = self._read_bridge_csv(path)
+        if frame.empty or "symbol" not in frame.columns:
+            raise RuntimeError(f"MT5 bridge position not found: {resolved}")
+        matches = frame[frame["symbol"].astype(str).str.upper() == resolved.upper()]
+        if matches.empty:
+            raise RuntimeError(f"MT5 bridge position not found: {resolved}")
+        actual = str(matches.iloc[0].get("symbol") or resolved).strip()
+        if not actual:
+            raise RuntimeError(f"MT5 bridge position not found: {resolved}")
+        return actual
+
+    def position_symbol_tick(self, symbol: str):
+        if self.mode == "native":
+            return self.symbol_tick(symbol)
+        resolved = self._bridge_position_symbol(symbol)
+        payload = self._read_key_values(self.config.bridge_dir / f"tick_{resolved}.txt")
+        time_utc = self._bridge_utc_epoch(payload, "time_utc", "time_broker", "time")
+        bid = float(payload.get("bid", "0") or 0.0)
+        ask = float(payload.get("ask", "0") or 0.0)
+        if bid <= 0 or ask <= 0:
+            raise RuntimeError(f"No MT5 tick for open position {resolved}")
+        return resolved, SimpleNamespace(
+            bid=bid,
+            ask=ask,
+            last=float(payload.get("last", "0") or 0.0),
+            time=time_utc,
+            time_utc=time_utc,
+            time_broker=int(float(payload.get("time_broker", payload.get("time", "0")) or 0)),
+            broker_utc_offset_seconds=self.broker_utc_offset_seconds(),
+            receipt_time_utc=datetime.now(timezone.utc),
+        )
+
+    def position_symbol_info(self, symbol: str) -> MT5SymbolSpec:
+        if self.mode == "native":
+            return self.symbol_info(symbol)
+        resolved = self._bridge_position_symbol(symbol)
+        try:
+            return self.symbol_info(resolved)
+        except RuntimeError:
+            digits = self._default_digits(resolved)
+            point = self._default_point(resolved)
+            return MT5SymbolSpec(
+                symbol=resolved,
+                visible=True,
+                description="open bridge position",
+                path="",
+                digits=digits,
+                point=point,
+                volume_min=0.01,
+                volume_max=100.0,
+                volume_step=0.01,
+                contract_size=self._default_contract_size(resolved),
+                tick_value=0.0,
+                tick_value_profit=0.0,
+                tick_value_loss=0.0,
+                tick_size=point,
+                stops_level=0,
+                trade_mode=4,
+                filling_mode=0,
+                currency_profit="",
+            )
+
     def symbol_tick(self, symbol: str):
         if self.mode == "native":
             assert self.mt5 is not None
@@ -456,6 +535,7 @@ class MT5Gateway:
         if self.mode == "native":
             assert self.mt5 is not None
             positions = self.mt5.positions_get() or []
+            own_magic = int(self.config.magic)
             return [
                 MT5PositionView(
                     ticket=int(p.ticket),
@@ -470,6 +550,7 @@ class MT5Gateway:
                     time=datetime.fromtimestamp(int(p.time), tz=timezone.utc),
                 )
                 for p in positions
+                if int(getattr(p, "magic", own_magic) or 0) == own_magic
             ]
         path = self.config.bridge_dir / "positions.csv"
         if not path.exists():
@@ -477,8 +558,17 @@ class MT5Gateway:
         df = self._read_bridge_csv(path)
         if df.empty:
             return []
+        has_magic = "magic" in df.columns
+        if not has_magic:
+            LOG.warning(
+                "positions.csv has no magic column - foreign positions on this account "
+                "cannot be excluded until the bridge EA is recompiled/redeployed"
+            )
+        own_magic = int(self.config.magic)
         positions: list[MT5PositionView] = []
         for _, row in df.iterrows():
+            if has_magic and int(row.get("magic", own_magic) or 0) != own_magic:
+                continue
             positions.append(
                 MT5PositionView(
                     ticket=int(row.get("ticket", 0) or 0),
@@ -499,8 +589,11 @@ class MT5Gateway:
         if self.mode == "native":
             assert self.mt5 is not None
             orders = self.mt5.orders_get() or []
+            own_magic = int(self.config.magic)
             views: list[MT5OrderView] = []
             for order in orders:
+                if int(getattr(order, "magic", own_magic) or 0) != own_magic:
+                    continue
                 order_type = self._native_order_type_name(int(order.type))
                 side = "BUY" if "BUY" in order_type else "SELL"
                 views.append(
@@ -524,8 +617,17 @@ class MT5Gateway:
         df = self._read_bridge_csv(path)
         if df.empty:
             return []
+        has_magic = "magic" in df.columns
+        if not has_magic:
+            LOG.warning(
+                "orders.csv has no magic column - foreign orders on this account "
+                "cannot be excluded until the bridge EA is recompiled/redeployed"
+            )
+        own_magic = int(self.config.magic)
         orders: list[MT5OrderView] = []
         for _, row in df.iterrows():
+            if has_magic and int(row.get("magic", own_magic) or 0) != own_magic:
+                continue
             orders.append(
                 MT5OrderView(
                     ticket=int(row.get("ticket", 0) or 0),
@@ -590,6 +692,14 @@ class MT5Gateway:
             },
         )
         result = self._await_result(request_id)
+        if int(getattr(result, "position", 0) or 0) <= 0:
+            resolved_ticket = self.resolve_position_ticket(
+                order_ticket=int(getattr(result, "order", 0) or 0),
+                deal_ticket=int(getattr(result, "deal", 0) or 0),
+                symbol=resolved,
+            )
+            if resolved_ticket > 0:
+                result.position = resolved_ticket
         return resolved, float(result.price or (tick.ask if direction == "BUY" else tick.bid)), result
 
     def place_pending_order(
@@ -861,6 +971,71 @@ class MT5Gateway:
     def deals_history_path(self) -> Path:
         return self._bridge_deals_path_for_read()
 
+    def resolve_position_ticket(
+        self,
+        *,
+        order_ticket: int = 0,
+        deal_ticket: int = 0,
+        symbol: str = "",
+    ) -> int:
+        order_ticket = int(order_ticket or 0)
+        deal_ticket = int(deal_ticket or 0)
+        expected_symbol = str(symbol or "").upper()
+
+        if self.mode == "native":
+            assert self.mt5 is not None
+            start = datetime(2024, 1, 1)
+            end = datetime.utcnow()
+            deals = self.mt5.history_deals_get(start, end) or []
+            for deal in reversed(deals):
+                if deal_ticket and int(getattr(deal, "ticket", 0) or 0) == deal_ticket:
+                    position_id = int(getattr(deal, "position_id", 0) or 0)
+                    if position_id > 0:
+                        return position_id
+            for deal in reversed(deals):
+                if order_ticket and int(getattr(deal, "order", 0) or 0) == order_ticket:
+                    if expected_symbol and str(getattr(deal, "symbol", "")).upper() != expected_symbol:
+                        continue
+                    position_id = int(getattr(deal, "position_id", 0) or 0)
+                    if position_id > 0:
+                        return position_id
+            return 0
+
+        path = self._bridge_deals_path_for_read()
+        if path.exists():
+            try:
+                df = self._read_bridge_csv(path)
+            except Exception:
+                df = pd.DataFrame()
+            if not df.empty and "position_id" in df.columns:
+                position_ids = pd.to_numeric(df["position_id"], errors="coerce")
+                if deal_ticket and "deal" in df.columns:
+                    deals = pd.to_numeric(df["deal"], errors="coerce")
+                    rows = df[deals == deal_ticket]
+                    for _, row in rows.iloc[::-1].iterrows():
+                        value = pd.to_numeric(row.get("position_id"), errors="coerce")
+                        position_id = int(value) if pd.notna(value) else 0
+                        if position_id > 0:
+                            return position_id
+                if order_ticket:
+                    rows = df[position_ids == order_ticket]
+                    for _, row in rows.iloc[::-1].iterrows():
+                        if expected_symbol and str(row.get("symbol", "")).upper() != expected_symbol:
+                            continue
+                        value = pd.to_numeric(row.get("position_id"), errors="coerce")
+                        position_id = int(value) if pd.notna(value) else 0
+                        if position_id > 0:
+                            return position_id
+
+        if order_ticket > 0:
+            for position in self.positions():
+                if int(position.ticket) != order_ticket:
+                    continue
+                if expected_symbol and str(position.symbol).upper() != expected_symbol:
+                    continue
+                return int(position.ticket)
+        return 0
+
     def deals_for_position(self, position_ticket: int):
         if self.mode == "native":
             assert self.mt5 is not None
@@ -899,6 +1074,8 @@ class MT5Gateway:
             out.append(
                 SimpleNamespace(
                     position_id=int(number(row, "position_id")),
+                    deal_entry=str(row.get("deal_entry", "") or "").strip().upper(),
+                    deal_reason=str(row.get("deal_reason", "") or "").strip().upper(),
                     price=number(row, "price"),
                     profit=profit,
                     swap=swap,

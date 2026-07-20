@@ -1,0 +1,15 @@
+import { chromium } from "playwright";
+const browser = await chromium.launch({ headless: true });
+const ctx = await browser.newContext({ viewport: { width: 1440, height: 1000 }, ignoreHTTPSErrors: true });
+const page = await ctx.newPage();
+const errors = [];
+page.on("console", (msg) => { if (msg.type() === "error") errors.push(msg.text()); });
+await page.goto("https://mytradebot.co.za/cipherfx/setup/", { waitUntil: "networkidle", timeout: 30000 });
+await page.fill("#aiSetupName", "Test User");
+await page.fill("#aiSetupEmail", "test@example.com");
+await page.click("#aiSetupForm button[type=submit], .assistant-form button");
+await page.waitForTimeout(1000);
+const statusText = await page.textContent("#status-line, .status-line").catch(() => "no status element found");
+console.log("STATUS TEXT:", statusText);
+console.log("ERRORS:", JSON.stringify(errors));
+await browser.close();

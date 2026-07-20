@@ -1,13 +1,22 @@
 from __future__ import annotations
 
 import json
+import math
 import sqlite3
 import threading
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 from .contracts import MarketSnapshot, TradeProposal, ExecutionResult
+
+
+class _ManagedConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc_value, traceback):
+        try:
+            return super().__exit__(exc_type, exc_value, traceback)
+        finally:
+            self.close()
 
 
 class DatabaseLayer:
@@ -20,14 +29,21 @@ class DatabaseLayer:
         self._initialize()
 
     def _connect(self):
-        conn = sqlite3.connect(self.path, timeout=10.0)
-        conn.execute("PRAGMA journal_mode=WAL")
+        # sqlite3.Connection.__exit__ commits/rolls back but does not close.
+        # Use a managed connection so each short operation releases its file
+        # descriptors and WAL read handles.
+        conn = sqlite3.connect(self.path, timeout=10.0, factory=_ManagedConnection)
         conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA journal_size_limit=262144000")
+        conn.execute("PRAGMA wal_autocheckpoint=1000")
         conn.execute("PRAGMA busy_timeout=10000")
         return conn
 
     def _initialize(self):
         with self._connect() as conn:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA journal_size_limit=262144000")
+            conn.execute("PRAGMA wal_autocheckpoint=1000")
             conn.executescript(
                 """
                 CREATE TABLE IF NOT EXISTS platform_events(
@@ -42,6 +58,36 @@ class DatabaseLayer:
                     key TEXT PRIMARY KEY,
                     value_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS premarket_plans(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    setup_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS premarket_plan_versions(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    setup_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS premarket_plan_events(
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_id TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    symbol TEXT NOT NULL,
+                    setup_id TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    reason TEXT NOT NULL,
+                    payload_json TEXT NOT NULL
                 );
                 CREATE TABLE IF NOT EXISTS platform_executions(
                     proposal_id TEXT PRIMARY KEY,
@@ -165,11 +211,45 @@ class DatabaseLayer:
                 CREATE INDEX IF NOT EXISTS idx_proposals_state_expiry ON trade_proposals(state, expires_at);
                 CREATE INDEX IF NOT EXISTS idx_exec_status ON executions(status, closed_at);
                 CREATE INDEX IF NOT EXISTS idx_learning_engine_time ON learning_metrics(engine, created_at);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_premarket_plans_event ON premarket_plans(event_id);
+                CREATE INDEX IF NOT EXISTS idx_premarket_plan_target ON premarket_plans(symbol, status, created_at);
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(engine_performance)")}
             if "metrics_json" not in columns:
                 conn.execute("ALTER TABLE engine_performance ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'")
+
+    def checkpoint(self) -> dict[str, int]:
+        with self._lock, self._connect() as conn:
+            row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        values = list(row or (0, 0, 0))
+        result = {
+            "busy": int(values[0] if len(values) > 0 else 0),
+            "log_pages": int(values[1] if len(values) > 1 else 0),
+            "checkpointed_pages": int(values[2] if len(values) > 2 else 0),
+        }
+        result.update({f"pruned_{table}": count for table, count in self.retention_sweep().items()})
+        return result
+
+    def retention_sweep(self, days: int = 14) -> dict[str, int]:
+        """Bound the growth of high-frequency append-only telemetry tables.
+
+        Only pure event/telemetry logs are pruned here - trade_history,
+        learning_metrics, executions/orders/positions and proposals are
+        permanent trading records and are never touched by this sweep.
+        """
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        deleted: dict[str, int] = {}
+        with self._lock, self._connect() as conn:
+            for table, column in (
+                ("platform_events", "event_time"),
+                ("premarket_plan_versions", "created_at"),
+                ("premarket_plan_events", "created_at"),
+                ("market_snapshots", "captured_at"),
+            ):
+                cursor = conn.execute(f"DELETE FROM {table} WHERE {column} < ?", (cutoff,))
+                deleted[table] = int(cursor.rowcount or 0)
+        return deleted
 
     @staticmethod
     def _now() -> str:
@@ -240,50 +320,47 @@ class DatabaseLayer:
             for engine, closed_trades, realized_pnl, wins, losses in rows
         }
 
-    def execution(
-        self,
-        proposal_id,
-        symbol,
-        side,
-        status,
-        volume,
-        *,
-        pnl=0.0,
-        initial_risk=0.0,
-        closed_at=None,
-    ):
-        with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO platform_executions(
-                    proposal_id,symbol,side,status,volume,pnl,initial_risk,created_at,closed_at
-                ) VALUES(?,?,?,?,?,?,?,?,?)
-                ON CONFLICT(proposal_id) DO UPDATE SET
-                    status=excluded.status, volume=excluded.volume, pnl=excluded.pnl,
-                    initial_risk=excluded.initial_risk, closed_at=excluded.closed_at
-                """,
-                (
-                    str(proposal_id),
-                    str(symbol),
-                    str(side),
-                    str(status),
-                    float(volume),
-                    float(pnl),
-                    float(initial_risk),
-                    self._now(),
-                    closed_at,
-                ),
-            )
-
     def proposal_seen(self, proposal_id):
+        """Return True only for terminal execution outcomes.
+
+        A transient operational block must not make a still-valid immutable
+        proposal look executed. Permanent broker failures and successful
+        outcomes remain idempotent.
+        """
+        retryable = {
+            "BROKER_DISCONNECTED",
+            "TRADING_NOT_ALLOWED",
+            "MAX_DAILY_TRADES",
+            "MAX_OPEN_TRADES",
+            "INVALID_TICK",
+            "SPREAD_LIMIT",
+            "INSUFFICIENT_MARGIN",
+        }
         with self._lock, self._connect() as conn:
-            return (
-                conn.execute(
-                    "SELECT 1 FROM platform_executions WHERE proposal_id=? LIMIT 1",
-                    (str(proposal_id),),
-                ).fetchone()
-                is not None
-            )
+            row = conn.execute(
+                """
+                SELECT p.status, COALESCE(o.response_json, '')
+                FROM platform_executions AS p
+                LEFT JOIN orders AS o ON o.proposal_id = p.proposal_id
+                WHERE p.proposal_id=?
+                LIMIT 1
+                """,
+                (str(proposal_id),),
+            ).fetchone()
+        if row is None:
+            return False
+        status, response_json = row
+        if status in {"FILLED", "DRY_RUN", "CLOSED", "REJECTED", "DUPLICATE_SUPPRESSED"}:
+            return True
+        if status != "EXECUTION_BLOCKED":
+            return True
+        if not response_json:
+            return False
+        try:
+            reason = str(json.loads(response_json).get("reason", ""))
+        except (TypeError, ValueError):
+            reason = ""
+        return reason not in retryable
 
     def save_snapshot(self, snapshot_id: str, snapshot: MarketSnapshot) -> None:
         payload = {
@@ -364,6 +441,155 @@ class DatabaseLayer:
                 ),
             )
 
+    def latest_snapshots(self, symbols: list[str] | tuple[str, ...] | None = None) -> list[dict[str, Any]]:
+        """Return the newest persisted ten-frame snapshot for each symbol."""
+        with self._lock, self._connect() as conn:
+            params: list[str] = []
+            where = ""
+            if symbols:
+                clean = sorted({str(symbol or "").strip().upper() for symbol in symbols if str(symbol or "").strip()})
+                if not clean:
+                    return []
+                placeholders = ",".join("?" for _ in clean)
+                where = f"WHERE UPPER(symbol) IN ({placeholders})"
+                params.extend(clean)
+            rows = conn.execute(
+                "SELECT m.symbol,m.asset_class,m.captured_at,m.tick_timestamp,m.payload_json "
+                "FROM market_snapshots m "
+                "JOIN (SELECT symbol,MAX(captured_at) AS captured_at "
+                "      FROM market_snapshots " + where + " GROUP BY symbol) latest "
+                "ON latest.symbol=m.symbol AND latest.captured_at=m.captured_at "
+                "ORDER BY m.symbol",
+                params,
+            ).fetchall()
+        return [
+            {
+                "symbol": row[0],
+                "asset_class": row[1],
+                "captured_at": row[2],
+                "tick_timestamp": row[3],
+                "payload_json": row[4],
+            }
+            for row in rows
+        ]
+
+    def save_premarket_plan(
+        self,
+        *,
+        event_id: str,
+        symbol: str,
+        setup_id: str,
+        status: str,
+        reason: str,
+        payload: dict[str, Any],
+    ) -> None:
+        """Persist a planning record only; it is never an executable proposal."""
+        created_at = self._now()
+        encoded = self._json(payload)
+        values = (
+            str(event_id),
+            created_at,
+            str(symbol),
+            str(setup_id),
+            str(status),
+            str(reason),
+            encoded,
+        )
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT INTO premarket_plans(event_id,created_at,symbol,setup_id,status,reason,payload_json) "
+                "VALUES(?,?,?,?,?,?,?) "
+                "ON CONFLICT(event_id) DO UPDATE SET created_at=excluded.created_at, "
+                "symbol=excluded.symbol, setup_id=excluded.setup_id, status=excluded.status, "
+                "reason=excluded.reason, payload_json=excluded.payload_json",
+                values,
+            )
+            conn.execute(
+                "INSERT INTO premarket_plan_versions(event_id,created_at,symbol,setup_id,status,reason,payload_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                values,
+            )
+            conn.execute(
+                "INSERT INTO premarket_plan_events(event_id,created_at,symbol,setup_id,status,reason,payload_json) "
+                "VALUES(?,?,?,?,?,?,?)",
+                values,
+            )
+
+    def get_proposal(self, proposal_id: str) -> dict[str, Any] | None:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT proposal_id,symbol,asset_class,engine,side,entry_price,stop_loss,
+                       take_profit,score,confidence,probability,risk_amount,created_at,
+                       expires_at,state,payload_json
+                FROM trade_proposals WHERE proposal_id=?
+                """,
+                (str(proposal_id),),
+            ).fetchone()
+        if not row:
+            return None
+        try:
+            payload = json.loads(row[15] or "{}")
+        except (TypeError, json.JSONDecodeError):
+            payload = {}
+        keys = (
+            "proposal_id", "symbol", "asset_class", "engine", "side", "entry_price",
+            "stop_loss", "take_profit", "score", "confidence", "probability",
+            "risk_amount", "created_at", "expires_at", "state", "payload",
+        )
+        result = dict(zip(keys, row))
+        result["payload"] = payload
+        return result
+
+    def calibrated_probability(
+        self, engine: str, side: str, score: float, model_version: str,
+    ) -> dict[str, Any]:
+        """Return a transparent, engine/version/score-bucket outcome estimate."""
+        bucket = max(0, min(90, int(float(score) // 10) * 10))
+        wins = losses = 0
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT result_r,metrics_json FROM engine_performance "
+                "WHERE engine=? ORDER BY closed_at DESC",
+                (str(engine),),
+            ).fetchall()
+        for result_r, raw_metrics in rows:
+            try:
+                metrics = json.loads(raw_metrics or "{}")
+            except (TypeError, json.JSONDecodeError):
+                continue
+            if (
+                metrics.get("model_version") != model_version
+                or metrics.get("outcome_type") != "closed_trade"
+                or not metrics.get("learning_eligible")
+                or not metrics.get("result_r_valid")
+                or str(metrics.get("side", side)).upper() != str(side).upper()
+                or int(metrics.get("score_bucket", -1)) != bucket
+            ):
+                continue
+            try:
+                value = float(result_r)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(value) or abs(value) <= 1e-12:
+                continue
+            if value > 0:
+                wins += 1
+            else:
+                losses += 1
+        samples = wins + losses
+        probability = (2.0 + wins) / (4.0 + samples) * 100.0
+        return {
+            "probability": round(probability, 2),
+            "status": "CALIBRATED" if samples >= 30 else "PRIOR_ONLY",
+            "sample_size": samples,
+            "wins": wins,
+            "losses": losses,
+            "score_bucket": bucket,
+            "model_version": model_version,
+            "side": str(side).upper(),
+        }
+
     def update_proposal_state(self, proposal_id: str, state: str) -> None:
         with self._lock, self._connect() as conn:
             conn.execute(
@@ -387,6 +613,27 @@ class DatabaseLayer:
             "DUPLICATE_SUPPRESSED": "REJECTED",
         }.get(result.status, result.status)
         with self._lock, self._connect() as conn:
+            conn.execute(
+                """
+                INSERT INTO platform_executions(
+                    proposal_id,symbol,side,status,volume,pnl,initial_risk,created_at,closed_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(proposal_id) DO UPDATE SET
+                    status=excluded.status,volume=excluded.volume,
+                    initial_risk=excluded.initial_risk
+                """,
+                (
+                    proposal.proposal_id,
+                    result.symbol,
+                    result.side,
+                    result.status,
+                    float(result.volume),
+                    0.0,
+                    float(result.initial_risk),
+                    result.submitted_at.isoformat(),
+                    None,
+                ),
+            )
             conn.execute(
                 """
                 INSERT INTO orders(
@@ -502,18 +749,36 @@ class DatabaseLayer:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT e.proposal_id,e.position_ticket,e.symbol,e.side,e.volume,e.fill_price,
-                       e.initial_risk,e.submitted_at,e.filled_at,p.asset_class,p.engine,p.created_at
+                SELECT e.proposal_id,e.order_ticket,e.deal_ticket,e.position_ticket,
+                       e.symbol,e.side,e.volume,e.fill_price,e.initial_risk,e.submitted_at,
+                       e.filled_at,p.asset_class,p.engine,p.created_at
                 FROM executions e JOIN trade_proposals p ON p.proposal_id=e.proposal_id
                 WHERE e.status='FILLED' AND e.closed_at IS NULL
                 ORDER BY e.filled_at
                 """
             ).fetchall()
         keys = (
-            "proposal_id", "position_ticket", "symbol", "side", "volume", "fill_price",
-            "initial_risk", "submitted_at", "filled_at", "asset_class", "engine", "created_at",
+            "proposal_id", "order_ticket", "deal_ticket", "position_ticket", "symbol", "side",
+            "volume", "fill_price", "initial_risk", "submitted_at", "filled_at", "asset_class",
+            "engine", "created_at",
         )
         return [dict(zip(keys, row)) for row in rows]
+
+    def update_execution_position_ticket(self, proposal_id: str, position_ticket: int) -> bool:
+        ticket = int(position_ticket or 0)
+        if ticket <= 0:
+            return False
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                '''
+                UPDATE executions
+                SET position_ticket=?
+                WHERE proposal_id=? AND status='FILLED'
+                  AND (position_ticket IS NULL OR position_ticket=0)
+                ''',
+                (ticket, str(proposal_id)),
+            )
+            return cursor.rowcount > 0
 
     def mark_trade_closed(self, proposal_id: str, closed_at: datetime, pnl: float) -> None:
         stamp = closed_at.isoformat()
@@ -533,12 +798,26 @@ class DatabaseLayer:
 
     def mark_position_closed(self, position_ticket: int, closed_at: datetime, pnl: float) -> None:
         with self._lock, self._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            if "position_ticket" not in columns:
+                return
+            updates = []
+            values = []
+            if "state" in columns:
+                updates.append("state=?")
+                values.append("CLOSED")
+            if "profit" in columns:
+                updates.append("profit=?")
+                values.append(float(pnl))
+            if "updated_at" in columns:
+                updates.append("updated_at=?")
+                values.append(closed_at.isoformat())
+            if not updates:
+                return
+            values.append(int(position_ticket))
             conn.execute(
-                """
-                UPDATE positions SET state='CLOSED', profit=?, updated_at=?
-                WHERE position_ticket=?
-                """,
-                (float(pnl), closed_at.isoformat(), int(position_ticket)),
+                f"UPDATE positions SET {', '.join(updates)} WHERE position_ticket=?",
+                tuple(values),
             )
 
     def record_trade_history(
@@ -555,29 +834,56 @@ class DatabaseLayer:
         closed_at: datetime,
         metrics: dict[str, Any],
     ) -> bool:
+        # Preserve broker outcome fields; enrich older sparse rows with missing
+        # proposal telemetry so later learning remains fully traceable.
         with self._lock, self._connect() as conn:
             cursor = conn.execute(
-                """
-                INSERT OR IGNORE INTO trade_history(
-                    trade_id,proposal_id,symbol,asset_class,side,realized_pnl,initial_risk,
-                    result_r,exit_reason,closed_at,metrics_json
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?)
-                """,
+                "INSERT OR IGNORE INTO trade_history("
+                "trade_id,proposal_id,symbol,asset_class,side,realized_pnl,initial_risk,"
+                "result_r,exit_reason,closed_at,metrics_json) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
-                    str(trade_id),
-                    proposal_id,
-                    str(symbol),
-                    str(asset_class),
-                    str(side),
-                    float(realized_pnl),
-                    float(initial_risk),
-                    float(result_r),
-                    str(exit_reason),
-                    closed_at.isoformat(),
-                    self._json(metrics),
+                    str(trade_id), proposal_id, str(symbol), str(asset_class), str(side),
+                    float(realized_pnl), float(initial_risk), float(result_r),
+                    str(exit_reason), closed_at.isoformat(), self._json(metrics),
                 ),
             )
-            return cursor.rowcount == 1
+            if cursor.rowcount == 1:
+                return True
+
+            existing = conn.execute(
+                "SELECT proposal_id,metrics_json FROM trade_history WHERE trade_id=?",
+                (str(trade_id),),
+            ).fetchone()
+            if existing is None:
+                return False
+            try:
+                existing_metrics = json.loads(existing[1] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                existing_metrics = {}
+            if not isinstance(existing_metrics, dict):
+                existing_metrics = {}
+
+            trace_keys = (
+                "model_version", "outcome_type", "learning_eligible",
+                "result_r_valid", "proposal_trace_missing", "proposal_score",
+                "proposal_confidence", "proposal_probability", "proposal_created_at",
+                "proposal_expires_at", "score_bucket",
+            )
+            enriched = False
+            for key in trace_keys:
+                value = metrics.get(key) if isinstance(metrics, dict) else None
+                if value is not None and existing_metrics.get(key) is None:
+                    existing_metrics[key] = value
+                    enriched = True
+            proposal_value = proposal_id or existing[0]
+            proposal_changed = bool(proposal_value and not existing[0])
+            if enriched or proposal_changed:
+                conn.execute(
+                    "UPDATE trade_history SET proposal_id=COALESCE(proposal_id,?),metrics_json=? WHERE trade_id=?",
+                    (proposal_value, self._json(existing_metrics), str(trade_id)),
+                )
+            return bool(enriched or proposal_changed)
 
     def record_learning_metric(
         self,
@@ -589,23 +895,44 @@ class DatabaseLayer:
         *,
         proposal_id: str | None = None,
     ) -> None:
+        # Reconciliation can observe the same broker close more than once.
+        # Replace the existing record instead of creating duplicate feedback.
         with self._lock, self._connect() as conn:
-            conn.execute(
-                """
-                INSERT INTO learning_metrics(
-                    engine,trade_id,proposal_id,symbol,asset_class,created_at,metrics_json
-                ) VALUES(?,?,?,?,?,?,?)
-                """,
-                (
-                    str(engine),
-                    str(trade_id),
-                    proposal_id,
-                    str(symbol),
-                    str(asset_class),
-                    self._now(),
-                    self._json(metrics),
-                ),
+            values = (
+                str(engine),
+                str(trade_id),
+                proposal_id,
+                str(symbol),
+                str(asset_class),
+                self._now(),
+                self._json(metrics),
             )
+            existing = conn.execute(
+                """
+                SELECT id FROM learning_metrics
+                WHERE engine=? AND trade_id=?
+                ORDER BY id DESC LIMIT 1
+                """,
+                (str(engine), str(trade_id)),
+            ).fetchone()
+            if existing:
+                conn.execute(
+                    """
+                    UPDATE learning_metrics
+                    SET proposal_id=?,symbol=?,asset_class=?,created_at=?,metrics_json=?
+                    WHERE id=?
+                    """,
+                    (values[2], values[3], values[4], values[5], values[6], int(existing[0])),
+                )
+            else:
+                conn.execute(
+                    """
+                    INSERT INTO learning_metrics(
+                        engine,trade_id,proposal_id,symbol,asset_class,created_at,metrics_json
+                    ) VALUES(?,?,?,?,?,?,?)
+                    """,
+                    values,
+                )
 
     def record_engine_outcome(
         self,
@@ -635,26 +962,44 @@ class DatabaseLayer:
                 ),
             )
 
-    def engine_history(self, engine: str, limit: int = 100) -> list[dict[str, float | str]]:
+    def engine_history(
+        self, engine: str, limit: int = 100, *,
+        model_version: str | None = None, learning_only: bool = False,
+    ) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
                 """
-                SELECT trade_id,symbol,result_r,pnl,closed_at
+                SELECT trade_id,symbol,result_r,pnl,closed_at,metrics_json
                 FROM engine_performance WHERE engine=?
-                ORDER BY closed_at DESC LIMIT ?
+                ORDER BY closed_at DESC
                 """,
-                (str(engine), max(1, int(limit))),
+                (str(engine),),
             ).fetchall()
-        return [
-            {
-                "trade_id": r[0],
-                "symbol": r[1],
-                "result_r": float(r[2]),
-                "pnl": float(r[3]),
-                "closed_at": r[4],
-            }
-            for r in rows
-        ]
+        selected = []
+        for row in rows:
+            try:
+                metrics = json.loads(row[5] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                metrics = {}
+            if model_version is not None and metrics.get("model_version") != model_version:
+                continue
+            if learning_only and (
+                metrics.get("outcome_type") != "closed_trade"
+                or not metrics.get("learning_eligible")
+                or not metrics.get("result_r_valid")
+            ):
+                continue
+            selected.append({
+                "trade_id": row[0],
+                "symbol": row[1],
+                "result_r": float(row[2]),
+                "pnl": float(row[3]),
+                "closed_at": row[4],
+                "metrics": metrics,
+            })
+            if len(selected) >= max(1, int(limit)):
+                break
+        return selected
 
     def position_baseline(self, position_ticket: int) -> dict[str, Any] | None:
         """Return immutable entry geometry for an executed position."""
@@ -723,10 +1068,81 @@ class DatabaseLayer:
         keys = ("proposal_id", "symbol", "asset_class", "engine", "side", "created_at", "expires_at")
         return [dict(zip(keys, row)) for row in rows]
 
+    def latest_loss_for(self, symbol: str, engine: str) -> dict[str, Any] | None:
+        asset_class = {"FOREX": "forex", "INDICES": "index", "METALS": "metal"}.get(str(engine).upper(), str(engine).lower())
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT h.trade_id, h.closed_at, h.realized_pnl, h.result_r
+                FROM trade_history h
+                LEFT JOIN trade_proposals p ON p.proposal_id=h.proposal_id
+                WHERE UPPER(h.symbol)=?
+                  AND h.realized_pnl < 0
+                  AND (UPPER(COALESCE(p.engine, ''))=? OR (p.engine IS NULL AND LOWER(h.asset_class)=?))
+                ORDER BY h.closed_at DESC
+                LIMIT 1
+                """,
+                (str(symbol).upper(), str(engine).upper(), asset_class),
+            ).fetchone()
+        if not row:
+            return None
+        return {"trade_id": row[0], "closed_at": row[1], "realized_pnl": float(row[2] or 0.0), "result_r": float(row[3] or 0.0)}
+
+    def latest_win_for(self, symbol: str, engine: str) -> dict[str, Any] | None:
+        asset_class = {"FOREX": "forex", "INDICES": "index", "METALS": "metal"}.get(str(engine).upper(), str(engine).lower())
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT h.trade_id, h.closed_at, h.realized_pnl, h.result_r
+                FROM trade_history h
+                LEFT JOIN trade_proposals p ON p.proposal_id=h.proposal_id
+                WHERE UPPER(h.symbol)=?
+                  AND h.realized_pnl > 0
+                  AND (UPPER(COALESCE(p.engine, ''))=? OR (p.engine IS NULL AND LOWER(h.asset_class)=?))
+                ORDER BY h.closed_at DESC
+                LIMIT 1
+                """,
+                (str(symbol).upper(), str(engine).upper(), asset_class),
+            ).fetchone()
+        if not row:
+            return None
+        return {"trade_id": row[0], "closed_at": row[1], "realized_pnl": float(row[2] or 0.0), "result_r": float(row[3] or 0.0)}
+
     def count_today(self):
         with self._lock, self._connect() as conn:
             row = conn.execute(
-                "SELECT COUNT(*) FROM platform_executions WHERE created_at LIKE ?",
+                """
+                SELECT COUNT(*)
+                FROM platform_executions
+                WHERE created_at LIKE ?
+                  AND status IN ('FILLED', 'DRY_RUN', 'CLOSED')
+                """,
                 (datetime.now(timezone.utc).date().isoformat() + "%",),
             ).fetchone()
         return int(row[0] if row else 0)
+
+    def count_today_for_symbol(self, symbol: str) -> int:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM platform_executions
+                WHERE created_at LIKE ?
+                  AND UPPER(symbol)=?
+                  AND status IN ('FILLED', 'DRY_RUN', 'CLOSED')
+                """,
+                (datetime.now(timezone.utc).date().isoformat() + "%", str(symbol).upper()),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def realized_pnl_today(self) -> float:
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COALESCE(SUM(realized_pnl), 0.0)
+                FROM trade_history
+                WHERE closed_at LIKE ?
+                """,
+                (datetime.now(timezone.utc).date().isoformat() + "%",),
+            ).fetchone()
+        return float(row[0] if row else 0.0)

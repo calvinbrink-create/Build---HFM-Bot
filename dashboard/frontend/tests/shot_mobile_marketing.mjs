@@ -1,0 +1,10 @@
+import { chromium } from "playwright";
+const OUT = "/tmp/claude-0/-root/9dca97ce-58d8-4690-a34d-0295150b0558/scratchpad/marketing_site";
+const browser = await chromium.launch({ headless: true });
+const context = await browser.newContext({ viewport: { width: 390, height: 844 }, deviceScaleFactor: 2, ignoreHTTPSErrors: true, isMobile: true, hasTouch: true, userAgent: "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1" });
+const page = await context.newPage();
+await page.goto("https://mytradebot.co.za/cipherfx/", { waitUntil: "networkidle", timeout: 30000 });
+await page.waitForTimeout(1000);
+await page.screenshot({ path: `${OUT}/mobile-full.png`, fullPage: true });
+await browser.close();
+console.log("done");

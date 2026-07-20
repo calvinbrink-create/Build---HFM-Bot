@@ -130,8 +130,8 @@ FULL_SCAN_SECONDS = 5
 PENDING_MONITOR_SECONDS = 0.25
 HOUSEKEEPING_SECONDS = 900
 
-MAX_TRADES_PER_DAY = 60
-DAILY_LOSS_LIMIT_USD = 1000
+MAX_TRADES_PER_DAY = 200
+DAILY_LOSS_LIMIT_USD = 5000
 MAX_OPEN_TRADES_TOTAL = 30
 MAX_OPEN_TRADES_PER_SYMBOL = 10
 
@@ -2383,10 +2383,12 @@ class XM_MT5_Bot:
         return _env_int("MT5_MAX_OPEN_TRADES_TOTAL", 30, lo=1, hi=30)
 
     def _effective_max_daily_trades(self) -> int:
-        return _env_int("MT5_MAX_TRADES_PER_DAY", 60, lo=1, hi=60)
+        return _env_int("MT5_MAX_TRADES_PER_DAY", 200, lo=1, hi=200)
 
     def _daily_loss_limit_used(self, acct=None) -> float:
-        return _env_float("MT5_MAX_DAILY_LOSS_USD", 1000.0, lo=0.0)
+        if self._demo_winrate_test_effective(acct):
+            return _env_float("MT5_MAX_DAILY_LOSS_USD", 10000.0, lo=0.0)
+        return _env_float("MT5_LIVE_DAILY_LOSS_LIMIT_USD", 5000.0, lo=0.0)
 
     def _update_demo_profile_status(self, acct=None) -> None:
         if acct is None:
@@ -2420,7 +2422,14 @@ class XM_MT5_Bot:
         return self._loss_limit_for_symbol(canonical, market, "MT5_MAX_TRADE_RISK", default)
 
     def _strategy_equity(self, acct) -> float:
+        balance = float(getattr(acct, "balance", 0.0) or 0.0)
         equity = float(getattr(acct, "equity", 0.0) or 0.0)
+        if str(self.runtime.trade_mode or "").strip().lower() == "live":
+            # Live sizing follows broker capital. Use the lower of balance and
+            # equity so floating loss cannot increase the risk base.
+            if balance > 0 and equity > 0:
+                return min(balance, equity)
+            return max(balance, equity, 0.0)
         cap = float(self.runtime.capital_cap_usd or CFG.get("capital_cap_usd", 5000.0) or 5000.0)
         if equity <= 0:
             return cap
@@ -6653,10 +6662,9 @@ class XM_MT5_Bot:
         override_limit = _env_float("MT5_DAILY_LOSS_OVERRIDE_USD", 0.0, lo=0.0)
         if override_limit > 0:
             loss_limit = min(loss_limit, override_limit)
-        elif os.getenv("MT5_MAX_DAILY_LOSS_USD") is not None:
-            absolute_limit = _env_float("MT5_MAX_DAILY_LOSS_USD", loss_limit, lo=0.0)
-            if not self._demo_winrate_test_effective(acct):
-                loss_limit = min(loss_limit, absolute_limit)
+        elif not self._demo_winrate_test_effective(acct):
+            absolute_limit = _env_float("MT5_LIVE_DAILY_LOSS_LIMIT_USD", loss_limit, lo=0.0)
+            loss_limit = min(loss_limit, absolute_limit)
         _ss.set_status("daily_loss_limit_usd", round(abs(loss_limit), 2))
         _ss.set_status("daily_loss_limit_used", round(abs(loss_limit), 2))
         allowed = realized_today > -abs(loss_limit)
@@ -6989,15 +6997,40 @@ class XM_MT5_Bot:
 
     def _last_symbol_close_allows_entry(self, sym: str, *, confirmed_pending: bool = False) -> tuple[bool, str]:
         canonical = self._canonical_from_resolved(sym).upper()
-        self._audit_decision({
-            "event": "SYMBOL_REENTRY_OBSERVE_ONLY",
-            "decision": "observe_only",
-            "scope": "symbol",
-            "symbol": canonical,
-            "confirmed_pending": bool(confirmed_pending),
-            "reason": "symbol re-entry cooldown is not an execution veto",
-        })
-        return True, "OK; symbol re-entry cooldown is observe-only"
+        last_close = self.last_symbol_closes.get(canonical)
+        if not isinstance(last_close, dict):
+            return True, "OK"
+        closed_at = _parse_dt(last_close.get("closed_at"))
+        if closed_at is None:
+            return True, "OK"
+        outcome = str(last_close.get("outcome") or "").lower()
+        realized = last_close.get("realized")
+        realized_val = float(realized) if realized is not None else 0.0
+        base_cooldown_s = _env_float("MT5_SYMBOL_REENTRY_COOLDOWN_SECONDS", 300.0, lo=0.0, hi=3600.0)
+        big_win_usd = _env_float("MT5_BIG_WIN_COOLDOWN_USD", 50.0, lo=1.0, hi=100000.0)
+        big_win_cooldown_s = _env_float("MT5_BIG_WIN_COOLDOWN_SECONDS", 900.0, lo=0.0, hi=7200.0)
+        is_big_win = outcome == "win" and realized_val >= big_win_usd
+        cooldown_s = max(base_cooldown_s, big_win_cooldown_s) if is_big_win else base_cooldown_s
+        if cooldown_s <= 0:
+            return True, "OK; symbol re-entry cooldown disabled"
+        elapsed_s = (datetime.utcnow() - closed_at).total_seconds()
+        if elapsed_s < cooldown_s:
+            remaining_s = max(1, math.ceil(cooldown_s - elapsed_s))
+            self._audit_decision({
+                "event": "SYMBOL_REENTRY_COOLDOWN_BLOCKED",
+                "decision": "BLOCK",
+                "scope": "symbol",
+                "symbol": canonical,
+                "outcome": outcome,
+                "realized": realized_val,
+                "big_win": is_big_win,
+                "remaining_seconds": remaining_s,
+                "confirmed_pending": bool(confirmed_pending),
+                "reason": "symbol re-entry cooldown active after recent close",
+            })
+            label = "big win" if is_big_win else (outcome or "close")
+            return False, f"{canonical} re-entry cooldown after {label} ({math.ceil(remaining_s / 60)}m left)"
+        return True, "OK"
 
     def _symbol_lock_allows_entry(self, sym: str) -> tuple[bool, str]:
         canonical = self._canonical_from_resolved(sym).upper()
@@ -7084,6 +7117,20 @@ class XM_MT5_Bot:
         max_levels = _env_int("MT5_PYRAMID_MAX_LEVELS", 8, lo=1, hi=10)
         if len(same_direction) >= max_levels:
             return False, f"pyramid max level reached ({max_levels})"
+        burst_window_seconds = _env_float("MT5_PYRAMID_BURST_WINDOW_SECONDS", 60.0, lo=5.0, hi=300.0)
+        opened_times = [
+            value
+            for pos in same_direction
+            if (value := _parse_dt((self.open_trades.get(str(pos.ticket), {}) or {}).get("opened_at"))) is not None
+        ]
+        if opened_times:
+            first_leg_opened_at = min(opened_times)
+            age_seconds = (datetime.utcnow() - first_leg_opened_at).total_seconds()
+            if age_seconds > burst_window_seconds:
+                return False, (
+                    f"pyramid add window elapsed ({age_seconds:.0f}s > {burst_window_seconds:.0f}s "
+                    "since first leg opened)"
+                )
         for pos in same_direction:
             meta = self.open_trades.get(str(pos.ticket), {})
             if isinstance(meta, dict) and meta.get("trend_invalidation_warning"):

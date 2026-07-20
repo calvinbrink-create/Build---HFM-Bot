@@ -2,8 +2,13 @@
 set -euo pipefail
 
 EXPECTED_BACKEND="mt5"
-EXPECTED_DB="/opt/cipherfx_mt5/state/mt5_state.db"
-EXPECTED_STATE_DIR="/opt/cipherfx_mt5/state"
+if [ "${MT5_TRADE_MODE:-demo}" = "live" ]; then
+  EXPECTED_DB="/opt/cipherfx_mt5/state/live/mt5_state.db"
+  EXPECTED_STATE_DIR="/opt/cipherfx_mt5/state/live"
+else
+  EXPECTED_DB="/opt/cipherfx_mt5/state/mt5_state.db"
+  EXPECTED_STATE_DIR="/opt/cipherfx_mt5/state"
+fi
 
 fail() {
   printf '%s

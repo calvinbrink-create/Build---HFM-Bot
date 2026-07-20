@@ -63,6 +63,11 @@ class ClosedGateway:
         return self.deals if int(ticket) == 55 else []
 
 
+class ZeroTicketClosedGateway(ClosedGateway):
+    def resolve_position_ticket(self, **kwargs):
+        return 55
+
+
 class OperationalGateway:
     def account_info(self):
         return SimpleNamespace(
@@ -244,6 +249,39 @@ class Phase3LearningSystemTests(unittest.TestCase):
                     (proposal.proposal_id,),
                 ).fetchone()[0]
             self.assertEqual(status, "CLOSED")
+
+    def test_zero_position_ticket_is_resolved_before_learning_feedback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            db = DatabaseLayer(Path(tmp) / "platform.db")
+            intelligence = LearningEngine(db)
+            feedback = LearningFeedbackEngine(db, intelligence.record_outcome)
+            proposal = make_proposal("filled-zero-ticket")
+            db.save_proposal(proposal)
+            result = ExecutionResult(
+                proposal.proposal_id,
+                "FILLED",
+                proposal.symbol,
+                proposal.side,
+                0.1,
+                order_ticket=10,
+                deal_ticket=11,
+                position_ticket=0,
+                fill_price=proposal.entry_price,
+                filled_at=datetime.now(timezone.utc) - timedelta(seconds=120),
+                initial_risk=10.0,
+            )
+            db.save_execution_result(proposal, result)
+            self.assertEqual(
+                feedback.reconcile_closed_trades(ZeroTicketClosedGateway()), 1
+            )
+            with sqlite3.connect(db.path) as conn:
+                ticket, status = conn.execute(
+                    "SELECT position_ticket,status FROM executions WHERE proposal_id=?",
+                    (proposal.proposal_id,),
+                ).fetchone()
+            self.assertEqual(ticket, 55)
+            self.assertEqual(status, "CLOSED")
+            self.assertEqual(len(db.engine_history("FOREX")), 1)
 
     def test_feedback_is_idempotent_and_engine_scoped(self):
         with tempfile.TemporaryDirectory() as tmp:

@@ -16,6 +16,20 @@ MT5_SERVER="${MT5_SERVER:-}"
 MT5_LOGIN="${MT5_LOGIN:-}"
 MT5_PASSWORD="${MT5_PASSWORD:-}"
 MT5_FORCE_LOGIN="${MT5_FORCE_LOGIN:-0}"
+MT5_WS_TICK_PORT="${MT5_WS_TICK_PORT:-8765}"
+
+if [ "${MT5_RUNTIME_ISOLATED:-0}" = "1" ]; then
+  template_prefix="${MT5_TEMPLATE_PREFIX:-$HOME/.mt5}"
+  template_terminal="$template_prefix/drive_c/Program Files/MetaTrader 5/terminal64.exe"
+  if [ ! -f "$TERMINAL_PATH" ]; then
+    if [ ! -f "$template_terminal" ]; then
+      echo "ERROR: live terminal template is missing: $template_terminal" >&2
+      exit 66
+    fi
+    mkdir -p "$MT5_PREFIX"
+    cp -a "$template_prefix"/. "$MT5_PREFIX"/
+  fi
+fi
 
 mkdir -p "$CACHE_DIR"
 mkdir -p "$BRIDGE_DIR/commands" "$BRIDGE_DIR/results"
@@ -44,12 +58,33 @@ if [ "$MT5_FORCE_LOGIN" = "1" ]; then
   done
 fi
 
-if [ -f "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" ]; then
-  install -m 0644 "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"
+if [ ! -s "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" ]; then
+  echo "ERROR: authoritative MQL source is missing" >&2
+  exit 68
 fi
-if [ ! -s "$BRIDGE_SOURCE" ] || ! cmp -s "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"; then
-  echo "ERROR: deployed MQL source does not match the authoritative source" >&2
-  exit 69
+if [ "$MT5_WS_TICK_PORT" = "8765" ]; then
+  install -m 0644 "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"
+  if [ ! -s "$BRIDGE_SOURCE" ] || ! cmp -s "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE"; then
+    echo "ERROR: deployed MQL source does not match the authoritative source" >&2
+    exit 69
+  fi
+else
+  python3 - "$APP_DIR/mt5_bridge/CipherFxBridge.mq5" "$BRIDGE_SOURCE" "$MT5_WS_TICK_PORT" <<'PY2'
+from pathlib import Path
+import sys
+source = Path(sys.argv[1]).read_text()
+destination = Path(sys.argv[2])
+port = sys.argv[3]
+needle = "input int WebSocketPort = 8765;"
+replacement = f"input int WebSocketPort = {port};"
+if source.count(needle) != 1:
+    raise SystemExit("authoritative bridge source has no unique WebSocketPort declaration")
+destination.write_text(source.replace(needle, replacement, 1))
+PY2
+  if ! grep -Fq "input int WebSocketPort = $MT5_WS_TICK_PORT;" "$BRIDGE_SOURCE"; then
+    echo "ERROR: isolated MQL source did not target port $MT5_WS_TICK_PORT" >&2
+    exit 69
+  fi
 fi
 
 cat >"$STARTUP_INI" <<EOF
@@ -67,7 +102,7 @@ ProfileLast=${BRIDGE_PROFILE}
 AllowLiveTrading=1
 AllowDllImport=1
 AllowWebRequest=1
-WebRequestURL=127.0.0.1:8765
+WebRequestURL=127.0.0.1:$MT5_WS_TICK_PORT
 Enabled=1
 Account=0
 Profile=0

@@ -1,0 +1,17 @@
+{
+  "name": "Cipher FX MT5 Dashboard",
+  "short_name": "Cipher FX",
+  "start_url": "/dashboard/mt5/",
+  "scope": "/dashboard/mt5/",
+  "display": "standalone",
+  "background_color": "#05080e",
+  "theme_color": "#05080e",
+  "icons": [
+    {
+      "src": "/dashboard/mt5/apple-touch-icon.png",
+      "sizes": "430x430",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

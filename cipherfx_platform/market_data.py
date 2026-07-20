@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import threading
-from typing import Iterable
 
 import pandas as pd
 
@@ -19,28 +18,36 @@ class MarketDataEngine:
 
     # Long context frames naturally advance less often, so only intraday
     # frames use freshness limits. The bridge timestamp is the candle open.
+    #
+    # D1 widened from 48h to 96h (2026-07-20): the most recent COMPLETED D1
+    # candle is Friday's close, and Friday-close to Monday-morning is
+    # routinely 54-58h - a 48h limit made every snapshot fail on Monday
+    # mornings for every asset class, even though only indices.py reads D1
+    # (for ADR/gap features that use a 20-day lookback and don't need
+    # today's candle). 96h survives a normal weekend with margin while
+    # still catching a genuinely dead feed after several days.
     FRESHNESS_MAX_AGE_SECONDS = {
-        "D1": 172800,
+        "D1": 345600,
         "H4": 43200,
         "H1": 10800,
         "M30": 5400,
         "M15": 2700,
         "M5": 900,
-        "M3": 540,
-        "M1": 180,
     }
 
+    # Only the timeframes actually read by an engine (see TIME_WEIGHTS in
+    # engines/*.py, plus D1/M30 used by indices.py._features()). MN1/W1/M3/M1
+    # were fetched and freshness-checked here for every symbol on every
+    # cycle but never read anywhere - pure overhead, and M1's 180s freshness
+    # window made it the most likely of the unused frames to spuriously
+    # fail and block a whole snapshot for no benefit.
     TIMEFRAMES = (
-        ("MN1", 43200),
-        ("W1", 10080),
         ("D1", 1440),
         ("H4", 240),
         ("H1", 60),
         ("M30", 30),
         ("M15", 15),
         ("M5", 5),
-        ("M3", 3),
-        ("M1", 1),
     )
 
     def __init__(self, gateway: MT5Gateway, history_bars: int = 220):
@@ -268,5 +275,3 @@ class MarketDataEngine:
             freshness=freshness,
         )
 
-    def symbols(self, configured: Iterable[str]) -> list[str]:
-        return [str(symbol).strip().upper() for symbol in configured if str(symbol).strip()]

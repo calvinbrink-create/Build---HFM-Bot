@@ -120,6 +120,8 @@ function normalizeRows(rows) {
         close: Number(row.close),
         volume: Number(row.volume || 0),
         source: row.source || "mt5",
+        fresh: row.fresh !== false,
+        marketClosed: row.status === "MARKET_CLOSED",
       };
       return candle;
     })
@@ -343,19 +345,20 @@ export default function CandleChart({
       chart.timeScale().fitContent();
       didFitRef.current = true;
     }
-    setStatus("ok");
+    setStatus(rows[rows.length - 1]?.marketClosed ? "closed" : "ok");
   }, [rows]);
 
   const last = rows[rows.length - 1] || null;
   const readout = hover || last;
   const readoutTime = readout?.time ? formatSastTime(readout.time) : `${DISPLAY_TZ_LABEL} chart time`;
+  const marketClosed = status === "closed";
 
   return (
     <div className="live-chart-shell" style={{ height: fill ? "100%" : height }}>
       <div className="live-chart-toolbar">
         <div>
           <strong>{sym}</strong>
-          <span>{timeframe} · {sourceLabel} · {readoutTime}</span>
+          <span>{timeframe} · {marketClosed ? "Last session" : sourceLabel} · {readoutTime}</span>
         </div>
         <div className="live-chart-ohlc">
           <span>O {formatPrice(sym, readout?.open)}</span>
@@ -364,6 +367,12 @@ export default function CandleChart({
           <span>C {formatPrice(sym, readout?.close)}</span>
         </div>
       </div>
+      {marketClosed && (
+        <div className="live-chart-closed-badge">
+          <span className="live-chart-closed-dot" />
+          Market closed - showing the last available session. Live ticking resumes automatically at the open.
+        </div>
+      )}
       <div ref={containerRef} className="live-chart-canvas" />
       {status === "empty" && (
         <div className="live-chart-empty">

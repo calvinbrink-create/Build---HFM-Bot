@@ -85,8 +85,17 @@ class MT5RuntimeConfig:
     capital_cap_usd: float = _env_float("MT5_CAPITAL_CAP_USD", 5000.0)
     max_position_pct: float = _env_float("MT5_MAX_POSITION_PCT", 1.0)
     max_open_trades: int = _env_int("MT5_MAX_OPEN_TRADES", 30)
-    max_daily_trades: int = _env_int("MT5_MAX_DAILY_TRADES", 30)
-    execution_mode: str = (os.getenv("MT5_EXECUTION_MODE", "auto").strip().lower() or "auto")
+    max_daily_trades: int = _env_int("MT5_MAX_DAILY_TRADES", 1000)
+    loss_cooldown_seconds: int = _env_int("MT5_LOSS_COOLDOWN_SECONDS", 600)
+    daily_loss_limit_usd: float = _env_float(
+        "MT5_LIVE_DAILY_LOSS_LIMIT_USD"
+        if os.getenv("MT5_TRADE_MODE", "paper").strip().lower() == "live"
+        else "MT5_MAX_DAILY_LOSS_USD",
+        5000.0 if os.getenv("MT5_TRADE_MODE", "paper").strip().lower() == "live" else 10000.0,
+    )
+    max_trades_per_symbol: int = _env_int("MT5_MAX_DAILY_TRADES_PER_SYMBOL", 60)
+    max_pyramid_trades: int = _env_int("MT5_MAX_PYRAMID_TRADES", 10)
+    execution_mode: str = (os.getenv("MT5_EXECUTION_MODE", "bridge").strip().lower() or "bridge")
     state_file: Path = Path(os.getenv("MT5_STATE_FILE", "mt5_runtime_state.json"))
     symbols_file: Path = Path(os.getenv("MT5_SYMBOLS_FILE", "mt5_symbols.json"))
     bridge_dir: Path = Path(os.getenv("MT5_BRIDGE_DIR", "mt5_bridge"))
@@ -95,7 +104,7 @@ class MT5RuntimeConfig:
         "MT5_MARKETS",
         "forex,metals,energies,crypto,indices,stocks,etfs",
     )
-    forex_symbols: list[str] = field(default_factory=lambda: ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD"])
+    forex_symbols: list[str] = field(default_factory=lambda: ["USDJPY", "USDCAD", "EURJPY"])
     metals_symbols: list[str] = field(default_factory=list)
     energies_symbols: list[str] = field(default_factory=list)
     crypto_symbols: list[str] = field(default_factory=list)
@@ -186,7 +195,7 @@ class MT5RuntimeConfig:
         for group, symbols in self.symbol_groups().items():
             if canonical in symbols:
                 return group
-        return "forex"
+        return "unknown"
 
     @property
     def commands_dir(self) -> Path:

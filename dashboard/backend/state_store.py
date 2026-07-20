@@ -50,6 +50,31 @@ SCORE_BANDS = (
 )
 
 
+def _active_dashboard_symbols() -> set[str]:
+    try:
+        payload = json.loads(Path("/opt/cipherfx_mt5/mt5_symbols.json").read_text())
+        active = {
+            str(symbol or "").strip().upper()
+            for group in ("forex", "metals", "indices")
+            for symbol in (payload.get(group) or [])
+            if str(symbol or "").strip()
+        }
+        aliases = payload.get("aliases") if isinstance(payload, dict) else {}
+        if isinstance(aliases, dict):
+            active.update(
+                str(aliases.get(symbol) or "").strip().upper()
+                for symbol in list(active)
+                if str(aliases.get(symbol) or "").strip()
+            )
+        return active
+    except Exception:
+        return set()
+
+
+def _dashboard_symbol_allowed(symbol: str) -> bool:
+    return str(symbol or "").strip().upper() in _active_dashboard_symbols()
+
+
 def _tz_name() -> str:
     return DEFAULT_TZ
 
@@ -1047,7 +1072,11 @@ def read_positions(include_stale=False):
         """
         rows = conn.execute(query, (cutoff,)).fetchall()
     conn.close()
-    return [enrich_position_dates(dict(r)) for r in rows]
+    return [
+        enrich_position_dates(dict(r))
+        for r in rows
+        if _dashboard_symbol_allowed(dict(r).get("sym") or dict(r).get("symbol"))
+    ]
 
 
 def read_signals():
@@ -1550,7 +1579,12 @@ def read_signal_scanner():
 
     scanner_status = {row["key"]: row["value"] for row in status_rows}
     configured_symbol_count = _safe_int(scanner_status.get("mt5_symbol_count")) or _safe_int(scanner_status.get("priority_scan_symbol_count"))
+    allowed_symbols = _active_dashboard_symbols()
     signals = _filter_latest_priority_signals([_public_signal_row(row) for row in signal_rows])
+    signals = [
+        row for row in signals
+        if str(row.get("sym") or "").strip().upper() in allowed_symbols
+    ]
     signals = [row for row in signals if str(row.get("gate") or "").strip().lower() not in {"market_window_closed", "markets closed"}]
     # A closed session is not a current signal. Historical data remains in
     # SQLite and the history views, but it is excluded from this live list.
@@ -1604,7 +1638,11 @@ def read_signal_scanner():
             "public_mode": "Shadow",
             "score_metric": {"version": "cipher_fx_score", "total": None, "band": ""},
         })
-    events = [_public_setup_event(row) for row in setup_rows]
+    events = [
+        _public_setup_event(row)
+        for row in setup_rows
+        if str(row.get("sym") or row.get("symbol") or "").strip().upper() in allowed_symbols
+    ]
     today_events = [row for row in events if row.get("trade_date") == today]
     week_events = [row for row in events if _date_between(row.get("trade_date"), week_start, week_end)]
     today_signals = [row for row in signals if trade_date_for(row.get("updated_at")) == today]
@@ -1620,6 +1658,8 @@ def read_signal_scanner():
     rejected = []
     for row in rejected_rows:
         data = dict(row)
+        if str(data.get("sym") or data.get("symbol") or "").strip().upper() not in allowed_symbols:
+            continue
         opened = date_detail_for(data.get("opened_at"))
         _add_date_prefix(data, "opened", opened)
         data["score"] = _safe_float(data.get("score"))
@@ -1820,7 +1860,7 @@ def _deals_summary(rows: list[dict], period: str, start: str, end: str) -> dict:
     by_symbol: dict[str, dict] = {}
     for row in rows:
         symbol = str(row.get("sym") or row.get("symbol") or "MT5")
-        item = by_symbol.setdefault(symbol, {"symbol": symbol, "trades": 0, "pnl": 0.0, "wins": 0, "losses": 0})
+        item = by_symbol.setdefault(symbol, {"symbol": symbol, "trades": 0, "pnl": 0.0, "wins": 0, "losses": 0, "breakeven": 0})
         pnl = float(row.get("realized") or row.get("pnl") or 0.0)
         item["trades"] += 1
         item["pnl"] += pnl
@@ -1828,12 +1868,18 @@ def _deals_summary(rows: list[dict], period: str, start: str, end: str) -> dict:
             item["wins"] += 1
         elif pnl < 0:
             item["losses"] += 1
+        else:
+            item["breakeven"] += 1
     symbol_rows = []
     for item in by_symbol.values():
         item["pnl"] = round(float(item["pnl"]), 2)
+        decided = int(item["wins"]) + int(item["losses"])
+        item["win_rate"] = round((int(item["wins"]) / decided * 100.0), 1) if decided else 0.0
+        item["loss_rate"] = round((int(item["losses"]) / decided * 100.0), 1) if decided else 0.0
         symbol_rows.append(item)
     symbol_rows.sort(key=lambda item: abs(float(item["pnl"])), reverse=True)
     total = len(rows)
+    decided = len(wins) + len(losses)
     gross_profit = sum(wins)
     gross_loss = sum(losses)
     return {
@@ -1841,10 +1887,12 @@ def _deals_summary(rows: list[dict], period: str, start: str, end: str) -> dict:
         "start_date": start,
         "end_date": end,
         "total_trades": total,
+        "decided_trades": decided,
         "wins": len(wins),
         "losses": len(losses),
         "breakeven": len(breakeven),
-        "win_rate": round((len(wins) / total * 100.0), 1) if total else 0.0,
+        "win_rate": round((len(wins) / decided * 100.0), 1) if decided else 0.0,
+        "win_rate_including_breakeven": round((len(wins) / total * 100.0), 1) if total else 0.0,
         "pnl": round(sum(pnls), 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
@@ -1906,41 +1954,335 @@ def sync_mt5_trade_exports(export_root: str | Path = "/opt/cipherfx_mt5/state/sy
     return {"day": day, "sqlite_trade_count": len(rows), **counts, "reconciled": True, "generated_at": datetime.now(timezone.utc).isoformat()}
 
 
+
+
+def _mt5_bridge_history(period: str, start: str, end: str, count: int) -> list[dict] | None:
+    """Read closed positions directly from the MT5 bridge history export."""
+    bridge_root = str(os.getenv("MT5_BRIDGE_DIR", "")).strip()
+    if not bridge_root:
+        return None
+    deals_path = Path(bridge_root) / "deals.csv"
+    positions_path = Path(bridge_root) / "positions.csv"
+    if not deals_path.is_file():
+        return None
+    try:
+        with deals_path.open("r", newline="", encoding="utf-8-sig") as handle:
+            rows = list(csv.DictReader(handle))
+    except (OSError, csv.Error):
+        return None
+    if not rows or not {"position_id", "symbol", "price", "profit"}.issubset(rows[0]):
+        return None
+
+    def number(row: dict, key: str, default: float = 0.0) -> float:
+        try:
+            value = row.get(key, default)
+            return default if value in (None, "") else float(value)
+        except (TypeError, ValueError):
+            return default
+
+    def ticket(row: dict, key: str) -> int:
+        return int(number(row, key, 0.0))
+
+    def utc_dt(row: dict):
+        raw = row.get("time_utc") or row.get("time") or row.get("time_broker")
+        try:
+            stamp = float(raw)
+            if stamp > 1000000000:
+                return datetime.fromtimestamp(stamp, tz=timezone.utc)
+        except (TypeError, ValueError, OSError):
+            pass
+        return None
+
+    def display_dt(value):
+        if value is None:
+            return ""
+        tz = _tzinfo()
+        return value.astimezone(tz).isoformat() if tz else value.isoformat()
+
+    active_positions: set[str] = set()
+    if positions_path.is_file():
+        try:
+            with positions_path.open("r", newline="", encoding="utf-8-sig") as handle:
+                active_positions = {
+                    str(row.get("ticket") or "").strip()
+                    for row in csv.DictReader(handle)
+                    if str(row.get("ticket") or "").strip() not in {"", "0"}
+                }
+        except (OSError, csv.Error):
+            active_positions = set()
+
+    grouped: dict[str, list[dict]] = {}
+    for row in rows:
+        pid = str(row.get("position_id") or "").strip()
+        if pid and pid != "0":
+            grouped.setdefault(pid, []).append(row)
+
+    known_by_position: dict[str, dict] = {}
+    try:
+        conn = get_conn()
+        known_rows = conn.execute(
+            "SELECT h.trade_id,h.proposal_id,h.exit_reason,h.asset_class,h.metrics_json,"
+            "e.position_ticket,e.order_ticket,e.deal_ticket "
+            "FROM trade_history h LEFT JOIN executions e ON e.proposal_id=h.proposal_id "
+            "WHERE h.closed_at IS NOT NULL"
+        ).fetchall()
+        conn.close()
+        for row in known_rows:
+            item = dict(row)
+            position = str(item.get("position_ticket") or "").strip()
+            if not position or position == "0":
+                try:
+                    metrics = json.loads(item.get("metrics_json") or "{}")
+                except (TypeError, ValueError):
+                    metrics = {}
+                position = str(metrics.get("broker_position_id") or "").strip()
+            if position and position != "0":
+                known_by_position[position] = item
+            trade_id = str(item.get("trade_id") or "")
+            if trade_id.startswith("mt5:position:"):
+                known_by_position.setdefault(trade_id.split(":", 2)[-1], item)
+            suffix = trade_id.rsplit("_", 1)[-1] if "_" in trade_id else ""
+            if suffix.isdigit():
+                known_by_position.setdefault(suffix, item)
+    except (OSError, sqlite3.Error):
+        known_by_position = {}
+
+    result: list[dict] = []
+    closing_names = {"DEAL_ENTRY_OUT", "DEAL_ENTRY_INOUT", "DEAL_ENTRY_OUT_BY", "OUT", "INOUT", "OUT_BY", "2", "3"}
+    opening_names = {"DEAL_ENTRY_IN", "DEAL_ENTRY_INOUT", "IN", "INOUT", "1", "2"}
+    for position_id, group in grouped.items():
+        if position_id in active_positions:
+            continue
+        decorated = sorted(
+            [(row, utc_dt(row)) for row in group if utc_dt(row) is not None],
+            key=lambda item: item[1],
+        )
+        if not decorated:
+            continue
+        has_entry_metadata = any(str(row.get("deal_entry") or "").strip() for row, _ in decorated)
+        if has_entry_metadata:
+            closing = [
+                (row, stamp) for row, stamp in decorated
+                if str(row.get("deal_entry") or "").strip().upper() in closing_names
+            ]
+            opening = [
+                (row, stamp) for row, stamp in decorated
+                if str(row.get("deal_entry") or "").strip().upper() in opening_names
+            ]
+            if not closing:
+                continue
+        else:
+            if len(decorated) < 2:
+                continue
+            opening, closing = decorated[:1], decorated[-1:]
+        entry_row, entry_time = opening[0] if opening else decorated[0]
+        close_row, close_time = closing[-1]
+        realized = round(sum(
+            number(row, "net_profit", number(row, "profit") + number(row, "swap") + number(row, "commission"))
+            for row, _ in decorated
+        ), 2)
+        entry_price = number(entry_row, "price")
+        exit_price = number(close_row, "price", entry_price)
+        known = known_by_position.get(position_id, {})
+        deal_type = str(entry_row.get("deal_type") or close_row.get("deal_type") or "").upper()
+        if "BUY" in deal_type or deal_type in {"0", "BUY"}:
+            side = "BUY"
+        elif "SELL" in deal_type or deal_type in {"1", "SELL"}:
+            side = "SELL"
+        elif abs(exit_price - entry_price) > 0.000001 and realized:
+            side = "BUY" if (exit_price > entry_price) == (realized > 0) else "SELL"
+        else:
+            side = str(known.get("side") or "")
+        status = "win" if realized > 0 else "loss" if realized < 0 else "breakeven"
+        closed_at = display_dt(close_time)
+        closed_day = trade_date_for(closed_at)
+        if period != "all" and not (start <= closed_day <= end):
+            continue
+        symbol = str(close_row.get("symbol") or entry_row.get("symbol") or "")
+        result.append({
+            "id": f"mt5_position_{position_id}",
+            "trade_id": f"mt5_position_{position_id}",
+            "proposal_id": known.get("proposal_id") or "",
+            "ticket": ticket(close_row, "deal"),
+            "position_ticket": int(position_id),
+            "order_ticket": ticket(close_row, "order"),
+            "deal_ticket": ticket(close_row, "deal"),
+            "sym": symbol,
+            "symbol": symbol,
+            "engine": {
+                "forex": "FOREX",
+                "index": "INDICES",
+                "metal": "METALS",
+            }.get(str(known.get("asset_class") or "").lower(), str(known.get("asset_class") or "").upper()),
+            "asset_class": str(known.get("asset_class") or ""),
+            "direction": side,
+            "side": side.lower(),
+            "outcome": status,
+            "status": "CLOSED",
+            "qty": number(entry_row, "volume"),
+            "volume": number(entry_row, "volume"),
+            "entry_price": entry_price,
+            "entry": entry_price,
+            "exit_price": exit_price,
+            "exit": exit_price,
+            "realized": realized,
+            "pnl": realized,
+            "profit": realized,
+            "opened_at": display_dt(entry_time),
+            "closed_at": closed_at,
+            "trade_date": closed_day,
+            "result_r": None,
+            "exit_reason": (
+                str(known.get("exit_reason") or "")
+                if str(known.get("exit_reason") or "") not in {"", "BROKER_HISTORY"}
+                else str(close_row.get("deal_reason") or "MT5 broker history; strategy reason unavailable")
+            ),
+            "source": "mt5_bridge_history",
+            "mt5_deal_entry": str(close_row.get("deal_entry") or ""),
+            "mt5_deal_type": str(close_row.get("deal_type") or ""),
+            "mt5_magic": ticket(close_row, "magic"),
+            "mt5_comment": str(close_row.get("comment") or ""),
+            "mt5_reason": str(close_row.get("deal_reason") or ""),
+        })
+    result.sort(key=lambda row: str(row.get("closed_at") or ""), reverse=True)
+    return result[:count]
+
+def _read_modular_history(period: str, start: str, end: str, count: int) -> list[dict]:
+    """Read closed trades from the active modular MT5 history tables."""
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT h.trade_id, h.proposal_id, h.symbol, h.asset_class, h.side,
+                   h.realized_pnl, h.initial_risk, h.result_r, h.exit_reason,
+                   h.closed_at,
+                   e.position_ticket, e.order_ticket, e.deal_ticket,
+                   e.volume, e.fill_price, e.filled_at
+            FROM trade_history h
+            LEFT JOIN executions e
+              ON e.proposal_id = COALESCE(h.proposal_id, h.trade_id)
+             AND e.rowid = (
+                 SELECT MAX(e2.rowid)
+                 FROM executions e2
+                 WHERE e2.proposal_id = COALESCE(h.proposal_id, h.trade_id)
+             )
+            WHERE h.closed_at IS NOT NULL
+              AND COALESCE(h.exit_reason, '') != 'PROPOSAL_EXPIRED'
+              AND h.trade_id NOT LIKE 'expired:%'
+            ORDER BY datetime(replace(h.closed_at, 'T', ' ')) DESC
+            """
+        ).fetchall()
+    finally:
+        conn.close()
+
+    output = []
+    for row in rows:
+        closed_at = row["closed_at"] or ""
+        closed_day = trade_date_for(closed_at)
+        if period != "all" and not (start <= closed_day <= end):
+            continue
+        realized = float(row["realized_pnl"] or 0.0)
+        status = "win" if realized > 0 else "loss" if realized < 0 else "breakeven"
+        ticket = row["position_ticket"] or row["deal_ticket"] or row["order_ticket"] or 0
+        output.append({
+            "id": row["trade_id"],
+            "trade_id": row["trade_id"],
+            "proposal_id": row["proposal_id"],
+            "ticket": ticket,
+            "position_ticket": row["position_ticket"] or 0,
+            "order_ticket": row["order_ticket"] or 0,
+            "deal_ticket": row["deal_ticket"] or 0,
+            "sym": row["symbol"] or "",
+            "symbol": row["symbol"] or "",
+            "engine": row["asset_class"] or "",
+            "asset_class": row["asset_class"] or "",
+            "direction": row["side"] or "",
+            "side": str(row["side"] or "").lower(),
+            "qty": float(row["volume"] or 0.0),
+            "volume": float(row["volume"] or 0.0),
+            "entry": row["fill_price"],
+            "entry_price": row["fill_price"],
+            "realized": realized,
+            "pnl": realized,
+            "profit": realized,
+            "outcome": status,
+            "status": "CLOSED",
+            "opened_at": row["filled_at"] or "",
+            "closed_at": closed_at,
+            "trade_date": closed_day,
+            "result_r": row["result_r"],
+            "exit_reason": row["exit_reason"] or "",
+            "source": "trade_history",
+        })
+        if len(output) >= count:
+            break
+    return output
+
 def read_deals_period(period: str = "today", limit: int = 200) -> dict:
     clean, start, end = _deal_period_range(period)
     count = max(1, min(int(limit or 200), 1000))
-    conn = get_conn()
-    if clean == "all":
-        rows = conn.execute(
-            "SELECT * FROM trades WHERE closed_at IS NOT NULL ORDER BY datetime(replace(closed_at, 'T', ' ')) DESC LIMIT ?",
-            (count,),
-        ).fetchall()
-    else:
-        rows = conn.execute(
-            """
-            SELECT * FROM trades
-            WHERE closed_at IS NOT NULL AND trade_date >= ? AND trade_date <= ?
-            ORDER BY datetime(replace(closed_at, 'T', ' ')) DESC LIMIT ?
-            """,
-            (start, end, count),
-        ).fetchall()
-    conn.close()
-    deals = [_deal_row_payload(row) for row in rows]
+
+    # MT5 bridge history is authoritative for broker deal identity and P/L.
+    # Modular history remains the attribution source only when the broker
+    # export is unavailable.
+    broker_deals = _mt5_bridge_history(clean, start, end, count)
+    deals = broker_deals if broker_deals is not None else _read_modular_history(clean, start, end, count)
+
+    # Only use the legacy ledger when the direct MT5 export is unavailable.
+    if broker_deals is None and (clean == "all" or not deals):
+        conn = get_conn()
+        try:
+            if clean == "all":
+                rows = conn.execute(
+                    "SELECT * FROM trades WHERE closed_at IS NOT NULL "
+                    "ORDER BY datetime(replace(closed_at, 'T', ' ')) DESC LIMIT ?",
+                    (count,),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    """
+                    SELECT * FROM trades
+                    WHERE closed_at IS NOT NULL AND trade_date >= ? AND trade_date <= ?
+                    ORDER BY datetime(replace(closed_at, 'T', ' ')) DESC LIMIT ?
+                    """,
+                    (start, end, count),
+                ).fetchall()
+        finally:
+            conn.close()
+
+        modular_ids = {str(row.get("trade_id") or row.get("id") or "") for row in deals}
+        for row in rows:
+            legacy = _deal_row_payload(row)
+            legacy_id = str(legacy.get("trade_id") or legacy.get("id") or "")
+            if legacy_id and legacy_id in modular_ids:
+                continue
+            deals.append(legacy)
+            if len(deals) >= count:
+                break
+
+    allowed_symbols = _active_dashboard_symbols()
+    deals = [
+        row for row in deals
+        if str(row.get("sym") or row.get("symbol") or "").strip().upper() in allowed_symbols
+    ][:count]
     summary = _deals_summary(deals, clean, start, end)
     public_keys = (
-        "id", "trade_id", "ticket", "sym", "symbol", "direction", "side",
-        "outcome", "status", "qty", "volume", "entry_price", "entry",
-        "exit_price", "exit", "price", "realized", "pnl", "profit",
-        "opened_at", "closed_at", "trade_date", "opened_date", "closed_date",
-        "opened_day", "closed_day", "opened_month_label", "trade_month_label",
-        "closed_month_label", "opened_label", "closed_label", "trade_label",
-        "duration_label",
+        "id", "trade_id", "proposal_id", "ticket", "position_ticket", "order_ticket",
+        "deal_ticket", "sym", "symbol", "engine", "asset_class", "direction", "side",
+        "outcome", "status", "qty", "volume", "entry_price", "entry", "exit_price",
+        "exit", "price", "fill_price", "realized", "pnl", "profit", "opened_at",
+        "closed_at", "trade_date", "opened_date", "closed_date", "opened_day",
+        "closed_day", "opened_month_label", "trade_month_label", "closed_month_label",
+        "opened_label", "closed_label", "trade_label", "duration_label", "result_r",
+        "exit_reason", "source", "mt5_deal_entry", "mt5_deal_type",
+        "mt5_magic", "mt5_comment", "mt5_reason",
     )
     public_deals = [{key: row.get(key) for key in public_keys if key in row} for row in deals]
     return {
         "period": clean,
         "start_date": start,
         "end_date": end,
+        "source": "mt5_bridge_history" if broker_deals is not None else "modular_history",
         "summary": summary,
         "deals": public_deals,
     }

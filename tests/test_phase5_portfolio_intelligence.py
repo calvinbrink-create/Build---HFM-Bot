@@ -47,6 +47,25 @@ class Phase5PortfolioIntelligenceTests(unittest.TestCase):
         self.assertEqual(snapshot["proposals"]["pending"], 2)
         self.assertEqual(snapshot["performance"]["closed_summaries"]["FOREX"]["wins"], 2)
 
+    def test_realized_loss_is_reflected_in_informational_health(self):
+        snapshot = self.snapshot(
+            account={"balance": 10000, "equity": 10000, "margin": 1000, "free_margin": 9000},
+            closed_summaries={"FOREX": {"closed_trades": 10, "realized_pnl": -3000, "wins": 2, "losses": 8}},
+        )
+        self.assertLess(snapshot["portfolio_health"]["score"], 100)
+        self.assertEqual(snapshot["portfolio_health"]["risk_status"], "HIGH")
+        self.assertEqual(snapshot["performance"]["realized_loss_ratio"], 0.3)
+
+    def test_engine_attribution_is_preserved_in_exposure(self):
+        snapshot = self.snapshot(
+            positions=[
+                {"ticket": 1, "symbol": "EURUSD", "side": "BUY", "volume": 0.2, "profit": 20, "engine": "FOREX"},
+                {"ticket": 2, "symbol": "GOLD", "side": "BUY", "volume": 0.1, "profit": -5, "engine": "METALS"},
+            ],
+        )
+        engines = {item["name"]: item["positions"] for item in snapshot["exposure"]["by_engine"]}
+        self.assertEqual(engines, {"FOREX": 1, "METALS": 1})
+
     def test_stale_or_disconnected_data_is_reported_not_traded_on(self):
         snapshot = self.snapshot(operational={"mt5_connected": False, "stale_tick_count": 4})
         self.assertEqual(snapshot["portfolio_health"]["risk_status"], "CRITICAL")

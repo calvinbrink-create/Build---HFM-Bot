@@ -11,7 +11,7 @@ import {
 const DISPLAY_TIME_ZONE = "Africa/Johannesburg";
 const DISPLAY_TZ_LABEL = "SAST";
 
-function toTime(value) {
+function replayToTime(value) {
   const raw = String(value ?? "").trim();
   if (!raw) return null;
   if (/^\d+$/.test(raw)) {
@@ -27,7 +27,7 @@ function normalizeCandles(rows) {
   const seen = new Set();
   return (Array.isArray(rows) ? rows : [])
     .map((row) => ({
-      time: toTime(row.ts ?? row.time ?? row.timestamp),
+      time: replayToTime(row.ts ?? row.time ?? row.timestamp),
       open: Number(row.open),
       high: Number(row.high),
       low: Number(row.low),
@@ -49,13 +49,13 @@ function normalizeTrades(rows) {
     direction: String(row.direction || row.side || "").toUpperCase(),
     entry: Number(row.entry),
     exit_px: Number(row.exit_px),
-    opened_at: toTime(row.opened_at || row.open_time || row.time),
-    closed_at: toTime(row.closed_at || row.close_time),
+    opened_at: replayToTime(row.opened_at || row.open_time || row.time),
+    closed_at: replayToTime(row.closed_at || row.close_time),
   }));
 }
 
 function formatTime(value) {
-  const seconds = toTime(value);
+  const seconds = replayToTime(value);
   if (!Number.isFinite(seconds)) return "--";
   return new Intl.DateTimeFormat("en-GB", {
     timeZone: DISPLAY_TIME_ZONE,
@@ -217,19 +217,22 @@ export default function TradeReplayChart({
       const entryTime = nearestTime(visibleRows, trade.opened_at);
       const exitTime = trade.closed_at && trade.closed_at <= lastTime ? nearestTime(visibleRows, trade.closed_at) : null;
       const buy = trade.direction === "BUY" || trade.direction === "LONG";
+      // Marker text is intentionally omitted: with many trades clustered in a
+      // short replay window, per-marker labels stack and overlap into
+      // unreadable clutter. Shape + color already carry the signal (arrow
+      // up/down = buy/sell, circle color = win/loss/breakeven); the trade
+      // list panel below the chart carries the detail.
       const markers = entryTime ? [{
         time: entryTime,
         position: buy ? "belowBar" : "aboveBar",
         color: buy ? "#19d78a" : "#ff5965",
         shape: buy ? "arrowUp" : "arrowDown",
-        text: (buy ? "BUY " : "SELL ") + (trade.trade_id || ""),
       }] : [];
       if (exitTime) markers.push({
         time: exitTime,
         position: buy ? "aboveBar" : "belowBar",
         color: trade.outcome === "win" ? "#19d78a" : trade.outcome === "loss" ? "#ff5965" : "#f4b317",
         shape: "circle",
-        text: "EXIT",
       });
       return markers;
     }).sort((a, b) => a.time - b.time));
@@ -243,7 +246,7 @@ export default function TradeReplayChart({
         lineWidth: 1,
         lineStyle: 2,
         axisLabelVisible: false,
-        title: trade.direction + " " + (trade.trade_id || ""),
+        title: trade.direction === "BUY" || trade.direction === "LONG" ? "Buy entry" : "Sell entry",
       }));
     chart.timeScale().fitContent();
   }, [visibleRows, normalizedTrades]);

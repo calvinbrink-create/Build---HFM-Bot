@@ -7,6 +7,8 @@ import csv
 import json
 import time
 import sqlite3
+import subprocess
+import shlex
 import urllib.request as _ur
 import xml.etree.ElementTree as _ET
 from datetime import datetime, timedelta, timezone
@@ -32,6 +34,7 @@ import app_store  # noqa: E402
 import state_store as db  # noqa: E402
 from mt5_xm_config import MT5RuntimeConfig  # noqa: E402
 from mt5_xm_gateway import MT5Gateway  # noqa: E402
+from portfolio_intelligence import build_portfolio_snapshot  # noqa: E402
 try:
     from visual_market_intelligence import fetch_visual_summary  # noqa: E402
 except Exception:
@@ -58,6 +61,14 @@ if (STATIC_DIR / "assets").exists():
 class LoginRequest(BaseModel):
     email: str
     password: str
+
+
+class LiveLoginRequest(BaseModel):
+    email: str
+    password: str
+    account: str
+    account_password: str
+    server: str = ""
 
 
 class MarketOrderRequest(BaseModel):
@@ -153,6 +164,14 @@ def _session_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)):
 
 
 def _connected() -> bool:
+    # The modular runtime is authoritative for live connection state.
+    try:
+        service, _updated = _platform_status_payload("service")
+        state = str(service.get("state") or "").strip().upper()
+        if state:
+            return state == "CONNECTED"
+    except Exception:
+        pass
     raw = db.read_status("mt5_connected")
     return str(raw).lower() == "true" if isinstance(raw, str) else bool(raw)
 
@@ -201,9 +220,310 @@ def _intelligence_rows(table, limit=50, symbol="", status=""):
             payload = json.loads(row.get("payload_json") or "{}")
         except Exception:
             payload = {}
+        row_symbol = str(row.get("symbol") or payload.get("symbol") or "").strip().upper()
+        if row_symbol and row_symbol not in _dashboard_symbol_codes():
+            continue
         row["payload"] = payload
         result.append(row)
     return result
+
+
+def _intelligence_count(table):
+    if table not in _INTELLIGENCE_TABLES:
+        return 0
+    columns = _intelligence_sql("PRAGMA table_info(" + table + ")")
+    has_symbol = any(str(row.get("name") or "") == "symbol" for row in columns)
+    if not has_symbol:
+        return int(_intelligence_sql("SELECT COUNT(*) AS count FROM " + table)[0]["count"])
+    allowed = sorted(_dashboard_symbol_codes())
+    placeholders = ",".join("?" for _ in allowed)
+    rows = _intelligence_sql(
+        "SELECT COUNT(*) AS count FROM " + table +
+        " WHERE TRIM(COALESCE(symbol, '')) = '' OR UPPER(symbol) IN (" +
+        placeholders + ")",
+        allowed,
+    )
+    return int(rows[0]["count"]) if rows else 0
+
+
+def _score_band(value) -> str:
+    score = _optional_float(value)
+    if score is None:
+        return ""
+    if score < 60:
+        return "0-59"
+    if score < 70:
+        return "60-69"
+    if score < 80:
+        return "70-79"
+    if score < 90:
+        return "80-89"
+    return "90-100"
+
+
+def _platform_status_payload(key: str) -> tuple[dict, str]:
+    try:
+        conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+        row = conn.execute(
+            "SELECT value_json, updated_at FROM platform_status WHERE key = ?",
+            (str(key),),
+        ).fetchone()
+        conn.close()
+    except Exception:
+        return {}, ""
+    if not row:
+        return {}, ""
+    try:
+        payload = json.loads(row[0] or "{}")
+    except Exception:
+        payload = {}
+    if str(key) == "market_feed":
+        payload = _filter_market_feed_payload(payload)
+    return (payload if isinstance(payload, dict) else {}), str(row[1] or "")
+
+
+def _platform_scan_rows() -> list[dict]:
+    try:
+        conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+        rows = conn.execute(
+            "SELECT key, value_json, updated_at FROM platform_status "
+            "WHERE key LIKE 'scan:%' ORDER BY updated_at DESC"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        return []
+    result = []
+    allowed_symbols = _dashboard_symbol_codes()
+    for key, value_json, updated_at in rows:
+        try:
+            payload = json.loads(value_json or "{}")
+        except Exception:
+            payload = {}
+        if not isinstance(payload, dict):
+            continue
+        symbol = str(payload.get("symbol") or str(key)[5:]).strip().upper()
+        if not symbol or symbol not in allowed_symbols:
+            continue
+        scores = payload.get("scores") if isinstance(payload.get("scores"), dict) else {}
+        totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+        side = str(payload.get("proposal_side") or "").upper()
+        if side not in {"BUY", "SELL"}:
+            side = ""
+        proposal_id = str(payload.get("proposal_id") or "")
+        score = _optional_float(payload.get("score"))
+        if score is None and totals:
+            values = [_optional_float(value) for value in totals.values()]
+            values = [value for value in values if value is not None]
+            score = max(values) if values else None
+        reasons = payload.get("reasons")
+        if not isinstance(reasons, list):
+            reasons = payload.get("proposal_reasoning")
+        if not isinstance(reasons, list):
+            reasons = []
+        engine = str(payload.get("engine") or "").upper()
+        asset_class = str(payload.get("asset_class") or "").lower()
+        proposal = bool(proposal_id)
+        progress = [
+            {"key": "H4", "label": "Direction", "state": "complete" if "H4" in scores else "inactive"},
+            {"key": "H1", "label": "Confirm", "state": "complete" if "H1" in scores else "inactive"},
+            {"key": "M15", "label": "Structure", "state": "complete" if "M15" in scores else "inactive"},
+            {"key": "M5", "label": "Trigger", "state": "complete" if "M5" in scores else "inactive"},
+            {"key": "ORDER", "label": "Order", "state": "complete" if proposal else "inactive"},
+        ]
+        result.append({
+            "sym": symbol,
+            "symbol": symbol,
+            "market": asset_class,
+            "direction": side,
+            "side": side,
+            "final_score": score,
+            "score": score,
+            "score_band": _score_band(score),
+            "status": "PROPOSAL_CREATED" if proposal else "NO_TRADE",
+            "reason": "; ".join(str(item) for item in reasons) or ("TRADE_PROPOSAL_CREATED" if proposal else "NO_TRADE_PROPOSAL"),
+            "systematic_reason": "",
+            "engine": engine,
+            "asset_class": asset_class,
+            "strategy": engine,
+            "created_at": str(updated_at or ""),
+            "updated_at": str(updated_at or ""),
+            "created_label": db.date_detail_for(updated_at).get("label", ""),
+            "trade_date": db.trade_date_for(updated_at),
+            "gate_ok": proposal,
+            "scan_stage": "ORDER" if proposal else "EVALUATED",
+            "scan_status": "PROPOSAL_CREATED" if proposal else "NO_TRADE",
+            "scan_story": (
+                "Live MT5 platform proposal created from the current synchronized snapshot."
+                if proposal else
+                "Live MT5 platform evaluated the current snapshot and did not create a proposal."
+            ),
+            "scan_progress": progress,
+            "scan_trigger": "PROPOSAL" if proposal else "NO_TRADE_PROPOSAL",
+            "scan_cycle_at": str(updated_at or ""),
+            "scan_candle_times": payload.get("freshness", {}).get("latest_completed", {}),
+            "market_session": "",
+            "pending_setup_created": False,
+            "m1_status": "",
+            "proposal_id": proposal_id,
+            "confidence": payload.get("confidence"),
+            "probability": payload.get("probability"),
+            "reasons": reasons,
+            "scores": scores,
+            "totals": totals,
+            "timeframes": payload.get("timeframes") or sorted(scores),
+            "score_breakdown": {
+                "timeframes": scores,
+                "totals": totals,
+                "threshold": payload.get("threshold"),
+                "feature_scores": payload.get("feature_scores") or {},
+            },
+            "public_metric_name": "Cipher FX Score",
+            "public_mode": "Shadow",
+            "score_metric": {
+                "version": "cipher_fx_score",
+                "total": score,
+                "band": _score_band(score),
+            },
+        })
+    return result
+
+
+def _active_platform_scanner() -> dict:
+    scans = _platform_scan_rows()
+    feed, feed_updated = _platform_status_payload("market_feed")
+    today = db.trading_today()
+    actionable = [row for row in scans if row.get("gate_ok")]
+    no_trade = [row for row in scans if not row.get("gate_ok")]
+    bands = {}
+    scores = []
+    for row in scans:
+        score = _optional_float(row.get("score"))
+        if score is None:
+            continue
+        scores.append(score)
+        band = row.get("score_band") or "unavailable"
+        bands[band] = bands.get(band, 0) + 1
+    recent_events = []
+    event_counts = {}
+    allowed_symbols = _dashboard_symbol_codes()
+    try:
+        conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+        event_rows = conn.execute(
+            "SELECT event_time,event_type,symbol,proposal_id,payload_json "
+            "FROM platform_events ORDER BY id DESC LIMIT 200"
+        ).fetchall()
+        conn.close()
+    except Exception:
+        event_rows = []
+    for event_time, event_type, symbol, proposal_id, payload_json in event_rows:
+        if str(symbol or "").strip() and str(symbol or "").strip().upper() not in allowed_symbols:
+            continue
+        try:
+            payload = json.loads(payload_json or "{}")
+        except Exception:
+            payload = {}
+        event_counts[str(event_type)] = event_counts.get(str(event_type), 0) + 1
+        recent_events.append({
+            "event": str(event_type),
+            "event_type": str(event_type),
+            "ts": str(event_time or ""),
+            "created_at": str(event_time or ""),
+            "sym": str(symbol or "").upper(),
+            "symbol": str(symbol or "").upper(),
+            "proposal_id": str(proposal_id or ""),
+            "reason": payload.get("reason") or payload.get("status") or str(event_type),
+            "status": payload.get("status") or str(event_type),
+            "payload": payload,
+        })
+    configured = _symbols()
+    configured_symbols = {str(row.get("symbol") or "").upper() for row in configured}
+    scan_symbols = {str(row.get("symbol") or "").upper() for row in scans}
+    missing = sorted(configured_symbols - scan_symbols)
+    latest_scan = max((str(row.get("updated_at") or "") for row in scans), default="")
+    return {
+        "source": "platform_status_and_platform_events",
+        "public_latest_label": "Live platform scan",
+        "current_signals": scans,
+        "recent_events": recent_events[:80],
+        "blockers": [
+            {
+                "sym": row.get("symbol"),
+                "market": row.get("asset_class"),
+                "direction": row.get("direction"),
+                "score": row.get("score"),
+                "reason": row.get("reason"),
+                "stage": row.get("scan_stage"),
+            }
+            for row in no_trade[:80]
+        ],
+        "rejected_orders": [
+            row for row in recent_events
+            if row.get("event") in {"ORDER_REJECTED", "EXECUTION_BLOCKED", "DUPLICATE_SUPPRESSED"}
+        ][:50],
+        "score_bands_today": [
+            {"band": band, "count": count}
+            for band, count in sorted(bands.items())
+        ],
+        "score_bands_week": [
+            {"band": band, "count": count}
+            for band, count in sorted(bands.items())
+        ],
+        "summary": {
+            "today": today,
+            "week_start": today,
+            "week_end": today,
+            "latest_signal_at": latest_scan,
+            "latest_signal_label": db.date_detail_for(latest_scan).get("label", "") if latest_scan else "",
+            "scanned_symbols_today": len(scans),
+            "tracked_symbols": len(configured_symbols) or len(scans),
+            "current_universe_rows": len(scans),
+            "missing_recent_symbols": missing,
+            "current_actionable": len(actionable),
+            "current_blocked": 0,
+            "current_waiting": len(no_trade),
+            "signals_today": sum(1 for row in scans if row.get("gate_ok")),
+            "signals_week": sum(1 for row in scans if row.get("gate_ok")),
+            "setups_today": event_counts.get("TRADE_PROPOSAL_CREATED", 0),
+            "setups_week": event_counts.get("TRADE_PROPOSAL_CREATED", 0),
+            "blocked_today": 0,
+            "blocked_week": 0,
+            "actionable_today": len(actionable),
+            "actionable_week": len(actionable),
+            "rejected_today": event_counts.get("ORDER_REJECTED", 0),
+            "rejected_week": event_counts.get("ORDER_REJECTED", 0),
+            "avg_score_today": round(sum(scores) / len(scores), 2) if scores else 0.0,
+            "avg_score_week": round(sum(scores) / len(scores), 2) if scores else 0.0,
+            "feed_updated_at": feed_updated,
+            "feed_source": feed.get("source", ""),
+            "fresh_symbols": feed.get("fresh_symbols", 0),
+            "stale_symbols": feed.get("stale_symbols", []),
+        },
+    }
+
+
+def _active_websocket_ticks(symbols: list[str] | None = None) -> list[dict]:
+    feed, _ = _platform_status_payload("market_feed")
+    if str(feed.get("source") or "").lower() != "websocket":
+        return []
+    wanted = {str(item or "").strip().upper() for item in (symbols or []) if str(item or "").strip()}
+    rows = []
+    for row in feed.get("ticks", []) if isinstance(feed.get("ticks"), list) else []:
+        if not isinstance(row, dict):
+            continue
+        symbol = str(row.get("symbol") or "").upper()
+        if wanted and symbol not in wanted and _resolve_symbol_code(symbol) not in wanted:
+            continue
+        item = dict(row)
+        age = _optional_float(item.get("age_seconds"))
+        if age is None:
+            age = _timestamp_age_seconds(item.get("time"))
+        item["age_seconds"] = round(age, 3) if age is not None else None
+        item["fresh"] = bool(item.get("fresh")) and age is not None and age <= 10.0
+        item["status"] = "LIVE_DATA" if item["fresh"] else "STALE_MARKET_DATA"
+        item["source"] = "websocket"
+        rows.append(item)
+    return rows
+
 
 def _bridge_dir() -> Path:
     return Path(os.getenv("MT5_BRIDGE_DIR", "/root/.mt5/drive_c/Program Files/MetaTrader 5/MQL5/Files/cipherfx"))
@@ -229,8 +549,62 @@ def _symbol_aliases() -> dict[str, str]:
 
 
 def _dashboard_symbol_allowlist() -> set[str]:
+    """Return the 12 canonical instruments shown by the dashboard."""
+    try:
+        payload = json.loads(_symbols_catalog_path().read_text())
+        active = {
+            str(symbol or "").strip().upper()
+            for group in ("forex", "metals", "indices")
+            for symbol in (payload.get(group) or [])
+            if str(symbol or "").strip()
+        }
+        if active:
+            return active
+    except Exception:
+        pass
     raw = os.getenv("MT5_PRIORITY_SYMBOLS", "")
     return {str(item or "").strip().upper() for item in raw.split(",") if str(item or "").strip()}
+
+
+def _dashboard_symbol_codes() -> set[str]:
+    """Return canonical instruments plus their MT5 broker aliases for matching."""
+    codes = set(_dashboard_symbol_allowlist())
+    aliases = _symbol_aliases()
+    codes.update(
+        str(aliases.get(symbol) or "").strip().upper()
+        for symbol in list(codes)
+        if str(aliases.get(symbol) or "").strip()
+    )
+    return codes
+
+
+def _dashboard_symbol_allowed(symbol: str) -> bool:
+    return str(symbol or "").strip().upper() in _dashboard_symbol_codes()
+
+
+def _filter_market_feed_payload(payload: dict) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+    allowed = _dashboard_symbol_codes()
+    ticks = [
+        dict(row)
+        for row in (payload.get("ticks") or [])
+        if isinstance(row, dict)
+        and str(row.get("symbol") or "").strip().upper() in allowed
+    ]
+    filtered = dict(payload)
+    filtered["ticks"] = ticks
+    filtered["tracked_symbols"] = min(
+        int(payload.get("tracked_symbols") or len(ticks) or 0),
+        len(allowed),
+    )
+    filtered["fresh_symbols"] = sum(1 for row in ticks if str(row.get("status") or "").upper() == "LIVE_DATA")
+    filtered["stale_symbols"] = [
+        str(row.get("symbol") or "").upper()
+        for row in ticks
+        if str(row.get("status") or "").upper() != "LIVE_DATA"
+    ]
+    return filtered
 
 
 def _resolve_symbol_code(symbol: str) -> str:
@@ -322,6 +696,97 @@ def _read_bridge_rates(symbol: str, timeframe: str, limit: int | None = None, ma
     # File mtime alone is not proof of fresh market data. Reject a file that
     # was touched recently but whose latest candle is still old.
     return rows if _bridge_rows_are_fresh(rows, max_age_seconds) else []
+
+
+def _read_bridge_rates_last_known(symbol: str, timeframe: str, limit: int | None = None) -> list[dict]:
+    """Read the bridge rate file with no freshness cutoff.
+
+    Used only as a fallback when the market is closed (weekend, holiday) and
+    the freshness-gated read in _read_bridge_rates() has nothing to return.
+    This must never be used while the market is open - _read_bridge_rates()
+    remains the only path for anything presented as a live candle.
+    """
+    resolved = _resolve_symbol_code(symbol)
+    for candidate in (
+        _bridge_dir() / f"rates_{resolved}_{timeframe.upper()}.csv",
+        _bridge_dir() / f"rates_{str(symbol or '').strip().upper()}_{timeframe.upper()}.csv",
+    ):
+        rows = _read_csv(candidate, limit)
+        if rows:
+            return rows
+    return []
+
+
+def _choppiness_index(rows: list[dict], period: int = 14) -> float | None:
+    """Choppiness Index over the last `period` bars.
+
+    Industry-standard regime gauge: high = ranging/choppy (price covering
+    little net ground relative to its total path), low = trending. Bounded
+    0-100. Thresholds 61.8 / 38.2 are the conventional Fibonacci bands.
+    """
+    if len(rows) < period + 1:
+        return None
+    recent = rows[-(period + 1):]
+    trs, highs, lows = [], [], []
+    for i in range(1, len(recent)):
+        try:
+            high = float(recent[i]["high"])
+            low = float(recent[i]["low"])
+            prev_close = float(recent[i - 1]["close"])
+        except (TypeError, ValueError, KeyError):
+            return None
+        trs.append(max(high - low, abs(high - prev_close), abs(low - prev_close)))
+        highs.append(high)
+        lows.append(low)
+    span = max(highs) - min(lows)
+    tr_sum = sum(trs)
+    if span <= 0 or tr_sum <= 0:
+        return None
+    return round(100.0 * math.log10(tr_sum / span) / math.log10(period), 1)
+
+
+def _regime_label(ci: float | None) -> str:
+    if ci is None:
+        return "UNKNOWN"
+    if ci >= 61.8:
+        return "CHOPPY"
+    if ci <= 38.2:
+        return "TRENDING"
+    return "TRANSITIONAL"
+
+
+def _market_regime() -> dict:
+    """Per-symbol and overall market regime from live M15 candles.
+
+    Read-only supervision signal so the dashboard can explain WHY the bot is
+    selective: in a choppy/ranging market few setups clear the entry guard,
+    which is intended, not a fault.
+    """
+    counts = {"CHOPPY": 0, "TRENDING": 0, "TRANSITIONAL": 0, "UNKNOWN": 0}
+    per_symbol = []
+    for sym in sorted(_dashboard_symbol_allowlist()):
+        rows = _read_bridge_rates(sym, "M15", 40, max_age_seconds=_live_candle_age_limit("M15"))
+        if not rows:
+            rows = _read_bridge_rates_last_known(sym, "M15", 40)
+        ci = _choppiness_index(rows) if rows else None
+        label = _regime_label(ci)
+        counts[label] += 1
+        per_symbol.append({"symbol": sym, "choppiness": ci, "label": label})
+    known = counts["CHOPPY"] + counts["TRENDING"] + counts["TRANSITIONAL"]
+    if known == 0:
+        overall = "UNKNOWN"
+    elif counts["CHOPPY"] >= max(counts["TRENDING"], counts["TRANSITIONAL"]):
+        overall = "CHOPPY"
+    elif counts["TRENDING"] >= counts["TRANSITIONAL"]:
+        overall = "TRENDING"
+    else:
+        overall = "TRANSITIONAL"
+    return {
+        "overall": overall,
+        "counts": counts,
+        "symbols": per_symbol,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def _aggregate_rate_rows(rows: list[dict], timeframe: str, limit: int) -> list[dict]:
@@ -587,38 +1052,30 @@ def _timestamp_age_seconds(value, fallback_mtime=None):
 
 
 def _live_bridge_ticks(symbols: list[str] | None = None) -> list[dict]:
-    """Read quote files only and expose an explicit live/stale contract."""
+    """Return the live WebSocket tick snapshot, falling back to the last
+
+    known bridge tick file (bid/ask as of the last quote received) when the
+    WebSocket feed itself is down or the market is closed. Fallback rows are
+    always tagged fresh=False / status=STALE_MARKET_DATA so the frontend can
+    never mistake a last-known price for a live one.
+    """
+    live_rows = _active_websocket_ticks(symbols)
+    if live_rows:
+        return live_rows
     wanted = {str(item or "").strip().upper() for item in (symbols or []) if str(item or "").strip()}
-    wanted.update(_resolve_symbol_code(item).upper() for item in list(wanted))
-    rows = []
-    for path in sorted(_bridge_dir().glob("tick_*.txt")):
-        resolved = path.stem.replace("tick_", "").upper()
-        if wanted and resolved not in wanted:
+    fallback_rows = []
+    for row in _terminal_ticks(list(wanted) if wanted else None):
+        symbol = str(row.get("symbol") or "").upper()
+        if wanted and symbol not in wanted and _resolve_symbol_code(symbol) not in wanted:
             continue
-        raw = _read_kv(path)
-        bid = _optional_float(raw.get("bid"))
-        ask = _optional_float(raw.get("ask"))
-        last = _optional_float(raw.get("last"))
-        try:
-            mtime = path.stat().st_mtime
-        except OSError:
-            mtime = None
-        tick_time = raw.get("time") or raw.get("time_utc") or raw.get("timestamp") or None
-        age = _timestamp_age_seconds(tick_time, mtime)
-        fresh = age is not None and age <= 5.0
-        rows.append({
-            "symbol": resolved,
-            "bid": bid,
-            "ask": ask,
-            "last": last,
-            "spread": (ask - bid) if bid is not None and ask is not None else None,
-            "time": tick_time,
-            "age_seconds": round(age, 3) if age is not None else None,
-            "fresh": fresh,
-            "status": "LIVE_DATA" if fresh else "STALE_MARKET_DATA",
-            "source": "mt5_bridge_tick",
-        })
-    return rows
+        age = _timestamp_age_seconds(row.get("time"))
+        item = dict(row)
+        item["age_seconds"] = round(age, 3) if age is not None else None
+        item["fresh"] = False
+        item["status"] = "STALE_MARKET_DATA"
+        item["source"] = "mt5_bridge_last_known"
+        fallback_rows.append(item)
+    return fallback_rows
 
 
 def _live_candle_age_limit(timeframe: str) -> int:
@@ -776,16 +1233,25 @@ def _bridge_positions() -> list[dict]:
     for row in rows:
         if not row.get("ticket"):
             continue
+        symbol = row.get("symbol", "")
+        if not _dashboard_symbol_allowed(symbol):
+            continue
+        direction = row.get("direction", "")
+        volume = _finite(row.get("volume"), digits=2)
         out.append(db.enrich_position_dates({
             "ticket": row.get("ticket", ""),
-            "sym": row.get("symbol", ""),
-            "direction": row.get("direction", ""),
-            "qty": _finite(row.get("volume"), digits=2),
+            "sym": symbol,
+            "symbol": symbol,
+            "direction": direction,
+            "side": direction,
+            "qty": volume,
+            "volume": volume,
             "entry": _finite(row.get("price_open"), digits=8),
             "current": _finite(row.get("price_current"), digits=8),
             "sl": _finite(row.get("sl"), digits=8),
             "tp": _finite(row.get("tp"), digits=8),
             "unrealized": _finite(row.get("profit"), digits=2),
+            "profit": _finite(row.get("profit"), digits=2),
             "opened_at": row.get("time", ""),
             "venue": "XM Global MT5",
             "source": "mt5_terminal",
@@ -804,6 +1270,8 @@ def _orders() -> list[dict]:
     if bridge_rows:
         out = []
         for row in bridge_rows:
+            if not _dashboard_symbol_allowed(row.get("symbol", "")):
+                continue
             out.append({
                 "ticket": row.get("ticket", ""),
                 "symbol": row.get("symbol", ""),
@@ -893,7 +1361,13 @@ def _activity() -> dict:
     daily_pnl = _finite(db.read_status("daily_pnl") or db.read_todays_pnl() or 0.0)
     unrealized = _finite(sum(float(p.get("unrealized") or 0.0) for p in positions))
     market_value = _finite(sum(abs(float(p.get("current") or 0.0) * float(p.get("qty") or 0.0)) for p in positions))
-    available = _finite(max(equity - market_value, 0.0))
+    # MT5 free margin is authoritative. Equity minus notional market value is
+    # not broker free margin and can be materially wrong for leveraged CFDs.
+    available = _finite(account.get("free_margin") or 0.0)
+    margin_used = _finite(account.get("margin") or 0.0)
+    margin_level = _finite((equity / margin_used) * 100.0) if margin_used > 0 else 0.0
+    equity_zar = _finite(equity * float(fx["rate"])) if fx.get("rate") else 0.0
+    unrealized_pnl_zar = _finite(unrealized * float(fx["rate"])) if fx.get("rate") else None
     updated_at = datetime.now().isoformat()
     if positions:
         updated_at = max(str(p.get("updated_at") or updated_at) for p in positions)
@@ -916,11 +1390,16 @@ def _activity() -> dict:
             "realized_pnl": _finite(daily_pnl - unrealized),
             "market_value": market_value,
             "available_funds": available,
+            "free_margin": available,
+            "margin": margin_used,
+            "margin_level": margin_level,
             "equity_with_loan": equity,
             "total_cash": available,
             "cash_balances": ([{"currency": "USD", "cash": available}] if equity else []),
             "currency": account.get("currency") or "USD",
             "usd_zar_rate": fx["rate"],
+            "equity_zar": equity_zar,
+            "unrealized_pnl_zar": unrealized_pnl_zar,
         },
         "balances": ([{"currency": "USD", "cash": available}] if equity else []),
         "open_orders": orders,
@@ -967,7 +1446,105 @@ def login(req: LoginRequest):
         raise HTTPException(status_code=401, detail="Invalid credentials")
     token = app_store.create_session(user_row["id"])
     user_row, profile_row = app_store.get_user_by_id(user_row["id"])
-    return {"token": token, "user": app_store.serialize_user(user_row, profile_row)}
+    return {"token": token, "user": app_store.serialize_user(user_row, profile_row), "mode": "DEMO"}
+
+
+_LIVE_ENV_PATH = Path("/run/cipherfx/mt5-live.env")
+
+
+def _systemd_action(action: str, unit: str | None = None) -> None:
+    command = ["systemctl", action]
+    if unit:
+        command.append(unit)
+    result = subprocess.run(
+        command,
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    if result.returncode:
+        detail = (result.stderr or result.stdout or "systemd action failed").strip()
+        raise HTTPException(status_code=503, detail=f"{unit} {action} failed: {detail[-240:]}")
+
+
+def _write_live_runtime_env(account: str, account_password: str, server: str) -> None:
+    account = str(account or "").strip()
+    if not account.isdigit() or int(account) <= 0:
+        raise HTTPException(status_code=400, detail="A numeric live MT5 account is required")
+    if not str(account_password or "").strip():
+        raise HTTPException(status_code=400, detail="A live MT5 account password is required")
+    server = str(server or os.getenv("MT5_SERVER", "")).strip()
+    if not server:
+        raise HTTPException(status_code=400, detail="An MT5 server is required")
+    live_root = Path("/opt/cipherfx_mt5/state/live")
+    values = {
+        "MT5_LOGIN": account,
+        "MT5_PASSWORD": account_password,
+        "MT5_SERVER": server,
+        "MT5_TRADE_MODE": "live",
+        "MT5_DRY_RUN": "0",
+        "MT5_RUNTIME_ISOLATED": "1",
+        "MT5_TEMPLATE_PREFIX": "/root/.mt5",
+        "MT5_PREFIX": "/root/.mt5_live",
+        "MT5_TERMINAL_PATH": "/root/.mt5_live/drive_c/Program Files/MetaTrader 5/terminal64.exe",
+        "DISPLAY_NUM": ":100",
+        "MT5_WS_TICK_PORT": "8766",
+        "MT5_BRIDGE_DIR": "/root/.mt5_live/drive_c/Program Files/MetaTrader 5/MQL5/Files/cipherfx",
+        "CIPHERFX_CACHE_DIR": "/root/.cache/cipherfx-live",
+        "SCALPBOT_STATE_DB": str(live_root / "mt5_state.db"),
+        "MT5_STATE_FILE": str(live_root / "mt5_runtime_state.json"),
+        "MT5_HEARTBEAT_FILE": str(live_root / "mt5_heartbeat.json"),
+        "CIPHERFX_BROKER_BACKEND": "mt5",
+        "CIPHERFX_BROKER_NAME": "XM Global MT5 Live",
+        "CIPHERFX_PLATFORM_NAME": "MetaTrader 5",
+        "CIPHERFX_ACCOUNT_LABEL": "XM Global MT5 Live",
+        "MT5_CAPITAL_CAP_USD": "0",
+        "MT5_RISK_PCT": "0.25",
+        "MT5_RISK_PCT_FOREX": "0.25",
+        "MT5_RISK_PCT_INDICES": "0.25",
+        "MT5_RISK_PCT_METALS": "0.25",
+        "MT5_MAX_TRADE_RISK_USD": "25",
+        "MT5_MAX_TRADE_RISK_FOREX_USD": "25",
+        "MT5_MAX_TRADE_RISK_INDICES_USD": "25",
+        "MT5_MAX_TRADE_RISK_METALS_USD": "25",
+        "MT5_MAX_DAILY_LOSS_USD": "5000",
+        "MT5_MAX_TRADES_PER_DAY": "200",
+        "MT5_MAX_DAILY_TRADES": "200",
+        "MT5_MAX_OPEN_TRADES_TOTAL": "30",
+        "MT5_MAX_OPEN_TRADES": "30",
+        "MT5_MAX_DAILY_TRADES_PER_SYMBOL": "60",
+        "MT5_MAX_PYRAMID_TRADES": "2",
+        "MT5_MAX_MARGIN_FRACTION": "0.20",
+    }
+    _LIVE_ENV_PATH.parent.mkdir(parents=True, exist_ok=True)
+    text = "\n".join(f"{key}={shlex.quote(str(value))}" for key, value in values.items()) + "\n"
+    temporary = Path(str(_LIVE_ENV_PATH) + ".tmp")
+    temporary.write_text(text)
+    os.chmod(temporary, 0o600)
+    temporary.replace(_LIVE_ENV_PATH)
+    live_root.mkdir(parents=True, exist_ok=True)
+    os.chmod(live_root, 0o700)
+
+
+@app.post("/api/live-login")
+def live_login(req: LiveLoginRequest):
+    app_store.ensure_configured_dashboard_user()
+    user_row = app_store.authenticate_user(req.email, req.password)
+    if user_row is None:
+        raise HTTPException(status_code=401, detail="Invalid dashboard credentials")
+    _write_live_runtime_env(req.account, req.account_password, req.server)
+    _systemd_action("daemon-reload")
+    _systemd_action("restart", "scalpbot-dashboard-mt5-live.service")
+    _systemd_action("restart", "scalpbot-mt5-live.service")
+    token = app_store.create_session(user_row["id"])
+    user_row, profile_row = app_store.get_user_by_id(user_row["id"])
+    return {
+        "token": token,
+        "user": app_store.serialize_user(user_row, profile_row),
+        "mode": "LIVE",
+        "runtime": "STARTING",
+    }
 
 
 @app.post("/api/login_web", response_class=HTMLResponse)
@@ -1243,8 +1820,33 @@ def health():
 def status():
     activity = _activity()
     fx = _usd_zar_rate()
-    campaigns = _campaign_snapshot()
-    active_campaigns = [row for row in campaigns if row.get("status") == "active"]
+    service, service_updated = _platform_status_payload("service")
+    runtime, runtime_updated = _platform_status_payload("runtime")
+    market_feed, market_feed_updated = _platform_status_payload("market_feed")
+    scans = _platform_scan_rows()
+    latest_scan = max((str(row.get("updated_at") or "") for row in scans), default="")
+    heartbeat_path = Path(os.getenv("MT5_HEARTBEAT_FILE", "/opt/cipherfx_mt5/state/mt5_heartbeat.json"))
+    heartbeat = {}
+    try:
+        heartbeat = json.loads(heartbeat_path.read_text())
+    except Exception:
+        heartbeat = {}
+    last_heartbeat = str(heartbeat.get("updated_at") or runtime.get("last_cycle") or service_updated or "")
+    try:
+        max_daily_trades = int(service.get("max_daily_trades") or os.getenv("MT5_MAX_DAILY_TRADES", "200") or 200)
+    except (TypeError, ValueError):
+        max_daily_trades = 100
+    try:
+        max_open_trades = int(service.get("max_open_trades") or os.getenv("MT5_MAX_OPEN_TRADES", "30") or 30)
+    except (TypeError, ValueError):
+        max_open_trades = 30
+    try:
+        daily_loss_cap_usd = float(service.get("daily_loss_cap_usd") or os.getenv("MT5_MAX_DAILY_LOSS_USD", "5000") or 5000)
+    except (TypeError, ValueError):
+        daily_loss_cap_usd = 5000.0
+    fresh_symbols = int(market_feed.get("fresh_symbols") or 0)
+    tracked_symbols = int(market_feed.get("tracked_symbols") or 0)
+    stale_symbols = market_feed.get("stale_symbols") if isinstance(market_feed.get("stale_symbols"), list) else []
     return {
         "broker_backend": "mt5",
         "broker_name": activity["broker_name"],
@@ -1252,36 +1854,49 @@ def status():
         "account_id": activity["overview"]["account_id"],
         "server": activity["overview"].get("server", ""),
         "balance": activity["overview"].get("balance", 0.0),
-        "equity": activity["overview"]["net_liquidation"],
+        "equity": activity["overview"].get("net_liquidation", 0.0),
         "daily_pnl": activity["overview"]["daily_pnl"],
         "currency": activity["overview"].get("currency", "USD"),
         "usd_zar_rate": fx["rate"],
         "usd_zar_source": fx["source"],
         "usd_zar_updated_at": fx["updated_at"],
-        "mode": db.read_status("mode") or "DEMO",
-        "mt5_connected": activity["connected"],
+        "mode": str(os.getenv("MT5_TRADE_MODE") or service.get("mode") or db.read_status("mode") or "demo").upper(),
+        "mt5_connected": str(service.get("state") or "").upper() == "CONNECTED",
+        "market_data_source": market_feed.get("source") or service.get("market_data_source") or "websocket",
         "mt5_trade_allowed": db.read_status("mt5_trade_allowed"),
         "dry_run": os.getenv("MT5_DRY_RUN", "0") in {"1", "true", "True", "yes", "on"},
-        "poll_seconds": db.read_status("poll_seconds") or os.getenv("MT5_POLL_SECONDS", "1"),
+        "poll_seconds": os.getenv("MT5_POLL_SECONDS", "0.2"),
         "max_pyramid_levels": int(float(os.getenv("MT5_PYRAMID_MAX_LEVELS", "10") or 10)),
         "allow_pyramiding": os.getenv("MT5_ALLOW_PYRAMIDING", "1") in {"1", "true", "True", "yes", "on"},
-        "campaign_monitor_seconds": db.read_status("campaign_monitor_seconds") or os.getenv("MT5_CAMPAIGN_MONITOR_SECONDS", "0.50"),
-        "active_campaign_count": len(active_campaigns),
-        "campaigns": campaigns[:30],
-        "scan_seconds": db.read_status("scan_seconds") or os.getenv("MT5_SCAN_SECONDS", "890"),
-        "max_open_trades": db.read_status("max_open_trades") or os.getenv("MT5_MAX_OPEN_TRADES", "30"),
-        "max_daily_trades": db.read_status("max_daily_trades") or os.getenv("MT5_MAX_DAILY_TRADES", "30"),
-        "daily_trade_count": db.read_status("daily_trade_count"),
-        "next_scan_due": db.read_status("next_scan_due"),
-        "last_scan": db.read_status("last_scan"),
-        "last_heartbeat": db.read_status("last_heartbeat"),
+        "active_campaign_count": 0,
+        "campaigns": [],
+        "scan_seconds": os.getenv("MT5_SCAN_SECONDS", "0.2"),
+        "max_open_trades": max_open_trades,
+        "max_daily_trades": max_daily_trades,
+        "daily_loss_cap_usd": daily_loss_cap_usd,
+        "daily_trade_count": runtime.get("filled", 0),
+        "fresh_symbols": fresh_symbols,
+        "tracked_symbols": tracked_symbols,
+        "stale_symbols": stale_symbols,
+        "heartbeat_age_seconds": heartbeat.get("age_seconds"),
+        "next_scan_due": "",
+        "last_scan": latest_scan,
+        "last_heartbeat": last_heartbeat,
         "live_unrealized_pnl": activity["unrealized_pnl"],
         "live_position_count": activity["position_count"],
         "effective_position_count": activity["position_count"],
         "halt": db.read_status("halt"),
-        "paused": False,
+        "market_feed": {
+            "source": market_feed.get("source", "websocket"),
+            "fresh_symbols": market_feed.get("fresh_symbols", 0),
+            "tracked_symbols": market_feed.get("tracked_symbols", 0),
+            "stale_symbols": market_feed.get("stale_symbols", []),
+            "max_tick_age_seconds": market_feed.get("max_tick_age_seconds"),
+            "updated_at": market_feed_updated,
+            "weekend_closed": _market_hours_snapshot().get("weekend_closed", False),
+        },
+        "updated_at": runtime_updated or service_updated or datetime.now(timezone.utc).isoformat(),
     }
-
 
 
 @app.get("/api/visual/status", dependencies=[Depends(_session_user)])
@@ -1309,7 +1924,7 @@ def intelligence_summary():
     health = _intelligence_sql("SELECT status, COUNT(*) AS count FROM market_data_health GROUP BY status ORDER BY count DESC")
     table_counts = {}
     for table in _INTELLIGENCE_TABLES:
-        table_counts[table] = _intelligence_sql("SELECT COUNT(*) AS count FROM " + table)[0]["count"]
+        table_counts[table] = _intelligence_count(table)
     runtime_raw = db.read_status("intelligence_runtime_audit")
     try:
         runtime_audit = json.loads(runtime_raw or "{}")
@@ -1346,7 +1961,7 @@ def intelligence_overview():
 
     def count(table):
         try:
-            return int(_intelligence_sql("SELECT COUNT(*) AS count FROM " + table)[0]["count"])
+            return _intelligence_count(table)
         except Exception:
             return 0
 
@@ -1390,6 +2005,24 @@ def intelligence_overview():
             "required_conditions": conditions[:5],
             "latest_candle_ids": latest_ids,
             "contradictions": data.get("contradictions") or [],
+            "reason": row.get("reason") or data.get("reason") or "",
+            "target_market_date": data.get("target_market_date") or "",
+            "target_market_day": data.get("target_market_day") or "",
+            "target_window_sast": data.get("target_window_sast") or "",
+            "planned_at": data.get("planned_at") or created(row),
+            "source_snapshot_at": data.get("source_snapshot_at") or "",
+            "source_snapshot_age_hours": data.get("source_snapshot_age_hours"),
+            "timeframes": data.get("timeframes") if isinstance(data.get("timeframes"), list) else [],
+            "execution_status": data.get("execution_status") or "",
+            "execution_authority": data.get("execution_authority") or "",
+            "is_trade_proposal": bool(data.get("is_trade_proposal", False)),
+            "direction": data.get("direction") or "",
+            "score": data.get("score"),
+            "entry": data.get("entry"),
+            "stop": data.get("stop"),
+            "target": data.get("target"),
+            "probability": data.get("probability"),
+            "score_breakdown": data.get("score_breakdown") if isinstance(data.get("score_breakdown"), dict) else {},
         }
 
     plan_rows = rows("premarket_plans", 120)
@@ -1474,14 +2107,71 @@ def intelligence_overview():
     }
 
     applied_adjustments = sum(1 for item in adjustment_views if item["applied"])
+    # Report the same rolling outcome calculation used by the active engines.
+    active_learning = []
+    for engine, base_threshold, adjustment_cap in (
+        ("FOREX", 58.0, 8.0),
+        ("INDICES", 56.0, 7.0),
+        ("METALS", 57.0, 7.0),
+    ):
+        outcome_rows = _intelligence_sql(
+            "SELECT result_r, pnl, closed_at, trade_id FROM engine_performance "
+            "WHERE engine=? "
+            "ORDER BY datetime(replace(closed_at, 'T', ' ')) DESC LIMIT 50",
+            (engine,),
+        )
+        result_rs = [float(row.get("result_r") or 0.0) for row in outcome_rows]
+        wins = sum(1 for value in result_rs if value > 0)
+        losses = sum(1 for value in result_rs if value < 0)
+        decided = wins + losses
+        average_r = sum(result_rs) / len(result_rs) if result_rs else 0.0
+        adjustment = max(-adjustment_cap, min(adjustment_cap, average_r * 2.0))
+        active_learning.append({
+            "engine": engine,
+            "outcomes_received": len(result_rs),
+            "wins": wins,
+            "losses": losses,
+            "breakeven": len(result_rs) - decided,
+            "win_rate": round(wins / decided * 100.0, 1) if decided else 0.0,
+            "average_result_r": round(average_r, 4),
+            "threshold_base": base_threshold,
+            "threshold_adjustment": round(adjustment, 4),
+            "threshold_current": round(base_threshold - adjustment, 4),
+            "feedback_expired": sum(1 for row in outcome_rows if str(row.get("trade_id") or "").startswith("expired:")),
+            "last_outcome_at": outcome_rows[0].get("closed_at", "") if outcome_rows else "",
+        })
+    active_learning_total = sum(item["outcomes_received"] for item in active_learning)
+    try:
+        symbol_results = db.read_deals_period("today", limit=500).get("summary", {}).get("by_symbol", [])
+    except Exception:
+        symbol_results = []
     last_plan_at = latest_plans[0]["created_at"] if latest_plans else ""
     data_connected = _connected()
-    last_scan = db.read_status("last_scan")
-    last_heartbeat = db.read_status("last_heartbeat")
+    runtime_status, runtime_updated = _platform_status_payload("runtime")
+    service_status, service_updated = _platform_status_payload("service")
+    live_scan_rows = _platform_scan_rows()
+    live_scan_at = max(
+        (str(row.get("updated_at") or "") for row in live_scan_rows),
+        default="",
+    )
+    last_scan = (
+        live_scan_at
+        or str(runtime_status.get("last_cycle") or "")
+        or db.read_status("last_scan")
+    )
+    last_heartbeat = (
+        str(runtime_status.get("last_cycle") or "")
+        or str(service_updated or "")
+        or db.read_status("last_heartbeat")
+    )
     return {
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "source": "mt5_state.db",
         "mode": "Shadow",
+        # Keep the live timestamps available at the response boundary as well
+        # as inside data_status for clients that do not unpack nested status.
+        "last_scan": last_scan,
+        "last_heartbeat": last_heartbeat,
         "data_status": {
             "mt5_connected": data_connected,
             "last_scan": last_scan,
@@ -1492,7 +2182,7 @@ def intelligence_overview():
         },
         "planning": {
             "status": "READY" if latest_plans else "NO_PLANS",
-            "plan_count": count("premarket_plans"),
+            "plan_count": len(latest_plans),
             "latest_by_symbol": latest_plans,
             "latest_plan_at": last_plan_at,
             "story": (
@@ -1502,8 +2192,11 @@ def intelligence_overview():
                 "No persisted plans are available from the MT5 state database."
             ),
         },
+        "symbol_results": symbol_results,
         "learning": {
-            "mode": "SHADOW_ONLY",
+            "mode": "LIVE_ADAPTIVE",
+            "outcomes_received": active_learning_total,
+            "engines": active_learning,
             "adjustments_count": count("score_adjustments"),
             "applied_count": applied_adjustments,
             "latest_adjustments": adjustment_views[:12],
@@ -1512,8 +2205,8 @@ def intelligence_overview():
             "attribution_bucket_count": count("trade_attribution"),
             "false_entry_review_count": count("false_entries"),
             "story": (
-                "Learning is diagnostic only. It records score adjustments and replay evidence; "
-                "it does not change live permission."
+                "Closed broker outcomes and expired proposals are recorded by their originating engine. "
+                "Each engine uses its latest 50 feedback records to adjust its own live threshold; no proposal is changed retroactively."
             ),
         },
         "validation": {
@@ -1530,6 +2223,9 @@ def intelligence_overview():
                 "The page does not treat a plan or shadow adjustment as a fill."
             ),
         },
+        "live_scans": _platform_scan_rows(),
+        "live_market_feed": _platform_status_payload("market_feed")[0],
+        "live_runtime": _platform_status_payload("runtime")[0],
     }
 
 @app.get("/api/intelligence/decisions", dependencies=[Depends(_session_user)])
@@ -1584,14 +2280,127 @@ def symbols():
     return _symbols()
 
 
+def _portfolio_proposal_states() -> dict[str, int]:
+    try:
+        allowed = sorted(_dashboard_symbol_codes())
+        placeholders = ",".join("?" for _ in allowed)
+        rows = _intelligence_sql(
+            "SELECT UPPER(COALESCE(state, '')) AS state, COUNT(*) AS count "
+            "FROM trade_proposals WHERE UPPER(COALESCE(symbol, '')) IN (" +
+            placeholders + ") GROUP BY UPPER(COALESCE(state, ''))",
+            allowed,
+        )
+    except Exception:
+        return {}
+    return {
+        str(row.get("state") or "UNKNOWN"): int(row.get("count") or 0)
+        for row in rows
+    }
+
+
+@app.get("/api/portfolio/overview", dependencies=[Depends(_session_user)])
+def portfolio_overview():
+    # Read-only supervision endpoint, outside all trade and order paths.
+    symbols = _symbols()
+    ticks = _live_bridge_ticks([str(row.get("symbol") or "") for row in symbols])
+    live_count = sum(row.get("status") == "LIVE_DATA" for row in ticks)
+    stale_count = sum(row.get("status") == "STALE_MARKET_DATA" for row in ticks)
+    generated_at = datetime.now(timezone.utc).isoformat()
+    operational = {
+        "mt5_connected": _connected(),
+        "feed_status": "LIVE_DATA" if live_count and not stale_count else "PARTIAL_DATA" if live_count else "STALE_MARKET_DATA",
+        "live_tick_count": live_count,
+        "stale_tick_count": stale_count,
+        "monitored_symbol_count": len(symbols),
+        "generated_at": generated_at,
+    }
+    return build_portfolio_snapshot(
+        account=_terminal_account(),
+        positions=_positions(),
+        orders=_orders(),
+        proposal_states=_portfolio_proposal_states(),
+        closed_summaries={
+            period: db.read_deals_period(period=period, limit=50).get("summary")
+            for period in ("today", "week", "month")
+        },
+        operational=operational,
+        generated_at=generated_at,
+    )
+
+
+def _active_platform_trades(limit: int = 100, include_history: bool = False) -> list[dict]:
+    count = max(1, min(int(limit or 100), 500))
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        clauses = []
+        params = []
+        allowed = sorted(_dashboard_symbol_codes())
+        placeholders = ",".join("?" for _ in allowed)
+        clauses.append("UPPER(COALESCE(p.symbol, '')) IN (" + placeholders + ")")
+        params.extend(allowed)
+        if not include_history:
+            cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+            clauses.append("(p.closed_at IS NULL OR p.created_at >= ?)")
+            params.append(cutoff)
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        rows = conn.execute(
+            "SELECT p.proposal_id, p.symbol, p.side, p.status, p.volume, p.pnl, "
+            "p.initial_risk, p.created_at, p.closed_at "
+            "FROM platform_executions AS p" + where +
+            " ORDER BY COALESCE(p.closed_at, p.created_at) DESC LIMIT ?",
+            params + [count],
+        ).fetchall()
+    finally:
+        conn.close()
+    result = []
+    for row in rows:
+        item = dict(row)
+        status = str(item.get("status") or "").upper()
+        # A proposal blocked before broker submission is not an MT5 trade or
+        # order. Keep its exact reason in scan/audit data, but never present it
+        # as an unfilled trade in the trade list.
+        if status in {"EXECUTION_BLOCKED", "DUPLICATE_SUPPRESSED"}:
+            continue
+        closed = bool(item.get("closed_at"))
+        public_status = "CLOSED" if closed else ("OPEN" if status in {"FILLED", "DRY_RUN"} else status)
+        item.update({
+            "trade_id": item.get("proposal_id") or "",
+            "proposal_id": item.get("proposal_id") or "",
+            "sym": item.get("symbol") or "",
+            "symbol": item.get("symbol") or "",
+            "direction": item.get("side") or "",
+            "side": item.get("side") or "",
+            "qty": item.get("volume") or 0,
+            "realized": item.get("pnl") or 0,
+            "pnl": item.get("pnl") or 0,
+            "profit": item.get("pnl") or 0,
+            "outcome": public_status,
+            "status": public_status,
+            "opened_at": item.get("created_at") or "",
+            "closed_at": item.get("closed_at") or "",
+        })
+        result.append(item)
+    return result
+
+
+@app.get("/api/intelligence/watch", dependencies=[Depends(_session_user)])
+def intelligence_watch():
+    path = Path("/opt/cipherfx_mt5/state/intelligence_reports/latest.json")
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {"generated_at": None, "overall": "UNKNOWN", "finding_count": 0, "findings": []}
+
+
 @app.get("/api/signals", dependencies=[Depends(_session_user)])
 def signals():
-    return db.read_signals()
+    return _active_platform_scanner().get("current_signals", [])
 
 
 @app.get("/api/scanner", dependencies=[Depends(_session_user)])
 def scanner():
-    return db.read_signal_scanner()
+    return _active_platform_scanner()
 
 
 @app.get("/api/news", dependencies=[Depends(_session_user)])
@@ -1609,12 +2418,22 @@ def news(sym: str = "EURUSD", limit: int = 8):
 
 @app.get("/api/trades", dependencies=[Depends(_session_user)])
 def trades(limit: int = 100, include_history: bool = False):
-    return db.read_trades(limit=limit, today_only=not include_history)
+    return _active_platform_trades(limit=limit, include_history=include_history)
 
 
 @app.get("/api/deals", dependencies=[Depends(_session_user)])
 def deals(period: str = "today", limit: int = 200):
-    return db.read_deals_period(period=period, limit=limit)
+    payload = db.read_deals_period(period=period, limit=limit)
+    # Closed MT5 history is live state. Prevent an intermediary or browser
+    # cache from displaying an earlier period after a broker reconciliation.
+    return JSONResponse(
+        content=payload,
+        headers={
+            "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+            "Pragma": "no-cache",
+            "Expires": "0",
+        },
+    )
 
 
 @app.get("/api/stats", dependencies=[Depends(_session_user)])
@@ -1641,6 +2460,11 @@ def replay(sym: str = "EURUSD", limit: int = 500, timeframe: str = "M5"):
     }
 
 
+@app.get("/api/market/regime", dependencies=[Depends(_session_user)])
+def market_regime():
+    return JSONResponse(_market_regime(), headers={"Cache-Control": "no-store, max-age=0"})
+
+
 @app.get("/api/live/market", dependencies=[Depends(_session_user)])
 def live_market(sym: str = "", symbols: str = ""):
     requested = [item for item in (symbols.split(",") if symbols else ([sym] if sym else [])) if item]
@@ -1654,11 +2478,11 @@ def live_market(sym: str = "", symbols: str = ""):
     selected_rows = _overlay_live_tick(selected_rows, selected)
     return JSONResponse(
         {
-            "source": "mt5_bridge_live",
+            "source": "websocket_live",
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "ticks": _live_bridge_ticks(requested),
             "selected_symbol": selected,
-            "selected_candle": _candle_payload(selected_rows[-1], "mt5_bridge_live") if selected_rows else None,
+            "selected_candle": _candle_payload(selected_rows[-1], "mt5_history_websocket_tick") if selected_rows else None,
             "selected_candle_fresh": bool(selected_rows),
         },
         headers={"Cache-Control": "no-store, max-age=0"},
@@ -1684,16 +2508,45 @@ def candles(sym: str = "EURUSD", limit: int = 120, timeframe: str = "M15"):
         )
         bridge_rows = _aggregate_rate_rows(m15_rows, tf, count) if m15_rows else []
     bridge_rows = _overlay_live_tick(bridge_rows, code)
-    payload = [_candle_payload(row, "mt5_bridge_live") for row in bridge_rows]
+
+    market_closed = False
+    if not bridge_rows:
+        # Nothing passed the freshness gate - either the bridge has never
+        # produced this timeframe, or the market is closed (weekend/holiday)
+        # and the last real candle is simply older than the live cutoff.
+        # Fall back to the last known bars so the chart still renders
+        # something real instead of going blank, but tag it clearly so the
+        # frontend never presents it as a live/ticking candle.
+        last_known = _read_bridge_rates_last_known(code, tf, count)
+        if not last_known and tf != "M15":
+            m15_last_known = _read_bridge_rates_last_known(code, "M15", 500)
+            last_known = _aggregate_rate_rows(m15_last_known, tf, count) if m15_last_known else []
+        if last_known:
+            bridge_rows = last_known
+            market_closed = True
+
+    payload = [_candle_payload(row, "mt5_history_websocket_tick") for row in bridge_rows]
+    if market_closed:
+        for row in payload:
+            row["fresh"] = False
+            row["status"] = "MARKET_CLOSED"
     last = payload[-1] if payload else {}
+    if market_closed:
+        source_header = "mt5_history_market_closed"
+    elif payload:
+        source_header = "mt5_history_websocket_tick"
+    else:
+        source_header = "websocket_unavailable"
     return JSONResponse(
         payload,
         headers={
             "Cache-Control": "no-store, max-age=0",
-            "X-CipherFX-Source": "mt5_bridge_live" if payload else "mt5_bridge_unavailable",
+            "X-CipherFX-Source": source_header,
             "X-CipherFX-Candle-Age-Seconds": str(last.get("bar_age_seconds", "")),
             "X-CipherFX-Quote-Age-Seconds": str(last.get("quote_age_seconds", "")),
             "X-CipherFX-Fallback": "disabled",
+            "X-CipherFX-Live-Tick-Source": "websocket",
+            "X-CipherFX-Market-Closed": "true" if market_closed else "false",
         },
     )
 

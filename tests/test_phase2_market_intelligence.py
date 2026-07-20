@@ -70,7 +70,7 @@ class Phase2MarketIntelligenceTests(unittest.TestCase):
         self.assertNotEqual(ForexLearningEngine.THRESHOLD, IndicesLearningEngine.THRESHOLD)
         self.assertNotEqual(IndicesLearningEngine.THRESHOLD, MetalsLearningEngine.THRESHOLD)
         for engine in (ForexLearningEngine, IndicesLearningEngine, MetalsLearningEngine):
-            self.assertEqual(set(engine.TIME_WEIGHTS), {"MN1", "W1", "D1", "H4", "H1", "M30", "M15", "M5", "M3", "M1"})
+            self.assertEqual(set(engine.TIME_WEIGHTS), {"H4", "H1", "M15", "M5", "M1"})
 
     def test_no_shared_scoring_class_is_active(self):
         from cipherfx_platform import runtime
@@ -98,6 +98,39 @@ class Phase2MarketIntelligenceTests(unittest.TestCase):
                 self.assertTrue(proposal.probability > 0)
                 self.assertTrue(proposal.proposal_id)
                 self.assertIsInstance(proposal.reasoning, tuple)
+
+    def test_each_engine_replay_is_deterministic_and_bounded(self):
+        cases = (
+            ("forex", "EURUSD", ForexLearningEngine),
+            ("index", "US100Cash", IndicesLearningEngine),
+            ("metal", "GOLD", MetalsLearningEngine),
+        )
+        for asset_class, symbol, engine_class in cases:
+            with self.subTest(asset_class=asset_class):
+                snapshot = MarketDataEngine(
+                    SnapshotGateway(), history_bars=220
+                ).snapshot(symbol, asset_class)
+                with tempfile.TemporaryDirectory() as tmp:
+                    first_engine = engine_class(DatabaseLayer(Path(tmp) / "first.db"))
+                    second_engine = engine_class(DatabaseLayer(Path(tmp) / "second.db"))
+                    first = first_engine.propose(snapshot)
+                    second = second_engine.propose(snapshot)
+                    first_report = first_engine.last_report
+                    second_report = second_engine.last_report
+                    self.assertEqual(first_report["scores"], second_report["scores"])
+                    self.assertEqual(first_report["feature_scores"], second_report["feature_scores"])
+                    self.assertEqual(first_report["score"], second_report["score"])
+                    self.assertEqual(first_report["threshold"], second_report["threshold"])
+                    for side_scores in first_report["scores"].values():
+                        self.assertTrue(all(0.0 <= value <= 100.0 for value in side_scores.values()))
+                    self.assertEqual(bool(first), bool(second))
+                    if first and second:
+                        self.assertEqual(first.side, second.side)
+                        self.assertEqual(first.score, second.score)
+                        self.assertEqual(first.stop_loss, second.stop_loss)
+                        self.assertEqual(first.take_profit, second.take_profit)
+                        self.assertIn("timeframes", first.score_components)
+                        self.assertEqual(set(first.score_components["timeframes"]), set(engine_class.TIME_WEIGHTS))
 
     def test_proposal_contract_is_immutable_and_has_required_fields(self):
         now = datetime.now(timezone.utc)
