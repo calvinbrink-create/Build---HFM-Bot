@@ -4,6 +4,11 @@
 /__pycache__/
 **/node_modules/
 *.db
+*.db-*
+*.npz
+config/market_memory.json
+config/pattern_memory*.json
+config/pattern_memory*.npz
 **/__pycache__/
 *.py[cod]
 *.log

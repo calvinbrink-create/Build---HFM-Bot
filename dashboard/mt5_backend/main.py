@@ -3172,13 +3172,6 @@ def _jarvis_tool_get_symbol_universe(_input: dict) -> dict:
         return {"error": str(exc)}
 
 
-def _jarvis_tool_get_symbol_time_filters(_input: dict) -> dict:
-    try:
-        return json.loads(Path("/opt/cipherfx_mt5/config/symbol_time_filters.json").read_text())
-    except Exception as exc:
-        return {"error": str(exc)}
-
-
 def _jarvis_tool_save_note(input: dict) -> dict:
     text = str(input.get("text", "")).strip()
     if not text:
@@ -3257,11 +3250,6 @@ JARVIS_TOOLS = [
         "input_schema": {"type": "object", "properties": {}},
     },
     {
-        "name": "get_symbol_time_filters",
-        "description": "Get the per-symbol UTC hour/weekday entry blocks currently deployed (from the deep-history backtest) - which symbols are blocked from entering at which hours/weekdays and why.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
         "name": "get_config_value",
         "description": "Read one specific live config value by its exact env var name, e.g. MT5_MAX_DAILY_LOSS_USD. Credentials (password/key/secret/token) are always refused.",
         "input_schema": {
@@ -3297,7 +3285,6 @@ _JARVIS_TOOL_DISPATCH = {
     "get_daily_audit": _jarvis_tool_get_daily_audit,
     "get_intelligence_watch": _jarvis_tool_intelligence_watch,
     "get_symbol_universe": _jarvis_tool_get_symbol_universe,
-    "get_symbol_time_filters": _jarvis_tool_get_symbol_time_filters,
     "get_config_value": _jarvis_tool_get_config_value,
     "save_note": _jarvis_tool_save_note,
 }

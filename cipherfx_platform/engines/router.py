@@ -7,6 +7,24 @@ from ..database import DatabaseLayer
 from ..strategy_dispatch import build_setup
 ENGINE_BY_ASSET = {"forex": "FOREX_ENGINE", "index": "INDICES_ENGINE", "metal": "METALS_ENGINE"}
 
+
+def _canonical_engine(value: str | None) -> str:
+    """Map runtime engine labels to stable learning ledger names."""
+    label = str(value or "").strip().upper()
+    aliases = {
+        "FOREX": "FOREX",
+        "FOREX_ENGINE": "FOREX",
+        "INDICES": "INDICES",
+        "INDEX": "INDICES",
+        "INDEX_ENGINE": "INDICES",
+        "INDICES_ENGINE": "INDICES",
+        "METALS": "METALS",
+        "METAL": "METALS",
+        "METAL_ENGINE": "METALS",
+        "METALS_ENGINE": "METALS",
+    }
+    return aliases.get(label, label or "UNKNOWN")
+
 def _setup_fingerprint(snapshot: MarketSnapshot, setup: dict) -> str:
     """Identify the active chart setup without using score or a new gate."""
     frames = setup.get("frames") or {}
@@ -46,7 +64,7 @@ class LearningEngine:
             from ..pattern_memory import PatternMemory
             observed = PatternMemory.load().observe(values.get("memory_shape"), values.get("side", ""), result_r)
         except Exception: pass
-        engine = str(values.get("engine") or ENGINE_BY_ASSET.get(asset_class, "UNKNOWN_ENGINE")).upper()
+        engine = _canonical_engine(values.get("engine") or asset_class)
         if self.database:
             self.database.record_engine_outcome(engine, trade_id, symbol, result_r, pnl, metrics={**values, "memory_observed": observed})
             self.database.event("LEARNING_OUTCOME_APPLIED", {"trade_id": trade_id, "symbol": symbol, "engine": engine, "result_r": result_r, "memory_observed": observed, "model_version": values.get("model_version")}, symbol=symbol)

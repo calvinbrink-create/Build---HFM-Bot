@@ -149,20 +149,39 @@ class ModularTradingRuntime:
     @staticmethod
     def _decision_payload(report: dict, proposal=None) -> dict:
         setup = dict(report.get("setup") or {})
+        frames = dict(setup.get("frames") or {})
+        h4 = dict(frames.get("H4") or {})
+        m15 = dict(frames.get("M15") or {})
+        m5 = dict(frames.get("M5") or {})
+        chart = dict(setup.get("chart_setup") or {})
+        setup_direction = str(
+            setup.get("setup_direction")
+            or frames.get("setup_direction")
+            or h4.get("direction")
+            or chart.get("side")
+            or "NO_TRADE"
+        )
+        side = str(setup.get("side") or chart.get("side") or "NO_TRADE")
         return {
             "engine": report.get("engine", "SETUP_ENGINE"),
             "decision": report.get("decision", "NO_SETUP"),
             "symbol": report.get("symbol", ""),
             "asset_class": report.get("asset_class", ""),
-            "side": setup.get("side", "NO_TRADE"),
+            "side": side,
             "setup_type": setup.get("setup_type", ""),
             "entry_model": setup.get("entry_model", ""),
-            "h4_direction": setup.get("h4_direction", "NO_TRADE"),
-            "m15_aoi": bool(setup.get("m15_aoi", False)),
-            "m15_confirmation": bool(setup.get("m15_confirmation", False)),
-            "m15_retracement": bool(setup.get("m15_retracement", False)),
-            "m5_trigger": bool(setup.get("m5_trigger", False)),
-            "m5_trigger_type": setup.get("m5_trigger_type", "NONE"),
+            "h4_direction": setup_direction,
+            "h4_direction_source": h4.get("direction_source", ""),
+            "m15_aoi": bool(m15.get("aoi") or m15.get("available")),
+            "m15_confirmation": bool(m15.get("confirmation") or m15.get("direction") in {"BUY", "SELL"}),
+            "m15_retracement": bool(m15.get("retracement", False)),
+            "m5_trigger": bool(chart.get("valid") or m5.get("valid")),
+            "m5_trigger_type": chart.get("type") or m5.get("type") or "NONE",
+            "trigger_source": chart.get("trigger_source") or m5.get("trigger_source") or "",
+            "setup_valid": bool(setup.get("valid")),
+            "rejection_reason": setup.get("rejection_reason", ""),
+            "decision_role": setup.get("decision_role", "CHART_SETUP_WITH_MEMORY"),
+            "memory_recognized": bool((setup.get("memory") or {}).get("recognized")),
             "memory": setup.get("memory", {}),
             "reasons": setup.get("reasons", ()),
             "proposal_id": proposal.proposal_id if proposal else "",

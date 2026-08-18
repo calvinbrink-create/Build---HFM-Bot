@@ -125,49 +125,17 @@ def _context(frame)->dict[str,Any]:
 
 
 def build_setup(snapshot: MarketSnapshot)->dict[str,Any]:
-    # HOUR FILTER. Measured 2026-08-18 on M1-resolution backtest, 69 days:
-    # hours 4,5,20,22 UTC are net negative or flat; 0,8,17,18 are weakest.
-    # Excluding them lifted R/trade 0.149 -> 0.221 and cut the worst losing
-    # streak from 9 to 7. MT5_BLOCKED_HOURS_UTC="" disables the filter.
-    _bh = str(_os.getenv("MT5_BLOCKED_HOURS_UTC", "0,4,5,8,17,18,20,22")).strip()
-    if _bh:
-        try:
-            _blocked = {int(x) for x in _bh.split(",") if x.strip().isdigit()}
-            _hr = getattr(snapshot, "captured_at", None)
-            if _hr is not None and _hr.hour in _blocked:
-                return {"valid": False, "side": "NO_TRADE", "engine": ENGINE,
-                        "strategy_name": STRATEGY, "setup_type": STRATEGY,
-                        "rejection_reason": f"BLOCKED_HOUR_{_hr.hour}"}
-        except Exception:
-            pass
     regime=classify_market(snapshot.frames)
     h4=_context(snapshot.frames.get("H4"));m15=_context(snapshot.frames.get("M15"))
     regime_h4=((regime.get("timeframes") or {}).get("H4") or {}).get("direction")
     if regime_h4 in {"BUY", "SELL"}:
         h4={**h4,"raw_direction":h4["direction"],"direction":regime_h4,"direction_source":"H4_REGIME"}
-    # DIRECTION = H4(5-bar) AND H1(8-bar) must agree. Backtested 2026-08-17
-    # on the LIVE_STRUCTURE_BREAK path (the only path that runs when M5 data
-    # is fresh) over 69 days: 52.0% win, +0.244 R/trade, +736R, positive in
-    # all 4 chronological folds. Alternatives on the same test:
-    #   no filter      41.2% win, -0.025 R/trade, -131R   (not robust)
-    #   220-bar frame  43.9% win, +0.044 R/trade, +160R   (not robust) <- old bug
-    #   H4 alone       49.0% win, +0.170 R/trade, +655R
-    #   H1 alone       48.7% win, +0.162 R/trade, +609R
-    # Fail-CLOSED: if the two disagree, setup_direction stays None and no
-    # trade is taken. The old code let None permit BOTH sides.
+    # H4 establishes direction. H1 is recorded as context only and never
+    # acts as a second hidden approval gate.
     _h4d=_recent_direction(snapshot.frames.get("H4"),int(float(_os.getenv("MT5_H4_TREND_LOOKBACK","3"))))
     _h1d=_recent_direction(snapshot.frames.get("H1"),int(float(_os.getenv("MT5_H1_TREND_LOOKBACK","5"))))
-    # MT5_DIRECTION_MODE: h4h1 (default) | h4 | h1 | none
-    #   h4h1  44 trades/day  +0.244 R/trade  +736R   most profitable
-    #   h4    56 trades/day  +0.170 R/trade  +655R   more trades
-    #   h1    55 trades/day  +0.162 R/trade  +609R
-    #   none  75 trades/day  -0.025 R/trade  -131R   LOSES MONEY
-    _mode=str(_os.getenv("MT5_DIRECTION_MODE","h4h1")).strip().lower()
-    if _mode=="none":   setup_direction="ANY"   # explicit: no direction filter, both sides allowed
-    elif _mode=="h4":   setup_direction=_h4d
-    elif _mode=="h1":   setup_direction=_h1d
-    else:               setup_direction=_h4d if (_h4d is not None and _h4d==_h1d) else None
-    h4={**h4,"h4_recent":_h4d,"h1_recent":_h1d,"direction_source":"H4_H1_AGREEMENT"}
+    setup_direction = _h4d
+    h4={**h4,"h4_recent":_h4d,"h1_recent":_h1d,"direction_source":"H4_DIRECTION"}
     chart=_chart_setup(snapshot.frames.get("M5"),snapshot.tick,setup_direction)
     memory=_memory(snapshot.frames.get("M5"),setup_direction or chart["side"]);m5=_candles(snapshot.frames.get("M5"))
     frames={"H4":h4,"M15":m15,"M5":{**chart,"bar_time":m5[-1].timestamp.isoformat() if m5 else ""},"setup_direction":setup_direction or chart["side"]}
