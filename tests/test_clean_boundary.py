@@ -64,11 +64,12 @@ def test_retired_architecture_files_are_absent():
 
 
 def test_asset_engines_have_no_retired_hidden_veto_paths():
-    for name in ("indices.py", "metals.py"):
+    for name in ("forex.py", "indices.py", "metals.py"):
         source = (ROOT / "cipherfx_platform" / "engines" / name).read_text(encoding="utf-8")
         assert "MT5_BLOCKED_HOURS_UTC" not in source
         assert "MT5_DIRECTION_MODE" not in source
-        assert '"direction_source":"H4_DIRECTION"' in source
+    assert '"direction_source":"H4_DIRECTION"' in (ROOT / "cipherfx_platform" / "engines" / "indices.py").read_text(encoding="utf-8")
+    assert 'else m15["direction"]' not in (ROOT / "cipherfx_platform" / "engines" / "forex.py").read_text(encoding="utf-8")
 
 
 def test_runtime_has_no_backtest_data_or_pattern_memory_artifacts():

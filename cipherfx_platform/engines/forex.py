@@ -100,7 +100,9 @@ def build_setup(snapshot: MarketSnapshot) -> dict[str, Any]:
     regime_h4 = ((regime.get("timeframes") or {}).get("H4") or {}).get("direction")
     if regime_h4 in {"BUY", "SELL"}:
         h4 = {**h4, "raw_direction": h4["direction"], "direction": regime_h4, "direction_source": "H4_REGIME"}
-    setup_direction = h4["direction"] if h4["direction"] in {"BUY", "SELL"} else m15["direction"] if m15["direction"] in {"BUY", "SELL"} else None
+    # H4 is the only direction authority. M15 describes the setup context;
+    # it cannot silently reverse or replace the higher-timeframe direction.
+    setup_direction = h4["direction"] if h4["direction"] in {"BUY", "SELL"} else None
     chart = _chart_setup(snapshot.frames.get("M5"), snapshot.tick, setup_direction)
     memory = _memory(snapshot.frames.get("M5"), setup_direction or chart["side"])
     m5 = _candles(snapshot.frames.get("M5"))
