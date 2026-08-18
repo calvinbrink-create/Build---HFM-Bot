@@ -1,11 +1,36 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any
 
 SIDES = frozenset({"BUY", "SELL"})
 TERMINAL_STATES = frozenset({"FILLED", "REJECTED", "EXPIRED", "CLOSED"})
+
+
+def _ttl() -> float:
+    try:
+        return max(1.0, float(os.getenv("MT5_PROPOSAL_TTL_SECONDS", "10")))
+    except (TypeError, ValueError):
+        return 10.0
+
+
+# How long a proposal may live before execution must give up on it.
+#
+# A setup and its execution are ONE action. If the trade does not go on inside
+# this window the proposal is dead - not parked, not queued, not retried from
+# cold storage. The next scan re-derives the setup from scratch against current
+# prices and, if it is still there, submits a NEW proposal.
+#
+# This was 20s (30s in meanrev) measured from when the proposal OBJECT was
+# built. Every engine rebuilds an identical proposal on each scan, so that
+# clock reset every 30 seconds and never expired anything: a setup could sit
+# for an hour and fill at a price with no relationship to it. Measured on live
+# UK100 entries 2026-08-13 - 53% of fills landed more than 10 minutes after the
+# signal bar closed, some at 59 minutes.
+# Enforced in ExecutionEngine._preflight as PROPOSAL_EXPIRED.
+PROPOSAL_TTL_SECONDS = _ttl()
 
 
 def utc_now() -> datetime:

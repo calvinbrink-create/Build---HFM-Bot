@@ -317,6 +317,14 @@ class MT5Gateway:
         df = self._read_bridge_csv(path)
         if df.empty:
             raise RuntimeError(f"Bridge rates file is empty for {resolved}")
+        # The rolling file the EA writes holds ~32 bars. Everything deeper lives
+        # in the _HISTORY file beside it, so a caller asking for 220 bars was
+        # silently getting 32. Merge the two; the rolling file wins on any
+        # timestamp both contain, since it is the one being refreshed.
+        deep = self._bridge_history_frame(resolved, label)
+        if deep is not None and not deep.empty and len(df) < count:
+            df = pd.concat([deep, df], ignore_index=True)
+            df = df.drop_duplicates(subset="time", keep="last")
         raw_time = pd.to_numeric(df["time"], errors="coerce")
         time_index, bridge_meta = self._normalized_bridge_times(raw_time, path, label)
         df["time"] = time_index
@@ -340,6 +348,32 @@ class MT5Gateway:
         result = df.set_index("time")[cols].tail(count)
         result.attrs["bridge_rates"] = bridge_meta
         return result
+
+    def _bridge_history_frame(self, resolved: str, label: str):
+        """The deep-history CSV beside the rolling one, cached on its mtime.
+
+        The EA appends to this file rarely, so re-parsing 10k rows on every
+        10-second scan would be pure waste. Returns None when there is no
+        history file, which is the normal case for a freshly added symbol.
+        """
+        path = self.config.bridge_dir / f"rates_{resolved}_{label}_HISTORY.csv"
+        try:
+            stamp = path.stat().st_mtime
+        except OSError:
+            return None
+        cache = getattr(self, "_bridge_history_cache", None)
+        if cache is None:
+            cache = self._bridge_history_cache = {}
+        key = (resolved, label)
+        hit = cache.get(key)
+        if hit is not None and hit[0] == stamp:
+            return hit[1]
+        try:
+            frame = self._read_bridge_csv(path)
+        except Exception:
+            frame = None
+        cache[key] = (stamp, frame)
+        return frame
 
     def _bridge_position_symbol(self, symbol: str) -> str:
         """Resolve a broker symbol for an already-open bridge position only."""

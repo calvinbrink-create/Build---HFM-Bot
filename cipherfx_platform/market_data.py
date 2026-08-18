@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import os
 import threading
 
 import pandas as pd
@@ -14,264 +15,193 @@ class MarketDataError(RuntimeError):
 
 
 class MarketDataEngine:
-    """Reads MT5/bridge data and constructs one synchronized snapshot."""
+    """One live MT5 WebSocket quote plus completed H4/M15/M5 bars."""
 
-    # Long context frames naturally advance less often, so only intraday
-    # frames use freshness limits. The bridge timestamp is the candle open.
-    #
-    # D1 widened from 48h to 96h (2026-07-20): the most recent COMPLETED D1
-    # candle is Friday's close, and Friday-close to Monday-morning is
-    # routinely 54-58h - a 48h limit made every snapshot fail on Monday
-    # mornings for every asset class, even though only indices.py reads D1
-    # (for ADR/gap features that use a 20-day lookback and don't need
-    # today's candle). 96h survives a normal weekend with margin while
-    # still catching a genuinely dead feed after several days.
-    FRESHNESS_MAX_AGE_SECONDS = {
-        "D1": 345600,
-        "H4": 43200,
-        "H1": 10800,
-        "M30": 5400,
-        "M15": 2700,
-        "M5": 900,
-    }
-
-    # Only the timeframes actually read by an engine (see TIME_WEIGHTS in
-    # engines/*.py, plus D1/M30 used by indices.py._features()). MN1/W1/M3/M1
-    # were fetched and freshness-checked here for every symbol on every
-    # cycle but never read anywhere - pure overhead, and M1's 180s freshness
-    # window made it the most likely of the unused frames to spuriously
-    # fail and block a whole snapshot for no benefit.
-    TIMEFRAMES = (
-        ("D1", 1440),
-        ("H4", 240),
-        ("H1", 60),
-        ("M30", 30),
-        ("M15", 15),
-        ("M5", 5),
-    )
+    # H1 added 2026-08-17: the direction filter needs H4 AND H1 agreement.
+    # Backtested on the LIVE_STRUCTURE_BREAK path (the one that actually runs)
+    # over 69 days of M1-reconstructed entries: H4+H1 gives 52.0% win /
+    # +0.244 R-per-trade / +736R, positive in all 4 chronological folds,
+    # vs -0.025 R-per-trade with no direction filter. Also matches today's
+    # live ledger and the pre-rebuild 1000-day validation.
+    TIMEFRAMES = (("H4", 240), ("H1", 60), ("M15", 15), ("M5", 5))
+    FRESHNESS_SECONDS = {"H4": 43200, "H1": 10800, "M15": 3600, "M5": 900}
 
     def __init__(self, gateway: MT5Gateway, history_bars: int = 220):
         self.gateway = gateway
         self.history_bars = max(60, int(history_bars))
-        # Strategy snapshots accept only ticks received through the live
-        # WebSocket transport. Bridge tick files remain diagnostic data and
-        # are deliberately not an execution fallback.
-        self.websocket_max_tick_age_seconds = 10.0
-        self._live_ticks: dict[str, Tick] = {}
-        self._tick_lock = threading.RLock()
-        self._last_websocket_event_at: datetime | None = None
+        try:
+            configured_age = float(os.getenv("MT5_WS_MAX_TICK_AGE_SECONDS", "60"))
+        except (TypeError, ValueError):
+            configured_age = 60.0
+        self.websocket_max_tick_age_seconds = max(10.0, min(60.0, configured_age))
+        self._ticks: dict[str, Tick] = {}
+        self._frames_cache: dict[str, dict[str, Frame]] = {}
+        self._changed_symbols: set[str] = set()
+        self._lock = threading.RLock()
+        self._last_event_at: datetime | None = None
         self.websocket_event_count = 0
         self.websocket_rejected_events = 0
 
     @staticmethod
-    def _as_utc(value) -> datetime:
+    def _utc(value) -> datetime:
         if isinstance(value, pd.Timestamp):
             value = value.to_pydatetime()
         if isinstance(value, datetime):
             return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value.astimezone(timezone.utc)
-        if isinstance(value, (int, float)):
-            return datetime.fromtimestamp(float(value), tz=timezone.utc)
-        raw = str(value).strip()
-        try:
-            numeric = float(raw)
-            if numeric > 1000000000:
-                return datetime.fromtimestamp(numeric, tz=timezone.utc)
-        except (TypeError, ValueError):
-            pass
-        return datetime.fromisoformat(raw.replace("Z", "+00:00")).astimezone(timezone.utc)
+        if isinstance(value, str):
+            try:
+                parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+                return parsed.replace(tzinfo=timezone.utc) if parsed.tzinfo is None else parsed.astimezone(timezone.utc)
+            except ValueError:
+                pass
+        return datetime.fromtimestamp(float(value), tz=timezone.utc)
 
     def ingest_tick(self, event: dict) -> None:
-        '''Accept one factual tick from the production WebSocket listener.'''
         if not isinstance(event, dict) or str(event.get("type", "tick")).lower() != "tick":
             return
-        symbol = str(event.get("symbol", "")).strip().upper()
         try:
-            tick_epoch = float(event.get("time_utc", 0) or 0)
-            bid = float(event.get("bid", 0) or 0)
-            ask = float(event.get("ask", 0) or 0)
-        except (TypeError, ValueError):
-            self.websocket_rejected_events += 1
-            return
-        if not symbol or tick_epoch <= 0 or bid <= 0 or ask <= 0 or ask < bid:
+            symbol = str(event["symbol"]).strip().upper()
+            timestamp = self._utc(event["time_utc"])
+            bid = float(event["bid"])
+            ask = float(event["ask"])
+        except (KeyError, TypeError, ValueError, OverflowError):
             self.websocket_rejected_events += 1
             return
         now = datetime.now(timezone.utc)
-        timestamp = datetime.fromtimestamp(tick_epoch, tz=timezone.utc)
-        if timestamp > now.replace(microsecond=0) + pd.Timedelta(seconds=5):
+        if not symbol or bid <= 0 or ask < bid or timestamp > now + pd.Timedelta(seconds=5):
             self.websocket_rejected_events += 1
             return
-        resolved = symbol
         try:
-            resolved = str(self.gateway.config.resolved_symbol(symbol) or symbol).strip().upper()
+            resolved = str(self.gateway.ensure_symbol(symbol) or symbol).strip().upper()
         except Exception:
-            pass
-        tick = Tick(
-            symbol=resolved,
-            bid=bid,
-            ask=ask,
-            timestamp=timestamp,
-            received_at=now,
-        )
-        keys = {symbol, resolved}
-        with self._tick_lock:
-            current = None
-            for key in keys:
-                candidate = self._live_ticks.get(key)
-                if candidate is not None and (current is None or candidate.timestamp > current.timestamp):
-                    current = candidate
-            if current is not None and tick.timestamp <= current.timestamp:
+            resolved = symbol
+        tick = Tick(resolved, bid, ask, timestamp, now)
+        with self._lock:
+            previous = self._ticks.get(resolved)
+            if previous is not None and timestamp <= previous.timestamp:
                 return
-            for key in keys:
-                self._live_ticks[key] = tick
-            self._last_websocket_event_at = now
+            self._ticks[resolved] = tick
+            self._ticks[symbol] = tick
+            self._changed_symbols.add(resolved)
+            self._last_event_at = now
             self.websocket_event_count += 1
 
-    def live_tick_status(self) -> dict:
-        now = datetime.now(timezone.utc)
-        with self._tick_lock:
-            latest = dict(self._live_ticks)
-            last_event = self._last_websocket_event_at
-        ages = {
-            symbol: max(0.0, (now - tick.timestamp).total_seconds())
-            for symbol, tick in latest.items()
-        }
-        fresh = {symbol: age for symbol, age in ages.items() if age <= self.websocket_max_tick_age_seconds}
-        return {
-            "source": "websocket",
-            "tracked_symbols": len(latest),
-            "fresh_symbols": len(fresh),
-            "stale_symbols": sorted(symbol for symbol, age in ages.items() if age > self.websocket_max_tick_age_seconds),
-            "max_tick_age_seconds": round(max(ages.values()), 3) if ages else None,
-            "last_websocket_event_at": last_event.isoformat() if last_event else "",
-            "websocket_event_count": self.websocket_event_count,
-            "websocket_rejected_events": self.websocket_rejected_events,
-        }
-
-    def _websocket_tick(self, symbol: str) -> tuple[str, Tick, float]:
-        # Production MT5Gateway exposes ensure_symbol and therefore must use
-        # the ingested websocket cache. Small contract-test gateways may only
-        # expose their factual symbol_tick adapter.
-        ensure_symbol = getattr(self.gateway, "ensure_symbol", None)
-        if callable(ensure_symbol):
-            resolved = str(ensure_symbol(symbol) or symbol).strip().upper()
-        else:
-            resolved = str(symbol).strip().upper()
-        keys = (resolved, str(symbol).strip().upper())
-        with self._tick_lock:
-            tick = next((self._live_ticks.get(key) for key in keys if self._live_ticks.get(key) is not None), None)
-        if tick is None and not callable(ensure_symbol):
-            raw = self.gateway.symbol_tick(symbol)
-            raw_symbol, raw_tick = raw if isinstance(raw, tuple) and len(raw) == 2 else (symbol, raw)
-            resolved = str(raw_symbol or symbol).strip().upper()
-            raw_time = getattr(raw_tick, "time_utc", None)
-            if raw_time is None:
-                raise MarketDataError(f"{symbol}: websocket tick unavailable")
-            timestamp = self._as_utc(raw_time)
-            bid = float(getattr(raw_tick, "bid", 0.0) or 0.0)
-            ask = float(getattr(raw_tick, "ask", 0.0) or 0.0)
-            now = datetime.now(timezone.utc)
-            if bid <= 0 or ask <= 0 or ask < bid:
-                raise MarketDataError(f"{symbol}: invalid websocket tick")
-            tick = Tick(symbol=resolved, bid=bid, ask=ask, timestamp=timestamp, received_at=now)
+    def _tick(self, symbol: str) -> tuple[str, Tick, float]:
+        resolved = str(self.gateway.ensure_symbol(symbol) or symbol).strip().upper()
+        with self._lock:
+            tick = self._ticks.get(resolved) or self._ticks.get(str(symbol).upper())
         if tick is None:
-            raise MarketDataError(f"{symbol}: websocket tick unavailable")
-        age_seconds = max(0.0, (datetime.now(timezone.utc) - tick.timestamp).total_seconds())
-        if age_seconds > self.websocket_max_tick_age_seconds:
-            raise MarketDataError(
-                f"{symbol}: websocket tick stale age_seconds={age_seconds:.3f} "
-                f"max_age_seconds={self.websocket_max_tick_age_seconds:.3f}"
-            )
-        return resolved, tick, age_seconds
+            raise MarketDataError(f"{symbol}: live WebSocket tick unavailable")
+        age = max(0.0, (datetime.now(timezone.utc) - tick.timestamp).total_seconds())
+        if age > self.websocket_max_tick_age_seconds:
+            raise MarketDataError(f"{symbol}: stale WebSocket tick age={age:.3f}s")
+        return resolved, tick, age
 
-    def live_tick_rows(self) -> list[dict]:
-        now = datetime.now(timezone.utc)
-        with self._tick_lock:
-            ticks = list(self._live_ticks.values())
-        rows = []
-        for tick in sorted(ticks, key=lambda item: item.symbol):
-            age = max(0.0, (now - tick.timestamp).total_seconds())
-            rows.append({
-                "symbol": tick.symbol,
-                "bid": tick.bid,
-                "ask": tick.ask,
-                "last": (tick.bid + tick.ask) / 2.0,
-                "spread": tick.ask - tick.bid,
-                "time": tick.timestamp.isoformat(),
-                "received_at": tick.received_at.isoformat(),
-                "age_seconds": round(age, 3),
-                "fresh": age <= self.websocket_max_tick_age_seconds,
-                "status": "LIVE_DATA" if age <= self.websocket_max_tick_age_seconds else "STALE_MARKET_DATA",
-                "source": "websocket",
-            })
-        return rows
-
-    def _raw(self, symbol: str, timeframe: str) -> pd.DataFrame:
-        # Every snapshot frame is an independent broker timeframe. In
-        # particular, M3 must never be synthesized from M1.
-        return self.gateway.rates(symbol, timeframe, self.history_bars)
-
-    def _frame(self, symbol: str, timeframe: str) -> Frame:
-        raw = self._raw(symbol, timeframe)
+    def _frame(self, symbol: str, label: str, minutes: int) -> Frame:
+        raw = self.gateway.rates(symbol, label, self.history_bars)
         if raw is None or raw.empty:
-            raise MarketDataError(f"{symbol} {timeframe}: no candles")
-
-        period_seconds = dict(self.TIMEFRAMES)[timeframe] * 60
+            raise MarketDataError(f"{symbol} {label}: no MT5 bars")
         now = datetime.now(timezone.utc)
-        ordered = raw[~raw.index.duplicated(keep="last")].sort_index()
-        candles = []
-        forming = 0
-        for index, row in ordered.iterrows():
-            timestamp = self._as_utc(index)
-            # A candle is usable only after its complete interval has closed.
-            # This excludes any still-forming broker candle.
-            if timestamp + pd.Timedelta(seconds=period_seconds) > now:
-                forming += 1
+        candles: list[Candle] = []
+        for index, row in raw[~raw.index.duplicated(keep="last")].sort_index().iterrows():
+            timestamp = self._utc(index)
+            if timestamp + pd.Timedelta(minutes=minutes) > now:
                 continue
-            candles.append(Candle(
-                timestamp=timestamp,
-                open=float(row.get("Open", 0.0) or 0.0),
-                high=float(row.get("High", 0.0) or 0.0),
-                low=float(row.get("Low", 0.0) or 0.0),
-                close=float(row.get("Close", 0.0) or 0.0),
-                volume=float(row.get("Volume", 0.0) or 0.0),
-            ))
-        if not candles:
-            raise MarketDataError(f"{symbol} {timeframe}: no completed candles")
-        latest = candles[-1].timestamp
-        max_age = self.FRESHNESS_MAX_AGE_SECONDS.get(timeframe)
-        age_seconds = max(0.0, (now - (latest + pd.Timedelta(seconds=period_seconds))).total_seconds())
-        if max_age is not None and age_seconds > max_age:
-            raise MarketDataError(
-                f"{symbol} {timeframe}: stale completed candle "
-                f"age_seconds={age_seconds:.1f} max_age_seconds={max_age}"
-            )
-        return Frame(timeframe, tuple(candles))
+            candles.append(Candle(timestamp, float(row.get("Open", 0.0) or 0.0), float(row.get("High", 0.0) or 0.0), float(row.get("Low", 0.0) or 0.0), float(row.get("Close", 0.0) or 0.0), float(row.get("Volume", 0.0) or 0.0)))
+        if len(candles) < 30:
+            raise MarketDataError(f"{symbol} {label}: insufficient completed MT5 bars")
+        age = max(0.0, (now - (candles[-1].timestamp + pd.Timedelta(minutes=minutes))).total_seconds())
+        if age > self.FRESHNESS_SECONDS[label]:
+            raise MarketDataError(f"{symbol} {label}: stale completed MT5 bar age={age:.1f}s")
+        return Frame(label, tuple(candles))
 
-    def snapshot(self, symbol: str, asset_class: str) -> MarketSnapshot:
-        # Reject before history work when the live quote is absent or stale.
-        # There is intentionally no bridge-file fallback in this path.
-        resolved, tick, tick_age_seconds = self._websocket_tick(symbol)
-        frames = {label: self._frame(symbol, label) for label, _minutes in self.TIMEFRAMES}
-        now = datetime.now(timezone.utc)
-        freshness = {
-            "source": "websocket",
-            "resolved_symbol": resolved,
-            "captured_at": now.isoformat(),
-            "tick_timestamp": tick.timestamp.isoformat(),
-            "tick_age_seconds": round(tick_age_seconds, 3),
-            "timeframes": [x[0] for x in self.TIMEFRAMES],
-            "completed_only": True,
-            "latest_completed": {
-                name: frame.last.timestamp.isoformat() if frame.last else ""
-                for name, frame in frames.items()
-            },
-        }
+    @staticmethod
+    def _snapshot_payload(resolved: str, asset_class: str, frames: dict[str, Frame], tick: Tick, tick_age: float, *, cached: bool) -> MarketSnapshot:
+        captured = datetime.now(timezone.utc)
         return MarketSnapshot(
-            symbol=symbol,
+            symbol=resolved,
             asset_class=asset_class,
             frames=frames,
             tick=tick,
-            captured_at=now,
-            freshness=freshness,
+            captured_at=captured,
+            freshness={
+                "source": "websocket",
+                "tick_age_seconds": round(tick_age, 3),
+                "completed_only": True,
+                "cached_completed_frames": bool(cached),
+                "timeframes": list(frames),
+                "latest_completed": {label: frame.last.timestamp.isoformat() for label, frame in frames.items()},
+            },
         )
 
+    def snapshot(self, symbol: str, asset_class: str) -> MarketSnapshot:
+        resolved, tick, tick_age = self._tick(symbol)
+        with self._lock:
+            frames = dict(self._frames_cache.get(resolved, {}))
+        refresh_labels: list[tuple[str, int]] = []
+        now = datetime.now(timezone.utc)
+        for label, minutes in self.TIMEFRAMES:
+            frame = frames.get(label)
+            expected_last = (tick.timestamp.timestamp() // (minutes * 60.0)) * (minutes * 60.0) - (minutes * 60.0)
+            stale = (
+                frame is None
+                or frame.last is None
+                or abs(frame.last.timestamp.timestamp() - expected_last) > 5.0
+                or (now - (frame.last.timestamp + pd.Timedelta(minutes=minutes))).total_seconds() > self.FRESHNESS_SECONDS[label]
+            )
+            if stale:
+                refresh_labels.append((label, minutes))
+        for label, minutes in refresh_labels:
+            frames[label] = self._frame(resolved, label, minutes)
+        with self._lock:
+            self._frames_cache[resolved] = dict(frames)
+        return self._snapshot_payload(resolved, asset_class, frames, tick, tick_age, cached=not bool(refresh_labels))
+
+    def cached_snapshot(self, symbol: str, asset_class: str) -> MarketSnapshot:
+        """Return live WebSocket price plus the last completed MT5 bars.
+
+        The fast trigger path never downloads history on every tick. It refreshes
+        only the newly completed M5 bar when a five-minute boundary is crossed.
+        """
+        resolved, tick, tick_age = self._tick(symbol)
+        with self._lock:
+            frames = dict(self._frames_cache.get(resolved, {}))
+        if not frames:
+            raise MarketDataError(f"{symbol}: completed MT5 frame cache is not initialized")
+        current_start = (tick.timestamp.timestamp() // 300.0) * 300.0
+        expected_last_m5 = current_start - 300.0
+        m5 = frames.get("M5")
+        if m5 is None or abs(m5.last.timestamp.timestamp() - expected_last_m5) > 5.0:
+            refreshed_m5 = self._frame(resolved, "M5", 5)
+            frames["M5"] = refreshed_m5
+            with self._lock:
+                self._frames_cache[resolved] = dict(frames)
+        now = datetime.now(timezone.utc)
+        for label, minutes in self.TIMEFRAMES:
+            frame = frames.get(label)
+            if frame is None or frame.last is None:
+                raise MarketDataError(f"{symbol} {label}: cached MT5 frame unavailable")
+            age = max(0.0, (now - (frame.last.timestamp + pd.Timedelta(minutes=minutes))).total_seconds())
+            if age > self.FRESHNESS_SECONDS[label]:
+                raise MarketDataError(f"{symbol} {label}: cached completed MT5 bar stale age={age:.1f}s")
+        return self._snapshot_payload(resolved, asset_class, frames, tick, tick_age, cached=True)
+
+    def drain_changed_symbols(self) -> list[str]:
+        with self._lock:
+            symbols = sorted(self._changed_symbols)
+            self._changed_symbols.clear()
+        return symbols
+
+    def live_tick_status(self) -> dict:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            ticks = dict(self._ticks)
+            last_event = self._last_event_at
+        ages = {symbol: max(0.0, (now - tick.timestamp).total_seconds()) for symbol, tick in ticks.items()}
+        return {"source": "websocket", "tracked_symbols": len(ticks), "fresh_symbols": sum(age <= self.websocket_max_tick_age_seconds for age in ages.values()), "stale_symbols": sorted(symbol for symbol, age in ages.items() if age > self.websocket_max_tick_age_seconds), "last_websocket_event_at": last_event.isoformat() if last_event else "", "websocket_event_count": self.websocket_event_count, "websocket_rejected_events": self.websocket_rejected_events}
+
+    def live_tick_rows(self) -> list[dict]:
+        now = datetime.now(timezone.utc)
+        with self._lock:
+            values = list({id(tick): tick for tick in self._ticks.values()}.values())
+        return [{"symbol": tick.symbol, "bid": tick.bid, "ask": tick.ask, "last": tick.mid, "spread": tick.ask - tick.bid, "time": tick.timestamp.isoformat(), "received_at": tick.received_at.isoformat(), "age_seconds": round(max(0.0, (now - tick.timestamp).total_seconds()), 3), "source": "websocket"} for tick in sorted(values, key=lambda item: item.symbol)]

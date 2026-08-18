@@ -20,7 +20,8 @@ const DASHBOARDS = {
     title: "MT5 Dashboard",
     path: "/dashboard/mt5",
     loginPath: "/mt5-api/login",
-    tokenKey: "cipherfx_mt5_token",
+    tokenKey: "cipherfx_mt5_demo_token",
+    liveTokenKey: "cipherfx_mt5_live_token",
   },
 };
 
@@ -82,12 +83,18 @@ function hasValidDashboardSession(dashboardId = currentDashboardId()) {
   const meta = readAuthMeta();
   const expiresAt = Number(meta.expiresAt || 0);
   const target = DASHBOARDS[dashboardId] || DASHBOARDS.ibkr;
-  return expiresAt > Date.now() && Boolean(safeStorageGet(target.tokenKey));
+  const tokenKey = dashboardId === "mt5"
+    ? (meta.mode === "live" ? target.liveTokenKey : target.tokenKey)
+    : target.tokenKey;
+  return expiresAt > Date.now() && Boolean(safeStorageGet(tokenKey));
 }
 
 function clearDashboardSession() {
   safeStorageRemove(AUTH_KEY);
   safeStorageRemove("cipherfx_mt5_mode");
+  safeStorageRemove("cipherfx_mt5_token");
+  safeStorageRemove("cipherfx_mt5_demo_token");
+  safeStorageRemove("cipherfx_mt5_live_token");
   Object.values(DASHBOARDS).forEach((dashboard) => safeStorageRemove(dashboard.tokenKey));
 }
 
@@ -134,8 +141,6 @@ function LoginPage({ activeDashboard, onLogin }) {
   const [error, setError] = React.useState("");
   const [warning, setWarning] = React.useState("");
   const [mt5Mode, setMt5Mode] = React.useState(() => safeStorageGet("cipherfx_mt5_mode") || "demo");
-  const [mt5Account, setMt5Account] = React.useState("");
-  const [mt5AccountPassword, setMt5AccountPassword] = React.useState("");
   const target = DASHBOARDS[activeDashboard] || DASHBOARDS.ibkr;
 
   async function submit(event) {
@@ -146,26 +151,34 @@ function LoginPage({ activeDashboard, onLogin }) {
     try {
       const credentials = { email: email.trim(), password };
       if (activeDashboard === "mt5") {
-        const endpoint = mt5Mode === "live" ? "/mt5-api/live-login" : "/mt5-api/login";
-        const body = mt5Mode === "live"
-          ? { ...credentials, account: mt5Account.trim(), account_password: mt5AccountPassword }
-          : credentials;
-        const response = await fetch(endpoint, {
+        // Live mode uses the exact same dashboard login as demo - the live
+        // MT5 account is already connected and running server-side (set up
+        // once via ops, not per-login), and the resulting session token is
+        // valid against both the demo and live backends. Re-collecting the
+        // MT5 account number/password on every login was never necessary
+        // once that connection exists, and re-submitting it used to also
+        // rewrite the live runtime config and restart the live services on
+        // every single login - disruptive for no reason once already set up.
+        const loginPath = mt5Mode === "live" ? "/mt5-live-api/login" : "/mt5-api/login";
+        const response = await fetch(loginPath, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
+          body: JSON.stringify(credentials),
         });
         if (!response.ok) throw new Error(await response.text().catch(() => "MT5 login failed"));
         const data = await response.json();
         if (!data.token) throw new Error("MT5 did not return a session token");
-        safeStorageSet(DASHBOARDS.mt5.tokenKey, data.token);
+        const tokenKey = mt5Mode === "live"
+          ? DASHBOARDS.mt5.liveTokenKey
+          : DASHBOARDS.mt5.tokenKey;
+        safeStorageSet(tokenKey, data.token);
         safeStorageSet("cipherfx_mt5_mode", mt5Mode);
         safeStorageSet(AUTH_KEY, JSON.stringify({
           email: credentials.email,
+          mode: mt5Mode,
           expiresAt: Date.now() + AUTH_TTL_MS,
           dashboards: ["mt5"],
         }));
-        setMt5AccountPassword("");
         onLogin();
       } else {
         await loginDashboard(DASHBOARDS.ibkr, credentials);
@@ -207,11 +220,11 @@ function LoginPage({ activeDashboard, onLogin }) {
         </div>
         <form className="dashboard-login-form" onSubmit={submit}>
           <label>
-            <span>Email</span>
+            <span>{activeDashboard === "mt5" && mt5Mode === "live" ? "MT5 account or dashboard email" : "Email"}</span>
             <input
               autoComplete="username"
-              inputMode="email"
-              type="email"
+              inputMode={activeDashboard === "mt5" && mt5Mode === "live" ? "text" : "email"}
+              type={activeDashboard === "mt5" && mt5Mode === "live" ? "text" : "email"}
               value={email}
               onChange={(event) => setEmail(event.target.value)}
               required
@@ -230,21 +243,11 @@ function LoginPage({ activeDashboard, onLogin }) {
           {activeDashboard === "mt5" && (
             <>
               <div className="mt5-mode-switch" aria-label="MT5 account mode">
-                <button type="button" className={mt5Mode === "demo" ? "active" : ""} onClick={() => { setMt5Mode("demo"); setMt5AccountPassword(""); }}>Demo mode</button>
+                <button type="button" className={mt5Mode === "demo" ? "active" : ""} onClick={() => setMt5Mode("demo")}>Demo mode</button>
                 <button type="button" className={mt5Mode === "live" ? "active" : ""} onClick={() => setMt5Mode("live")}>Live mode</button>
               </div>
               {mt5Mode === "live" && (
-                <div className="mt5-live-fields">
-                  <p>Live credentials are sent to the protected server and are never stored in this browser.</p>
-                  <label>
-                    <span>MT5 account</span>
-                    <input inputMode="numeric" type="text" value={mt5Account} onChange={(event) => setMt5Account(event.target.value)} autoComplete="off" required />
-                  </label>
-                  <label>
-                    <span>MT5 account password</span>
-                    <input type="password" value={mt5AccountPassword} onChange={(event) => setMt5AccountPassword(event.target.value)} autoComplete="off" required />
-                  </label>
-                </div>
+                <p className="mt5-live-fields">Use the live MT5 account number and broker password, or dashboard credentials. Credentials are sent to the protected server and are not stored in the browser.</p>
               )}
             </>
           )}

@@ -2430,10 +2430,15 @@ class XM_MT5_Bot:
             if balance > 0 and equity > 0:
                 return min(balance, equity)
             return max(balance, equity, 0.0)
-        cap = float(self.runtime.capital_cap_usd or CFG.get("capital_cap_usd", 5000.0) or 5000.0)
-        if equity <= 0:
-            return cap
-        return min(equity, cap) if cap > 0 else equity
+        # Demo sizing follows the broker account balance when no explicit
+        # capital cap is configured. A zero cap is an intentional uncapped mode;
+        # do not fall back to the legacy USD default because the account currency
+        # is supplied by MT5 and may be ZAR.
+        cap = float(self.runtime.capital_cap_usd or 0.0)
+        account_base = balance if balance > 0 else equity
+        if cap > 0:
+            return min(account_base, cap) if account_base > 0 else cap
+        return account_base
 
     def _account_trading_allowed(self, acct) -> tuple[bool, str]:
         actual = int(getattr(acct, "login", 0) or 0)

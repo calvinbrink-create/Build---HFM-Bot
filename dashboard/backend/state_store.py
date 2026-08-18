@@ -17,6 +17,23 @@ except ImportError:  # pragma: no cover
     ZoneInfo = None
 
 MT5_EXPECTED_STATE_DB = Path("/opt/cipherfx_mt5/state/mt5_state.db")
+# Isolated live-account stack (state/live/) added 2026-07-23 - a genuinely
+# separate database from the demo one, on purpose (real money, must never
+# share state with the demo account). The single-path check below predates
+# this and only ever allowed the demo path, so the live dashboard backend
+# has never actually been able to start - this was a real, silent bug, not
+# something anyone changed on purpose.
+MT5_EXPECTED_LIVE_STATE_DB = Path("/opt/cipherfx_mt5/state/live/mt5_state.db")
+# Isolated ZONE stack (demo acct 168934059) added 2026-08-01 - a third
+# deployment running only the zone limit-entry engine on US30, with its own
+# account, its own state DB and its own dashboard on 8012. Same reasoning as
+# the live path above: separate accounts must never share a state database.
+MT5_EXPECTED_ZONE_STATE_DB = Path("/opt/cipherfx_mt5_zone/state/mt5_state.db")
+MT5_ALLOWED_STATE_DBS = (
+    MT5_EXPECTED_STATE_DB,
+    MT5_EXPECTED_LIVE_STATE_DB,
+    MT5_EXPECTED_ZONE_STATE_DB,
+)
 
 
 def _state_db_path() -> Path:
@@ -27,8 +44,9 @@ def _state_db_path() -> Path:
         if not raw:
             raise RuntimeError("SCALPBOT_STATE_DB is required when CIPHERFX_BROKER_BACKEND=mt5")
         value = str(raw).strip()
-        if value != str(MT5_EXPECTED_STATE_DB):
-            raise RuntimeError(f"SCALPBOT_STATE_DB must be {MT5_EXPECTED_STATE_DB} for MT5; got {value}")
+        if value not in {str(path) for path in MT5_ALLOWED_STATE_DBS}:
+            allowed = " or ".join(str(path) for path in MT5_ALLOWED_STATE_DBS)
+            raise RuntimeError(f"SCALPBOT_STATE_DB must be {allowed} for MT5; got {value}")
         if "/opt/scalp_v3" in value:
             raise RuntimeError("SCALPBOT_STATE_DB must not point into /opt/scalp_v3 for MT5")
         if Path(value).name == "bot_state.db":
@@ -1782,16 +1800,32 @@ def read_trades(limit=100, today_only=False):
 
 
 def read_todays_pnl():
-    """Sum realized P&L from trades whose trade_date is today's trading date."""
+    """Sum realized P&L from trades closed today (trading-day boundary).
+
+    The `trades` table this used to read from stopped being written to on
+    2026-07-23 (last row: 2026-07-14) - closes have been recorded in
+    `trade_history` since, silently, with no error anywhere. Confirmed live:
+    14 real trades closed today totaling -$257.96 while this returned $0.00
+    because it was querying a table nothing writes to anymore.
+    """
     today = trading_today()
+    tz = _tzinfo()
     conn = get_conn()
     closed = conn.execute(
-        "SELECT realized FROM trades WHERE closed_at IS NOT NULL AND trade_date = ?",
-        (today,)
+        "SELECT realized_pnl, closed_at FROM trade_history WHERE closed_at IS NOT NULL"
     ).fetchall()
     conn.close()
-    realized_sum = sum(r["realized"] for r in closed if r["realized"] is not None)
-    return round(realized_sum, 2)
+    total = 0.0
+    for row in closed:
+        dt = _parse_dt(row["closed_at"])
+        if dt is None:
+            continue
+        local_dt = dt.astimezone(tz) if tz else dt
+        if local_dt.date().isoformat() != today:
+            continue
+        total += float(row["realized_pnl"] or 0.0)
+    return round(total, 2)
+
 
 def read_broker_day_pnl():
     """Sum realized P&L by MT5 broker close day, matching the EA reset boundary."""
@@ -1838,6 +1872,12 @@ def _deal_period_range(period: str) -> tuple[str, str, str]:
         return "month", start, end
     if clean in {"all", "history"}:
         return "all", "", ""
+    if clean in {"baseline", "restart"}:
+        # New tracking baseline set 2026-07-21 per explicit request: the
+        # entry-guard/exit/pyramid fixes landed 2026-07-20, so "yesterday
+        # and today" is the first data under the current, frozen build.
+        # Full history stays queryable via period=all - nothing is deleted.
+        return "baseline", "2026-07-20", today
     return "today", today, today
 
 
@@ -2260,11 +2300,14 @@ def read_deals_period(period: str = "today", limit: int = 200) -> dict:
             if len(deals) >= count:
                 break
 
-    allowed_symbols = _active_dashboard_symbols()
-    deals = [
-        row for row in deals
-        if str(row.get("sym") or row.get("symbol") or "").strip().upper() in allowed_symbols
-    ][:count]
+    # Do NOT filter by the currently-active trading universe here - a symbol
+    # being removed from new-entry eligibility (e.g. EURJPY/AUDUSD/NZDUSD/
+    # EURUSD removed 2026-07-21/22 after backtest evidence) must never hide
+    # its already-realized P&L from today's/historical summaries. Found live
+    # 2026-07-22: today's real closed P&L was -$938.03 across 13 broker
+    # deals, but this filter silently dropped 3 of them (AUDUSD -399.33,
+    # NZDUSD +108.29, EURUSD -205.72), understating today's loss by $496.76.
+    deals = deals[:count]
     summary = _deals_summary(deals, clean, start, end)
     public_keys = (
         "id", "trade_id", "proposal_id", "ticket", "position_ticket", "order_ticket",
@@ -2310,32 +2353,26 @@ def _runtime_open_trade_ids():
 
 
 def read_todays_trade_count():
-    """Count accepted bot entries in the current MT5 broker day."""
+    """Count accepted bot entries in the current MT5 broker day.
+
+    Used to read from the `trades` table, which stopped being written to on
+    2026-07-14 - this silently returned an undercount (often 0) for over a
+    week. Real executions are recorded in `platform_executions` now.
+    Statuses there are FILLED/DRY_RUN/CLOSED (a real order that went
+    through, at whatever stage of its life) vs REJECTED/EXECUTION_BLOCKED
+    (never actually became a trade) - no adopted-trade or runtime-open-id
+    special-casing needed, that was compensating for ambiguity specific to
+    the old table's schema which doesn't exist here.
+    """
     today = broker_trading_today()
-    runtime_open_trade_ids = _runtime_open_trade_ids()
     conn = get_conn()
     rows = conn.execute(
-        """
-        SELECT trade_id, opened_at, trade_date, status, closed_at
-        FROM trades
-        WHERE COALESCE(status, '') NOT IN ('rejected', 'cancelled', 'duplicate', 'reconciled_duplicate')
-        """
+        "SELECT created_at FROM platform_executions WHERE status IN ('FILLED','DRY_RUN','CLOSED')"
     ).fetchall()
     conn.close()
     count = 0
     for row in rows:
-        trade_id = str(row["trade_id"] or "")
-        if trade_id.startswith("mt5_adopted_"):
-            continue
-        status = str(row["status"] or "").lower()
-        if (
-            status == "live"
-            and not row["closed_at"]
-            and runtime_open_trade_ids is not None
-            and trade_id not in runtime_open_trade_ids
-        ):
-            continue
-        if broker_trade_date_for(row["opened_at"], fallback=row["trade_date"]) == today:
+        if broker_trade_date_for(row["created_at"]) == today:
             count += 1
     return count
 

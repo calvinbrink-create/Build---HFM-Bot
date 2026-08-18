@@ -25,7 +25,6 @@ import {
 } from "lucide-react";
 import logoSrc from "./cipherfx-icon.png";
 import CandleChart from "./CandleChart";
-import TradeReplayChart from "./TradeReplayChart";
 
 function apiBase() {
   try {
@@ -42,9 +41,7 @@ const TABS = [
   { id: "snapshot", label: "Snapshot", short: "Snapshot", icon: LayoutDashboard },
   { id: "market", label: "Market", short: "Market", icon: TrendingUp },
   { id: "chart", label: "Chart", short: "Chart", icon: BarChart3 },
-  { id: "replay", label: "Replay", short: "Replay", icon: History },
   { id: "scanner", label: "Scan", short: "Scan", icon: Activity },
-  { id: "intelligence", label: "Intel", short: "Intel", icon: Sparkles },
   { id: "trade", label: "Trade", short: "Trade", icon: Briefcase },
   { id: "history", label: "History", short: "History", icon: Clock3 },
 ];
@@ -54,7 +51,10 @@ const ENGINE_ORDER = ["Forex", "Indices", "Metals"];
 
 function token() {
   try {
-    return window.localStorage?.getItem("cipherfx_mt5_token") || "";
+    const mode = window.localStorage?.getItem("cipherfx_mt5_mode") === "live" ? "live" : "demo";
+    return window.localStorage?.getItem(
+      mode === "live" ? "cipherfx_mt5_live_token" : "cipherfx_mt5_demo_token",
+    ) || "";
   } catch {
     return "";
   }
@@ -86,17 +86,17 @@ function finite(value, fallback = null) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
-function money(value, currency = "USD") {
+function money(value) {
   const numeric = finite(value, null);
   if (numeric === null) return "--";
   const sign = numeric >= 0 ? "+" : "-";
-  return `${sign}$${Math.abs(numeric).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${currency === "USD" ? "" : ` ${currency}`}`;
+  return `${sign}R ${Math.abs(numeric).toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
-function plainMoney(value, currency = "USD") {
+function plainMoney(value) {
   const numeric = finite(value, null);
   if (numeric === null) return "--";
-  return `$${numeric.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}${currency === "USD" ? "" : ` ${currency}`}`;
+  return `R ${numeric.toLocaleString("en-ZA", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
 }
 
 function zarMoney(value) {
@@ -587,11 +587,11 @@ function SnapshotTab({ data, lastRefresh, onTab, onSelect }) {
   return (
     <>
       <div className="metrics-strip">
-        <Metric label="Open P/L" value={money(overview.unrealized_pnl)} sub={<><span>{number(overview.unrealized_pnl, 2)} USD floating</span><span className="metric-subzar">{zarMoney(overview.unrealized_pnl_zar)}</span></>} tone={finite(overview.unrealized_pnl, 0) >= 0 ? "blue" : "red"} />
+        <Metric label="Open P/L" value={money(overview.unrealized_pnl)} sub={<><span>{number(overview.unrealized_pnl, 2)} ZAR floating</span><span className="metric-subzar">{zarMoney(overview.unrealized_pnl_zar)}</span></>} tone={finite(overview.unrealized_pnl, 0) >= 0 ? "blue" : "red"} />
         <Metric
           label="Equity"
           value={plainMoney(overview.net_liquidation || status.equity)}
-          sub={<><span>{status.account_id ? `Account ${status.account_id} · USD` : "MT5 account · USD"}</span><span className="metric-subrate">USD/ZAR {number(overview.usd_zar_rate, 4)}</span><span className="metric-subzar">{zarMoney(overview.equity_zar)}</span></>}
+          sub={<><span>{status.account_id ? `Account ${status.account_id} · ZAR` : "MT5 account · ZAR"}</span><span className="metric-subzar">{zarMoney(overview.equity_zar)}</span></>}
         />
         <Metric label="Free margin" value={plainMoney(overview.available_funds)} sub={overview.available_funds !== undefined ? "Available broker margin" : "Waiting for MT5"} tone="green" />
         <Metric label="Today's P/L" value={money(status.daily_pnl)} sub={`${status.daily_trade_count || 0} accepted entries`} tone={finite(status.daily_pnl, 0) >= 0 ? "blue" : "red"} />
@@ -621,7 +621,7 @@ function SnapshotTab({ data, lastRefresh, onTab, onSelect }) {
         <Panel title="Live account" detail="MT5 positions only" action={<button className="link-button" type="button" onClick={() => onTab("trade")}>View positions <ChevronRight size={16} /></button>}>
           <div className="account-grid">
             <DataPair label="Equity" value={plainMoney(overview.net_liquidation)} />
-            <DataPair label="Open P/L" value={money(overview.unrealized_pnl)} sub={<><span>{number(overview.unrealized_pnl, 2)} USD floating</span><span className="metric-subzar">{zarMoney(overview.unrealized_pnl_zar)}</span></>} tone={finite(overview.unrealized_pnl, 0) >= 0 ? "blue" : "red"} />
+            <DataPair label="Open P/L" value={money(overview.unrealized_pnl)} sub={<><span>{number(overview.unrealized_pnl, 2)} ZAR floating</span><span className="metric-subzar">{zarMoney(overview.unrealized_pnl_zar)}</span></>} tone={finite(overview.unrealized_pnl, 0) >= 0 ? "blue" : "red"} />
             <DataPair label="Open trades" value={status.live_position_count ?? data.positions.length} />
             <DataPair label="Free margin" value={plainMoney(overview.available_funds)} tone="green" />
           </div>
@@ -639,7 +639,7 @@ function SnapshotTab({ data, lastRefresh, onTab, onSelect }) {
       </div>
       <Panel title="How the system reads the market" detail="One clear story from data to execution">
         <div className="flow-strip">
-          {["MT5 data", "10-frame snapshot", "Forex / Indices / Metals engine", "Immutable proposal", "Operational execution"].map((item, index) => (
+          {["MT5 live feed", "H4 / M15 / M5 snapshot", "Asset-specific learning engine", "Immutable proposal", "Operational execution"].map((item, index) => (
             <React.Fragment key={item}><span>{item}</span>{index < 4 && <ChevronRight size={15} />}</React.Fragment>
           ))}
         </div>
@@ -738,17 +738,6 @@ function ChartTab({ symbol, setSymbol, timeframe, setTimeframe, data, chart }) {
   );
 }
 
-function ReplayTab({ symbol, setSymbol, timeframe, setTimeframe, data, chart }) {
-  const symbols = dashboardSymbols(data).map((row) => row.symbol).filter(Boolean);
-  return (
-    <Panel title="Trade replay" detail="Broker candles with recorded MT5 deals overlaid" action={<div className="control-row"><select value={symbol} onChange={(event) => setSymbol(event.target.value)}>{symbols.map((item) => <option key={item}>{item}</option>)}</select></div>}>
-      <div className="timeframe-row">{["M1", "M5", "M15", "H1"].map((item) => <button type="button" key={item} className={timeframe === item ? "active" : ""} onClick={() => setTimeframe(item)}>{item}</button>)}</div>
-      <div className="chart-meta"><span><StatusDot live /> Online - MT5 history</span><span>{chart.trades.length} recorded deal markers</span></div>
-      <div className="chart-frame"><TradeReplayChart sym={symbol} timeframe={timeframe} candles={chart.candles} trades={chart.trades} cursor={chart.candles.length} height={440} /></div>
-    </Panel>
-  );
-}
-
 function ScannerTab({ data, onSelect }) {
   const scannerRows = data.scanner?.current_signals || [];
   const grouped = ENGINE_ORDER.reduce((acc, engine) => {
@@ -769,7 +758,7 @@ function ScannerTab({ data, onSelect }) {
         <div className="engine-list">{ENGINE_ORDER.map((engine) => <EngineRow key={engine} engine={engine} rows={grouped[engine]} onSelect={onSelect} />)}</div>
       </Panel>
       <Panel title="Scan path" detail="The same explanation is used on desktop and mobile">
-        <div className="flow-strip">{["MT5 live feed", "Ten-frame snapshot", "Engine analysis", "Score and confidence", "Immutable proposal", "Broker checks", "MT5 order", "Position record"].map((item, index) => <React.Fragment key={item}><span>{item}</span>{index < 7 && <ChevronRight size={15} />}</React.Fragment>)}</div>
+        <div className="flow-strip">{["MT5 live feed", "H4 / M15 / M5 snapshot", "Asset-specific engine", "Setup decision", "Immutable proposal", "Broker checks", "MT5 order", "Position record"].map((item, index) => <React.Fragment key={item}><span>{item}</span>{index < 7 && <ChevronRight size={15} />}</React.Fragment>)}</div>
       </Panel>
       <Panel title="Current symbol decisions" detail={`${scannerRows.length} latest platform evaluations`}>
         <div className="scan-list">
@@ -777,17 +766,17 @@ function ScannerTab({ data, onSelect }) {
             const symbol = row.symbol || row.sym;
             const engine = engineFor(symbol, row.engine || row.asset_class);
             const direction = directionOf(row);
-            const score = scoreOf(row);
-            const scores = row.scores || row.score_breakdown?.timeframes || {};
+            const decision = String(row.status || "NO_TRADE").toUpperCase();
+            const progress = Array.isArray(row.scan_progress) ? row.scan_progress : [];
             return (
               <button type="button" className="scan-row" key={symbol} onClick={() => onSelect(symbol)}>
                 <span className={`engine-icon small ${engineClass(engine)}`}>{engineIcon(engine)}</span>
                 <span className="scan-symbol"><strong>{symbol}</strong><small>{engine} - {dateLabel(row.updated_at || row.created_at)}</small></span>
                 <span className={`direction ${direction.toLowerCase()}`}>{direction}</span>
-                <span className="scan-score"><strong>{score === null ? "--" : number(score, 1)}</strong><small>score</small></span>
+                <span className="scan-score"><strong>{decision}</strong><small>decision</small></span>
                 <span className="scan-reason">{reasonOf(row)}</span>
                 <ChevronRight size={16} />
-                <span className="scan-timeframes">{Object.entries(scores).slice(0, 10).map(([tf, value]) => <em key={tf} title={`${tf} score`}>{tf} {number(value, 0)}</em>)}</span>
+                <span className="scan-timeframes">{progress.map((stage) => <em key={stage.key} title={stage.label}>{stage.key} {stage.state}</em>)}</span>
               </button>
             );
           })}
@@ -798,177 +787,27 @@ function ScannerTab({ data, onSelect }) {
   );
 }
 
-function IntelligenceWatchPanel({ watch }) {
-  const findings = Array.isArray(watch?.findings) ? watch.findings : [];
-  const overall = watch?.overall || "UNKNOWN";
-  const tone = overall === "CRITICAL" ? "red" : overall === "WARNING" ? "amber" : overall === "OK" ? "green" : "muted";
-  return (
-    <Panel
-      title="Intelligence watch"
-      detail="Automated read-only findings - runs every 6 hours, never changes the live bot"
-      action={<span className={`source-badge${tone === "green" ? "" : " offline"}`}><StatusDot live={tone === "green"} /> {overall}</span>}
-    >
-      <div className="intel-data-list">
-        {findings.map((f, index) => (
-          <div className="intel-data-row compact" key={index}>
-            <span><strong className={f.severity === "critical" ? "red" : f.severity === "warning" ? "amber" : "muted"}>{String(f.severity || "info").toUpperCase()}</strong><small>{f.area}</small></span>
-            <span style={{ gridColumn: "span 3" }}>{f.summary}</span>
-          </div>
-        ))}
-        {!findings.length && <div className="empty-state compact"><CheckCircle2 size={18} /> No findings - everything checked out clean.</div>}
-      </div>
-      <div className="compact-note">Last run {watch?.generated_at ? age(watch.generated_at) : "never"} - config drift, risk-gate activity, trailing win rate vs the current engine build, and system health.</div>
-    </Panel>
-  );
-}
-
-function IntelligenceTab({ data }) {
-  const intelligence = data.intelligence || {};
-  const portfolio = data.portfolio || {};
-  const health = portfolio.portfolio_health || {};
-  const planning = intelligence.planning || {};
-  const learning = intelligence.learning || {};
-  const execution = intelligence.execution || {};
-  const validation = intelligence.validation || {};
-  const dataStatus = intelligence.data_status || {};
-  const plans = Array.isArray(planning.latest_by_symbol) ? planning.latest_by_symbol : [];
-  const adjustments = Array.isArray(learning.latest_adjustments) ? learning.latest_adjustments : [];
-  const learningEngines = Array.isArray(learning.engines) ? learning.engines : [];
-  const liveScans = Array.isArray(intelligence.live_scans) ? intelligence.live_scans : [];
-  const symbolResults = Array.isArray(intelligence.symbol_results) ? intelligence.symbol_results : [];
-  const decisionCounts = Array.isArray(execution.decision_counts) ? execution.decision_counts : [];
-  const decisionTotal = decisionCounts.reduce((total, row) => total + Number(row.count || 0), 0);
-  const lastDecision = execution.last_decision || {};
-  const feed = intelligence.live_market_feed || {};
-  const facts = [
-    { title: "Plans", value: String(plans.length), text: planning.status === "READY" ? plans.length + " current symbol plans." : "No current plans." },
-    { title: "Learning feedback", value: String(learning.outcomes_received ?? 0), text: (learning.mode || "Unavailable") + " - closed outcomes received." },
-    { title: "Decisions", value: String(decisionTotal), text: lastDecision.status ? "Latest: " + lastDecision.status + " " + (lastDecision.symbol || "") : "No decision recorded." },
-    { title: "MT5 feed", value: dataStatus.mt5_connected ? String(dataStatus.broker_symbol_specs ?? 0) + " specs" : "Offline", text: "Seen " + age(dataStatus.last_heartbeat) + "; " + (feed.status || feed.state || "status unavailable") + "." },
-  ];
-  return (
-    <>
-      <ControlRoom status={data.status} lastRefresh={new Date()} />
-      <div className="metrics-strip">
-        <Metric label="Portfolio health" value={health.label || "--"} sub={"Score " + (health.score ?? "--") + " - " + (health.risk_status || "waiting")} tone={health.risk_status === "NORMAL" ? "green" : "red"} />
-        <Metric label="Pending proposals" value={portfolio.proposals?.pending ?? "--"} sub="Persisted proposal count" />
-        <Metric label="Open positions" value={portfolio.exposure?.open_positions ?? "--"} sub="MT5 broker positions" />
-        <Metric label="Live scan rows" value={String(liveScans.length)} sub={"Last scan " + age(dataStatus.last_scan)} tone="blue" />
-      </div>
-      <IntelligenceWatchPanel watch={data.intelligenceWatch} />
-      <Panel title="Intelligence" detail="Live MT5 planning, learning and execution">
-        <div className="intel-grid">{facts.map((fact) => <div className="intel-card" key={fact.title}><span className="eyebrow">{fact.title}</span><strong>{fact.value}</strong><p>{fact.text}</p></div>)}</div>
-      </Panel>
-      <Panel title="Live scan evidence" detail={String(liveScans.length) + " symbols - four-frame scores (H4/H1/M15/M5)"}>
-        <div className="intel-live-list">
-          {liveScans.map((row) => {
-            const side = directionOf(row) === "SELL" ? "SELL" : "BUY";
-            const frameScores = row.scores?.[side] || row.score_breakdown?.timeframes?.[side] || {};
-            const frames = ["H4", "H1", "M15", "M5"];
-            return (
-              <div className="intel-live-row" key={row.proposal_id || row.symbol}>
-                <div className="intel-live-head"><strong>{row.symbol}</strong><small>{row.engine || row.asset_class || "engine"} - {row.status || "unreported"}</small></div>
-                <div className="intel-live-summary"><span className={"direction " + directionOf(row).toLowerCase()}>{directionOf(row)}</span><span>Score <strong>{number(row.final_score ?? row.score, 1)}</strong></span><span>Confidence <strong>{number(row.confidence, 1)}</strong></span><span>Probability <strong>{number(row.probability, 1)}</strong></span></div>
-                <div className="intel-score-strip">{frames.map((frame) => <span className="intel-score-chip" key={frame}><small>{frame}</small><strong>{number(frameScores[frame], 0)}</strong></span>)}</div>
-                <div className="intel-live-reason">{(Array.isArray(row.reasons) && row.reasons.length ? row.reasons : [row.reason || "No reason recorded"]).join(" - ")}</div>
-              </div>
-            );
-          })}
-          {!liveScans.length && <div className="empty-state compact"><Activity size={18} /> No live scan rows are present in the MT5 state database.</div>}
-        </div>
-      </Panel>
-      <Panel title="Current symbol plans" detail={plans.length + " current MT5 plans"}>
-        <div className="intel-data-list">
-          {plans.map((row) => (
-            <div className="intel-data-row" key={row.plan_id || row.symbol}>
-              <span><strong>{row.symbol}</strong><small>{row.asset_class || "engine"} - {row.status || "unreported"}</small></span>
-              <span><small>Target market</small>{row.target_market_day || "--"} {row.target_market_date || "--"}<small>{row.target_window_sast || "--"}</small></span>
-              <span><small>Direction / score</small>{row.direction || "WATCH"} {number(row.score, 1)}</span>
-              <span><small>Snapshot</small>{row.source_snapshot_at ? age(row.source_snapshot_at) : "--"}<small>{(row.timeframes || []).length || 0} frames</small></span>
-              <span><small>Next step</small>{planStatusLabel(row)}<small>{planReasonLabel(row)}</small></span>
-            </div>
-          ))}
-          {!plans.length && <div className="empty-state compact"><Database size={18} /> No persisted intelligence plans in the active MT5 database.</div>}
-        </div>
-      </Panel>
-      <Panel title="Active learning by engine" detail="Live threshold response to the latest closed MT5 outcomes">
-        <div className="engine-evidence">
-          {learningEngines.map((row) => <div className="evidence-row learning-row" key={row.engine}><strong>{row.engine}</strong><span>{row.outcomes_received} outcomes</span><span>{row.wins} wins / {row.losses} losses</span><span>Win rate {percent(row.win_rate)}</span><span>Avg R {number(row.average_result_r, 3)}</span><span>Threshold {number(row.threshold_current, 2)}</span><span className={Number(row.threshold_adjustment) > 0 ? "red" : "green"}>{Number(row.threshold_adjustment) > 0 ? "Tighter" : "No tighter adjustment"}</span></div>)}
-          {!learningEngines.length && <div className="empty-state compact"><Sparkles size={18} /> No active engine outcomes recorded.</div>}
-        </div>
-        <div className="story-box"><Sparkles size={17} /> {learning.story || "No learning feedback status is available."}</div>
-      </Panel>
-      <div className="grid-two">
-        <Panel title="Today's symbol outcomes" detail="Direct MT5 closed-deal results">
-        <div className="symbol-results">
-          {symbolResults.map((row) => <div className="symbol-result" key={row.symbol}>
-            <div className="symbol-result-name"><strong>{row.symbol}</strong><small>{row.trades || 0} closed deals</small></div>
-            <div className="symbol-result-metrics"><span className="blue">{row.wins || 0} W</span><span className="red">{row.losses || 0} L</span><span>{row.breakeven || 0} BE</span><span>{percent(row.win_rate)} win</span><span className={finite(row.pnl, 0) >= 0 ? "blue" : "red"}>{money(row.pnl)}</span></div>
-          </div>)}
-          {!symbolResults.length && <div className="empty-line">No closed MT5 deals recorded today.</div>}
-        </div>
-      </Panel>
-      <Panel title="Recent learning" detail="Recorded updates from closed and missed trades">
-          <div className="intel-data-list">
-            {adjustments.slice(0, 8).map((row, index) => (
-              <div className="intel-data-row compact" key={(row.symbol || "portfolio") + "-" + row.created_at + "-" + index}>
-                <span><strong>{row.symbol || "Portfolio"}</strong><small>{row.mode || "SHADOW_ONLY"} - {dateLabel(row.created_at)}</small></span>
-                <span>Score {number(row.score_before, 1)} &rarr; {number(row.score_after, 1)}</span>
-                <span className={row.applied ? "green" : "muted"}>{row.applied ? "Applied" : "Observed only"}</span>
-                <span className="muted">{row.reason || "No reason recorded"}</span>
-              </div>
-            ))}
-            {!adjustments.length && <div className="empty-state compact"><Sparkles size={18} /> No persisted learning adjustments are available.</div>}
-          </div>
-        </Panel>
-        <Panel title="Execution status" detail="Broker checks and order results">
-          <div className="decision-facts">
-            <DataPair label="Last decision" value={lastDecision.status || "--"} />
-            <DataPair label="Symbol" value={lastDecision.symbol || "--"} />
-            <DataPair label="Reason" value={lastDecision.reason || "--"} />
-            <DataPair label="Recorded" value={dateLabel(lastDecision.created_at)} />
-          </div>
-          <div className="story-box"><Zap size={17} /> {execution.story || "No execution narrative is stored for the current runtime."}</div>
-        </Panel>
-      </div>
-      <Panel title="Engine summary" detail="Current scores by engine">
-        <div className="engine-evidence">
-          {ENGINE_ORDER.map((engine) => {
-            const rows = liveScans.filter((row) => engineFor(row.symbol, row.engine || row.asset_class) === engine);
-            const scores = rows.map(scoreOf).filter((value) => value !== null);
-            return <div className="evidence-row" key={engine}><span className={"engine-icon small " + engineClass(engine)}>{engineIcon(engine)}</span><strong>{engine}</strong><span>{rows.length} current symbols</span><span>Average score {scores.length ? number(scores.reduce((a, b) => a + b, 0) / scores.length, 1) : "--"}</span><span className="muted">{rows.filter((row) => row.gate_ok).length} proposals</span></div>;
-          })}
-        </div>
-      </Panel>
-      <Panel title="Runtime checks" detail="Current platform status">
-        <div className="decision-facts">
-          <DataPair label="Walk-forward" value={validation.walk_forward?.status || "--"} />
-          <DataPair label="Walk-forward samples" value={validation.walk_forward?.sample_size ?? "--"} />
-          <DataPair label="Live drift" value={validation.drift?.status || "--"} />
-          <DataPair label="Deployment stage" value={execution.deployment?.stage || "--"} />
-          <DataPair label="Trade mode" value={execution.deployment?.trade_mode || "--"} />
-          <DataPair label="Last scan" value={dateLabel(dataStatus.last_scan)} />
-        </div>
-      </Panel>
-      <Panel title="Module roles" detail="What each MT5 module does">
-        <div className="boundary-list"><Boundary label="Market data" value="Synchronises MT5 ticks and candles" /><Boundary label="Learning engines" value="Create independent scored proposals" /><Boundary label="Execution" value="Checks broker conditions and submits orders" /><Boundary label="Trade management" value="Manages active positions only" /><Boundary label="Portfolio intelligence" value="Reports health only" /></div>
-      </Panel>
-    </>
-  );
-}
-
-function Boundary({ label, value }) {
-  return <div className="boundary-row"><span>{label}</span><strong>{value}</strong><CheckCircle2 size={17} /></div>;
-}
-
 function TradeTab({ data, onSelect }) {
   const positions = Array.isArray(data.positions) ? data.positions : [];
   const orders = Array.isArray(data.orders) ? data.orders : [];
+  const status = data.status || {};
+  const activity = data.activity || {};
+  const overview = activity.overview || {};
   return (
     <>
       <Panel title="Trade desk" detail="The MT5 runtime owns order submission. This dashboard is an accurate read-only view.">
         <div className="read-only-banner"><Briefcase size={19} /><span>Execution is runtime-owned. No manual dashboard action can create a broker order.</span></div>
       </Panel>
+      <div className="metrics-strip">
+        <Metric label="Open P/L" value={money(overview.unrealized_pnl)} sub={<><span>{number(overview.unrealized_pnl, 2)} ZAR floating</span><span className="metric-subzar">{zarMoney(overview.unrealized_pnl_zar)}</span></>} tone={finite(overview.unrealized_pnl, 0) >= 0 ? "blue" : "red"} />
+        <Metric
+          label="Equity"
+          value={plainMoney(overview.net_liquidation || status.equity)}
+          sub={<><span>{status.account_id ? `Account ${status.account_id} · ZAR` : "MT5 account · ZAR"}</span><span className="metric-subzar">{zarMoney(overview.equity_zar)}</span></>}
+        />
+        <Metric label="Free margin" value={plainMoney(overview.available_funds)} sub={overview.available_funds !== undefined ? "Available broker margin" : "Waiting for MT5"} tone="green" />
+        <Metric label="Today's P/L" value={money(status.daily_pnl)} sub={`${status.daily_trade_count || 0} accepted entries`} tone={finite(status.daily_pnl, 0) >= 0 ? "blue" : "red"} />
+      </div>
       <Panel title="Open MT5 positions" detail={`${positions.length} broker positions currently visible`}>
         <div className="trade-list">
           {positions.map((row) => {
@@ -988,24 +827,32 @@ function TradeTab({ data, onSelect }) {
   );
 }
 
+const PERIOD_LABELS = { baseline: "Baseline", today: "Today", week: "Week", month: "Month", all: "All" };
+// Real deposit confirmed 2026-07-21 via MT5 account export (balance=50000.00
+// exact). This is the actual funded starting capital for the 30-day
+// baseline tracking window, not an assumed/placeholder figure.
+const BASELINE_CAPITAL_ZAR = 50000;
+
 function HistoryTab({ data }) {
-  const [period, setPeriod] = useState("today");
+  const [period, setPeriod] = useState("baseline");
   const payload = useHistory(period);
   const historyLoaded = Boolean(payload);
   const deals = payload?.deals || [];
   const summary = payload?.summary || {};
   const realizedPnl = summary.pnl ?? summary.total_pnl ?? 0;
   const symbolStats = Array.isArray(summary.by_symbol) ? summary.by_symbol : [];
-  const periods = ["today", "week", "month", "all"];
+  const periods = ["baseline", "today", "week", "month", "all"];
+  const returnPct = (finite(realizedPnl, 0) / BASELINE_CAPITAL_ZAR) * 100;
   return (
     <>
-      <Panel title="MT5 trade history" detail="Closed broker deals including today, this week, month and all available history." action={<div className="period-row">{periods.map((item) => <button type="button" className={period === item ? "active" : ""} key={item} onClick={() => setPeriod(item)}>{item === "all" ? "All" : item[0].toUpperCase() + item.slice(1)}</button>)}</div>}>
+      <Panel title="MT5 trade history" detail="Baseline = 2026-07-20 onward, the first full day under the current fixed build. Full history is still available under All - nothing was deleted." action={<div className="period-row">{periods.map((item) => <button type="button" className={period === item ? "active" : ""} key={item} onClick={() => setPeriod(item)}>{PERIOD_LABELS[item]}</button>)}</div>}>
         <div className="history-summary">
           <DataPair label="Closed trades" value={historyLoaded ? (summary.total_trades ?? deals.length) : "--"} />
           <DataPair label="Win rate" value={historyLoaded ? percent(summary.win_rate) : "--"} sub={historyLoaded ? `${summary.decided_trades ?? 0} decided` : ""} tone="green" />
           <DataPair label="Wins" value={historyLoaded ? (summary.wins ?? 0) : "--"} tone="green" />
           <DataPair label="Losses" value={historyLoaded ? (summary.losses ?? 0) : "--"} tone="red" />
           <DataPair label="Realized P/L" value={historyLoaded ? money(realizedPnl) : "--"} tone={historyLoaded ? (finite(realizedPnl, 0) >= 0 ? "blue" : "red") : ""} />
+          {period === "baseline" && <DataPair label="Return on R50k" value={historyLoaded ? `${returnPct >= 0 ? "+" : ""}${returnPct.toFixed(2)}%` : "--"} sub="funded 2026-07-21" tone={historyLoaded ? (returnPct >= 0 ? "blue" : "red") : ""} />}
         </div>
       </Panel>
       <Panel title="Symbol results" detail="Closed MT5 deals by symbol">
@@ -1039,13 +886,11 @@ function App({ onLogout }) {
   const defaultSymbol = dashboardSymbols(data)[0]?.symbol || "EURUSD";
   const [symbol, setSymbol] = useState(defaultSymbol);
   const [timeframe, setTimeframe] = useState("M15");
-  const [replayTimeframe, setReplayTimeframe] = useState("M5");
   useEffect(() => {
     const available = dashboardSymbols(data);
     if (available.length && !available.some((row) => row.symbol === symbol)) setSymbol(available[0].symbol);
   }, [data.symbols, symbol]);
   const chart = useChart(symbol, timeframe, tab === "chart");
-  const replay = useChart(symbol, replayTimeframe, tab === "replay");
   const currentTab = TABS.find((item) => item.id === tab) || TABS[0];
   const selectSymbol = (next) => { if (next) setSymbol(next); };
 
@@ -1060,9 +905,7 @@ function App({ onLogout }) {
         {tab === "snapshot" && <SnapshotTab data={data} lastRefresh={lastRefresh} onTab={setTab} onSelect={selectSymbol} />}
         {tab === "market" && <MarketTab data={data} onSelect={(item) => { selectSymbol(item); setTab("chart"); }} />}
         {tab === "chart" && <ChartTab symbol={symbol} setSymbol={setSymbol} timeframe={timeframe} setTimeframe={setTimeframe} data={data} chart={chart} />}
-        {tab === "replay" && <ReplayTab symbol={symbol} setSymbol={setSymbol} timeframe={replayTimeframe} setTimeframe={setReplayTimeframe} data={data} chart={replay} />}
         {tab === "scanner" && <ScannerTab data={data} onSelect={selectSymbol} />}
-        {tab === "intelligence" && <IntelligenceTab data={data} />}
         {tab === "trade" && <TradeTab data={data} onSelect={(item) => { selectSymbol(item); setTab("chart"); }} />}
         {tab === "history" && <HistoryTab data={data} />}
       </main>

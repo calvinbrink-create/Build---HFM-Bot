@@ -122,7 +122,8 @@ class LearningFeedbackEngine:
         )
         if inserted:
             self.database.record_learning_metric(
-                self.ENGINE_BY_ASSET.get(asset_class, asset_class.upper()),
+                str(record.metrics.get("engine") or "").upper()
+                or self.ENGINE_BY_ASSET.get(asset_class, asset_class.upper()),
                 record.trade_id,
                 record.symbol,
                 asset_class,
@@ -344,6 +345,9 @@ class LearningFeedbackEngine:
         management_state = self.database.load_management_state(ticket) or {}
         last_metrics = management_state.get("last_metrics") or {}
         telemetry_complete = bool(management_state and last_metrics)
+        proposal_context = ((proposal or {}).get("payload") or {}).get("context") or {}
+        if not isinstance(proposal_context, dict):
+            proposal_context = {}
         metrics = self._metrics(
             {
                 "holding_time_seconds": holding_time,
@@ -357,6 +361,10 @@ class LearningFeedbackEngine:
                 "management_telemetry_status": "COMPLETE" if telemetry_complete else "PARTIAL_NO_STATE",
                 "management_actions": management_state.get("action_log", []),
                 "management_state_updated_at": management_state.get("last_seen_at"),
+                # The proposal row already stores the strategy engine; without
+                # this the outcome was filed by ASSET CLASS (INDICES/METALS)
+                # and SIMPLE's results credited the wrong engine entirely.
+                "engine": str((proposal or {}).get("engine") or "").upper() or None,
                 "risk_source": risk_source,
                 "broker_order_ticket": int(row.get("order_ticket") or 0),
                 "broker_deal_ticket": int(row.get("deal_ticket") or 0),
@@ -365,16 +373,31 @@ class LearningFeedbackEngine:
                 "volatility": last_metrics.get("volatility"),
                 "session": last_metrics.get("session", "unknown"),
                 "slippage": last_metrics.get("slippage"),
+                "model_version": proposal_context.get("model_version"),
+                "memory_shape": proposal_context.get("memory_shape"),
             },
             pnl,
         )
+        # management.py's _close() computes and stores the real reason
+        # (EARLY_EXIT_R, MAX_DURATION_EXCEEDED, GIVEBACK_GUARD_TRIGGERED,
+        # etc.) into management_state["last_action_reason"] every time it
+        # closes a position - this reconciler is the only code path that
+        # writes to trade_history, but was hardcoding "BROKER_HISTORY" and
+        # discarding that real reason entirely. Found live 2026-07-22: every
+        # one of the last 30 closed trades showed the generic fallback, with
+        # zero visibility into which exit rule actually fired, even though
+        # the underlying R-multiples clearly showed EARLY_EXIT_R (-0.75)
+        # and profit-take were the real cause. Only fall back to the
+        # generic label when a position closed with no recorded management
+        # action at all (e.g. closed before management_state existed).
+        exit_reason = str(management_state.get("last_action_reason") or "").strip() or "BROKER_HISTORY"
         self.record_closed_trade(
             row["proposal_id"],
             row["symbol"],
             row["side"],
             pnl,
             initial_risk,
-            "BROKER_HISTORY",
+            exit_reason,
             closed_at,
             row["asset_class"],
             proposal_id=row["proposal_id"],

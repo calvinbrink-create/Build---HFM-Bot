@@ -97,6 +97,7 @@ KeepPrivate=1
 
 [Charts]
 ProfileLast=${BRIDGE_PROFILE}
+MaxBarsInChart=5000000
 
 [Experts]
 AllowLiveTrading=1

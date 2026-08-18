@@ -32,11 +32,16 @@ REBUILT_SYSTEM_SINCE = "2026-07-19T14:34:00+00:00"
 # Known-good baselines this watch checks against. These are the values
 # approved 2026-07-19; a finding here means live config has drifted from
 # what was actually decided, not necessarily that the value is wrong.
+# MT5_MAX_DAILY_LOSS_USD raised 1000->5000 on 2026-07-20 (old cap was
+# silently blocking every symbol for hours with no dashboard indication).
+# MT5_MAX_PYRAMID_TRADES dropped 8->1 on 2026-07-21: pyramiding disabled
+# entirely (the 8-leg simultaneous burst-fire was judged too risky after a
+# real GER40Cash loss from all 8 legs moving together).
 EXPECTED = {
     "MT5_MAX_DAILY_TRADES": "100",
-    "MT5_MAX_DAILY_LOSS_USD": "1000",
+    "MT5_MAX_DAILY_LOSS_USD": "5000",
     "MT5_MAX_DAILY_TRADES_PER_SYMBOL": "10",
-    "MT5_MAX_PYRAMID_TRADES": "8",
+    "MT5_MAX_PYRAMID_TRADES": "1",
     "MT5_PYRAMID_SIZE_DECAY": "0.70",
     "MT5_RISK_PCT_XAUUSD": "0.30",
 }

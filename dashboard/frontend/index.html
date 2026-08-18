@@ -30,4 +30,19 @@
       if (document.visibilityState === "visible") setAppHeight();
     });
   })();
-</script></head><body><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>
+</script></head><body><div id="cipherfx-dash-switch">
+<style>
+#cipherfx-dash-switch{position:fixed;top:0;left:0;right:0;z-index:99999;display:flex;gap:6px;
+padding:6px 10px;background:#0b0f17;border-bottom:1px solid #1e2836;
+font:500 12px/1.25 system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
+box-sizing:border-box}
+#cipherfx-dash-switch .cfx-sw{display:flex;flex-direction:column;padding:5px 12px;border-radius:7px;
+color:#7d8da3;text-decoration:none;border:1px solid transparent;white-space:nowrap}
+#cipherfx-dash-switch .cfx-sw span{font-size:10px;opacity:.65;font-weight:400}
+#cipherfx-dash-switch .cfx-sw:hover{background:#141b26;color:#c9d6e6}
+#cipherfx-dash-switch .cfx-on{background:#16233a;color:#5ea9ff;border-color:#2b4a77}
+body{padding-top:46px !important}
+@media (max-width:640px){#cipherfx-dash-switch .cfx-sw span{display:none}body{padding-top:34px !important}}
+</style>
+<a href="/dashboard/mt5" class="cfx-sw cfx-on" title="HFM Demo 57498881"><b>Dashboard 1</b><span>HFM Demo 57498881</span></a><a href="/dashboard/mt5-zone" class="cfx-sw" title="Demo 168934059 - ZONE US30"><b>Dashboard 2</b><span>Demo 168934059 - ZONE US30</span></a><a href="/dashboard/mt5-live" class="cfx-sw" title="420489940 - dry run"><b>Live</b><span>420489940 - dry run</span></a>
+</div><div id="root"></div><script type="module" src="/src/main.jsx"></script></body></html>

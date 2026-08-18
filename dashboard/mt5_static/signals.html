@@ -1,0 +1,136 @@
+<!doctype html><html lang="en"><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Cipher FX — Shadow A/B</title>
+<style>
+:root{--bg:#0a0e13;--card:#111820;--line:#1e2937;--txt:#e6edf3;--dim:#7d8b99;
+--up:#26a69a;--dn:#ef5350;--entry:#f0b90b;--grid:#161f2b}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--txt);
+font:14px/1.45 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif}
+header{padding:12px 16px;border-bottom:1px solid var(--line);position:sticky;top:0;
+background:rgba(10,14,19,.96);backdrop-filter:blur(8px);z-index:9}
+h1{font-size:16px;margin:0;letter-spacing:.02em}
+.sub{font-size:11px;color:var(--dim);margin-top:3px}
+main{padding:14px;display:grid;gap:14px;max-width:1000px;margin:0 auto}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:14px}
+.card h2{font-size:12px;margin:0 0 10px;color:var(--dim);letter-spacing:.08em;
+text-transform:uppercase;font-weight:700}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:12px}
+@media(max-width:640px){.grid2{grid-template-columns:1fr}}
+.cfg{border:1px solid var(--line);border-radius:8px;padding:12px;background:#0d141c}
+.cfg .name{font-size:15px;font-weight:700}
+.cfg .desc{font-size:11px;color:var(--dim);margin-top:2px}
+.row{display:flex;justify-content:space-between;padding:6px 0;
+border-top:1px solid var(--grid);font-size:13px;margin-top:8px}
+.row span:first-child{color:var(--dim);font-size:11px;letter-spacing:.04em}
+.pos{color:var(--up)}.neg{color:var(--dn)}.mut{color:var(--dim)}
+table{width:100%;border-collapse:collapse;font-size:12px}
+th{text-align:left;color:var(--dim);font-size:10px;letter-spacing:.06em;
+padding:6px 8px;border-bottom:1px solid var(--line);font-weight:700}
+td{padding:7px 8px;border-bottom:1px solid var(--grid);white-space:nowrap}
+.tag{font-size:9px;padding:2px 6px;border-radius:3px;background:#1a2430;
+color:var(--dim);font-weight:700;letter-spacing:.05em}
+.tag.a{background:rgba(240,185,11,.15);color:var(--entry)}
+.tag.b{background:rgba(125,139,153,.18);color:#9fb0c0}
+.tag.win{background:rgba(38,166,154,.15);color:var(--up)}
+.tag.loss{background:rgba(239,83,80,.15);color:var(--dn)}
+.dot{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px}
+.dot.on{background:var(--up)}.dot.off{background:var(--dim)}
+.wrap{overflow-x:auto}
+.empty{color:var(--dim);font-size:12px;padding:10px 0}
+</style></head><body>
+<header>
+  <h1>Cipher FX — Shadow A/B</h1>
+  <div class="sub" id="sub">loading…</div>
+</header>
+<main>
+  <div class="card">
+    <h2>Live account</h2>
+    <div id="acct" class="empty">loading…</div>
+  </div>
+
+  <div class="card">
+    <h2>Configs</h2>
+    <div class="grid2" id="cfgs"></div>
+  </div>
+
+  <div class="card">
+    <h2>Open shadow positions</h2>
+    <div class="wrap"><table id="opent"><thead><tr>
+      <th>cfg</th><th>symbol</th><th>side</th><th>entry</th><th>now</th>
+      <th>stop</th><th>target</th><th>R</th><th>ZAR</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="empty" id="openempty"></div>
+  </div>
+
+  <div class="card">
+    <h2>Closed shadow trades</h2>
+    <div class="wrap"><table id="donet"><thead><tr>
+      <th>cfg</th><th>symbol</th><th>side</th><th>entry</th><th>exit</th>
+      <th>R</th><th>ZAR</th><th>result</th><th>window</th>
+    </tr></thead><tbody></tbody></table></div>
+    <div class="empty" id="doneempty"></div>
+  </div>
+</main>
+<script>
+const f=(n,d=2)=>Number(n).toLocaleString('en-ZA',{minimumFractionDigits:d,maximumFractionDigits:d});
+const sgn=v=>v>0?'pos':v<0?'neg':'mut';
+const pm =(v,d=2)=>(v>0?'+':'')+f(v,d);
+
+function cfgCard(k,c){
+  const t=(o)=>o.n?`${o.w}/${o.n} &nbsp; ${Math.round(100*o.w/o.n)}% &nbsp; <span class="${sgn(o.r)}">${pm(o.r)}R</span>`:'<span class="mut">none</span>';
+  const z=(o)=>o.n?`<span class="${sgn(o.zar)}">${pm(o.zar,0)}</span>`:'<span class="mut">—</span>';
+  return `<div class="cfg">
+    <div class="name"><span class="tag ${k.toLowerCase()}">${k}</span> &nbsp;${c.label}</div>
+    <div class="desc">${k==='A'?'mirrors the live bot':'alternative from the holdout'}</div>
+    <div class="row"><span>LIVE HOURS</span><span>${t(c.live)}</span></div>
+    <div class="row"><span>&nbsp;&nbsp;ZAR at live size</span><span>${z(c.live)}</span></div>
+    <div class="row"><span>EXTRA HOURS</span><span>${t(c.extra)}</span></div>
+    <div class="row"><span>&nbsp;&nbsp;ZAR at live size</span><span>${z(c.extra)}</span></div>
+    <div class="row"><span>TOTAL</span><span>${t(c.all)}</span></div>
+  </div>`;
+}
+
+async function tick(){
+  let d;
+  try{ d=await (await fetch('shadow.json?t='+Date.now())).json(); }
+  catch(e){ document.getElementById('sub').textContent='feed unreachable'; return; }
+  if(d.error){ document.getElementById('sub').textContent='feed error: '+d.error; return; }
+
+  document.getElementById('sub').innerHTML =
+    `<span class="dot ${d.live_window_open?'on':'off'}"></span>live bot ${d.live_window_open?'trading window OPEN':'outside hours'}`
+    + ` &nbsp;·&nbsp; <span class="dot ${d.shadow_window_open?'on':'off'}"></span>shadow ${d.shadow_window_open?'open':'closed'}`
+    + ` &nbsp;·&nbsp; ${d.sast} SAST`;
+
+  const a=d.account;
+  document.getElementById('acct').innerHTML =
+    `<div class="row" style="border:0;margin:0"><span>BALANCE</span><span>${f(a.balance)} ZAR</span></div>
+     <div class="row"><span>EQUITY</span><span>${f(a.equity)} ZAR</span></div>
+     <div class="row"><span>OPEN POSITIONS</span><span>${a.positions}</span></div>
+     <div class="row"><span>FLOATING</span><span class="${sgn(a.floating)}">${pm(a.floating,0)} ZAR</span></div>`;
+
+  document.getElementById('cfgs').innerHTML = cfgCard('A',d.cfg.A)+cfgCard('B',d.cfg.B);
+
+  const ob=document.querySelector('#opent tbody');
+  ob.innerHTML = d.open.map(o=>`<tr>
+    <td><span class="tag ${o.cfg.toLowerCase()}">${o.cfg}</span></td><td>${o.sym}</td>
+    <td class="${o.side==='BUY'?'pos':'neg'}">${o.side}</td>
+    <td>${f(o.entry)}</td><td>${f(o.price)}</td><td>${f(o.stop)}</td><td>${f(o.target)}</td>
+    <td class="${sgn(o.r)}">${pm(o.r)}R</td><td class="${sgn(o.zar)}">${pm(o.zar,0)}</td></tr>`).join('');
+  document.getElementById('opent').style.display = d.open.length?'':'none';
+  document.getElementById('openempty').textContent = d.open.length?'':'nothing open';
+
+  const db=document.querySelector('#donet tbody');
+  db.innerHTML = d.closed.map(t=>`<tr>
+    <td><span class="tag ${t.cfg.toLowerCase()}">${t.cfg}</span></td><td>${t.sym}</td>
+    <td class="${t.side==='BUY'?'pos':'neg'}">${t.side}</td>
+    <td>${f(t.entry)}</td><td>${f(t.exit||0)}</td>
+    <td class="${sgn(t.r)}">${pm(t.r,3)}R</td>
+    <td class="${sgn(t.zar)}">${pm(t.zar,0)}</td>
+    <td><span class="tag ${t.result==='WIN'?'win':'loss'}">${t.result}</span></td>
+    <td class="mut">${t.in_live_window?'live':'extra'}</td></tr>`).join('');
+  document.getElementById('donet').style.display = d.closed.length?'':'none';
+  document.getElementById('doneempty').textContent = d.closed.length?'':'no closed trades yet';
+}
+tick(); setInterval(tick,10000);
+</script></body></html>

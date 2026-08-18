@@ -94,7 +94,10 @@ class MT5RuntimeConfig:
         5000.0 if os.getenv("MT5_TRADE_MODE", "paper").strip().lower() == "live" else 10000.0,
     )
     max_trades_per_symbol: int = _env_int("MT5_MAX_DAILY_TRADES_PER_SYMBOL", 60)
-    max_pyramid_trades: int = _env_int("MT5_MAX_PYRAMID_TRADES", 10)
+    max_xauusd_losses_per_day: int = _env_int("MT5_MAX_XAUUSD_LOSSES_PER_DAY", 2)
+    # Prevent opposite-direction bursts on the same symbol after an entry.
+    symbol_reentry_cooldown_seconds: int = _env_int("MT5_SYMBOL_REENTRY_COOLDOWN_SECONDS", 900)
+    max_pyramid_trades: int = _env_int("MT5_MAX_PYRAMID_TRADES", 4)
     execution_mode: str = (os.getenv("MT5_EXECUTION_MODE", "bridge").strip().lower() or "bridge")
     state_file: Path = Path(os.getenv("MT5_STATE_FILE", "mt5_runtime_state.json"))
     symbols_file: Path = Path(os.getenv("MT5_SYMBOLS_FILE", "mt5_symbols.json"))
@@ -104,7 +107,11 @@ class MT5RuntimeConfig:
         "MT5_MARKETS",
         "forex,metals,energies,crypto,indices,stocks,etfs",
     )
-    forex_symbols: list[str] = field(default_factory=lambda: ["USDJPY", "USDCAD", "EURJPY"])
+    # Was ["USDJPY","USDCAD","EURJPY"]. mt5_symbols.json says "forex": [], but the
+    # loader below skips empty lists, so the default silently survived - leaving
+    # three symbols SIMPLE does not claim, which fell through the router to the
+    # old FADE/SDZONE/ZONE/ORB/CRT/FOREX stack. Removed 2026-08-14.
+    forex_symbols: list[str] = field(default_factory=list)
     metals_symbols: list[str] = field(default_factory=list)
     energies_symbols: list[str] = field(default_factory=list)
     crypto_symbols: list[str] = field(default_factory=list)
@@ -139,8 +146,15 @@ class MT5RuntimeConfig:
         self.max_position_pct = min(1.25, max(0.01, float(self.max_position_pct or 1.0)))
         self.max_open_trades = max(1, int(self.max_open_trades or 1))
         self.max_daily_trades = max(1, int(self.max_daily_trades or 1))
+        self.symbol_reentry_cooldown_seconds = max(0, int(self.symbol_reentry_cooldown_seconds or 0))
         self.poll_seconds = max(0.1, float(self.poll_seconds or 1.0))
-        self.scan_seconds = max(60, int(self.scan_seconds or 890))
+        # Was max(60, ...) - a hard floor that silently raised any configured
+        # scan interval to 60s. MT5_SCAN_SECONDS has read 30 since 2026-08-13
+        # and was never honoured. Measured 2026-08-14: 63.6s per symbol, while
+        # MT5_PROPOSAL_TTL_SECONDS=10 expired every setup after 10s - so the
+        # bot spent ~54s of every minute with nothing live and no way to
+        # re-derive. Floor lowered so the configured value is respected.
+        self.scan_seconds = max(1, int(self.scan_seconds or 890))
 
     def resolved_symbol(self, canonical: str) -> str:
         code = str(canonical or "").strip().upper()

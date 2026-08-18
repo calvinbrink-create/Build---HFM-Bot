@@ -1,73 +1,181 @@
 from __future__ import annotations
 
-import logging
+import math
 import os
 import threading
-import time
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
-from mt5_xm_config import MT5RuntimeConfig
 from mt5_xm_gateway import MT5Gateway
+from mt5_xm_config import MT5RuntimeConfig
 
-from .contracts import ExecutionResult, TradeProposal, SIDES
+from .contracts import ExecutionResult, TradeProposal
 from .database import DatabaseLayer
-from .market_sessions import market_window
-
-LOG = logging.getLogger("cipherfx.platform.execution")
-
-
-@dataclass(frozen=True)
-class ExecutionLimits:
-    risk_pct: float = 0.25
-    max_risk_pct: float = 1.0
-    max_spread_points: float = 0.0
-
-
-# proposal.asset_class uses the singular runtime.ASSET_GROUPS values
-# ("forex"/"index"/"metal"); the env vars configured in scalpbot-mt5.env use
-# the plural suffixes below. Symbol-specific overrides win over asset-class
-# overrides, which win over the flat default.
-_ASSET_CLASS_ENV_SUFFIX = {"forex": "FOREX", "index": "INDICES", "metal": "METALS"}
-
-# Instruments whose price action moves together closely enough that scoring
-# them independently every scan cycle produces simultaneous, correlated
-# entries rather than independent evidence. Canonical (pre-broker-suffix)
-# symbol names, matching MT5RuntimeConfig.canonical_symbol()/mt5_symbols.json.
-CORRELATION_GROUPS = (
-    frozenset({"EU50", "FRA40", "GER40", "UK100"}),
-    frozenset({"NAS100", "US30", "SPX500"}),
-    frozenset({"XAUUSD", "XAGUSD"}),
-)
 
 
 class ExecutionEngine:
-    """Operational validation and single-path broker submission only."""
+    """Operational execution for one immutable proposal.
+
+    A proposal is one trade idea. If configured, that idea is submitted as a
+    single tiered burst of up to 4 legs. This class never calculates market
+    direction, indicators, setup evidence, memory, score, confidence, or
+    probability. Every broker call goes through _send_leg().
+    """
 
     def __init__(self, gateway: MT5Gateway, config: MT5RuntimeConfig, database: DatabaseLayer):
         self.gateway = gateway
         self.config = config
         self.database = database
-        self.limits = ExecutionLimits(
-            max(0.01, float(os.getenv("MT5_RISK_PCT", "0.25"))),
-            max(0.01, float(os.getenv("MT5_MAX_RISK_PCT", "1.0"))),
-            max(0.0, float(os.getenv("MT5_MAX_SPREAD_POINTS", "0"))),
-        )
-        self._lock = threading.RLock()
         self._claimed: set[str] = set()
+        self._lock = threading.RLock()
 
-    def _canonical_symbol(self, symbol: str) -> str:
-        resolver = getattr(self.config, "canonical_symbol", None)
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
+
+    @staticmethod
+    def _symbol_key(value: str) -> str:
+        return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+    def _gold_daily_loss_reason(self, proposal: TradeProposal) -> str:
+        """Block new Gold entries after the configured SAST-day loss count."""
+        canonical = str(getattr(proposal, "symbol", "") or "").upper().replace(".", "_")
+        if canonical != "XAUUSD":
+            return ""
+        limit = max(0, int(getattr(self.config, "max_xauusd_losses_per_day", 2) or 0))
+        if limit <= 0:
+            return ""
+        losses = self.database.count_realized_losses_today_for_symbol("XAUUSD")
+        if losses >= limit:
+            return f"GOLD_DAILY_LOSS_LIMIT:{losses}/{limit}"
+        return ""
+
+    def _symbol_reentry_cooldown_reason(self, proposal: TradeProposal) -> str:
+        """Block a second burst on the same symbol for the configured window."""
+        seconds = max(
+            0,
+            int(getattr(self.config, "symbol_reentry_cooldown_seconds", 0) or 0),
+        )
+        if seconds <= 0:
+            return ""
+        latest = self.database.latest_filled_execution_at_for_symbol(proposal.symbol)
+        if latest is None:
+            return ""
+        remaining = seconds - int((self._now() - latest).total_seconds())
+        if remaining > 0:
+            return f"SYMBOL_COOLDOWN_ACTIVE:{max(1, remaining)}"
+        return ""
+
+    def _setup_duplicate_reason(self, proposal: TradeProposal) -> str:
+        """Suppress the same persisted setup identity within the cooldown window."""
+        context = proposal.context if isinstance(proposal.context, dict) else {}
+        fingerprint = str(context.get("setup_fingerprint") or "")
+        seconds = max(
+            0,
+            int(getattr(self.config, "symbol_reentry_cooldown_seconds", 0) or 0),
+        )
+        if not fingerprint or seconds <= 0:
+            return ""
+        since = self._now() - timedelta(seconds=seconds)
+        if self.database.setup_fingerprint_seen_recently(
+            proposal.symbol,
+            fingerprint,
+            since,
+            exclude_proposal_id=proposal.proposal_id,
+        ):
+            return "SETUP_DUPLICATE_SUPPRESSED"
+        return ""
+
+    def _result(
+        self,
+        proposal: TradeProposal,
+        status: str,
+        volume: float = 0.0,
+        reason: str = "",
+        *,
+        response: dict | None = None,
+        **kwargs,
+    ) -> ExecutionResult:
+        submitted_at = self._now()
+        filled_at = submitted_at if status in {"FILLED", "DRY_RUN"} else None
+        result = ExecutionResult(
+            proposal_id=proposal.proposal_id,
+            status=status,
+            symbol=proposal.symbol,
+            side=proposal.side,
+            volume=float(volume),
+            reason=reason,
+            submitted_at=submitted_at,
+            filled_at=filled_at,
+            initial_risk=float(proposal.risk_amount or 0.0),
+            order_ticket=int(kwargs.get("order_ticket", 0)),
+            deal_ticket=int(kwargs.get("deal_ticket", 0)),
+            position_ticket=int(kwargs.get("position_ticket", 0)),
+            fill_price=float(kwargs.get("fill_price", 0.0)),
+        )
+        self.database.save_execution_result(
+            proposal,
+            result,
+            response=response or {"reason": result.reason},
+        )
+        self.database.event(
+            "EXECUTION_RESULT",
+            {
+                "status": status,
+                "reason": reason,
+                "volume": volume,
+                "filled_at": filled_at.isoformat() if filled_at else "",
+                "legs": (response or {}).get("legs", []),
+            },
+            symbol=proposal.symbol,
+            proposal_id=proposal.proposal_id,
+        )
+        return result
+
+    @staticmethod
+    def _risk_percent(symbol: str, asset_class: str) -> float:
+        canonical = str(symbol or "").upper().replace(".", "_")
+        specific = f"MT5_RISK_PCT_{canonical}"
+        if os.getenv(specific) is not None:
+            raw = os.getenv(specific, "1.0")
+        else:
+            group = {
+                "metal": "METALS",
+                "index": "INDICES",
+                "forex": "FOREX",
+            }.get(str(asset_class or "").lower(), "")
+            raw = os.getenv(f"MT5_RISK_PCT_{group}", "1.0") if group else "1.0"
         try:
-            value = resolver(symbol) if callable(resolver) else symbol
-        except Exception:
-            value = symbol
-        return str(value or "").strip().upper()
+            return min(10.0, max(0.01, float(raw)))
+        except (TypeError, ValueError):
+            return 1.0
 
-    def _env_override(self, prefix: str, proposal: TradeProposal, default: float) -> float:
-        symbol = self._canonical_symbol(proposal.symbol)
-        asset_suffix = _ASSET_CLASS_ENV_SUFFIX.get(str(proposal.asset_class or "").lower(), "")
-        for key in (f"{prefix}_{symbol}", f"{prefix}_{asset_suffix}" if asset_suffix else ""):
+    @staticmethod
+    def _max_lot(symbol: str, asset_class: str) -> float:
+        canonical = str(symbol or "").upper().replace(".", "_")
+        specific = f"MT5_MAX_LOT_{canonical}"
+        if os.getenv(specific) is not None:
+            raw = os.getenv(specific, "0")
+        else:
+            group = {
+                "metal": "METALS",
+                "index": "INDICES",
+                "forex": "FOREX",
+            }.get(str(asset_class or "").lower(), "")
+            raw = os.getenv(f"MT5_MAX_LOT_{group}", "0") if group else "0"
+        try:
+            return max(0.0, float(raw))
+        except (TypeError, ValueError):
+            return 0.0
+
+    @staticmethod
+    def _legacy_env_override(prefix: str, proposal: TradeProposal, default: float) -> float:
+        symbol = str(getattr(proposal, "symbol", "") or "").upper().replace(".", "_")
+        suffix = {
+            "forex": "FOREX",
+            "index": "INDICES",
+            "metal": "METALS",
+        }.get(str(getattr(proposal, "asset_class", "") or "").lower(), "")
+        for key in (f"{prefix}_{symbol}", f"{prefix}_{suffix}" if suffix else ""):
             if not key:
                 continue
             raw = os.getenv(key)
@@ -77,56 +185,79 @@ class ExecutionEngine:
                 return float(raw)
             except (TypeError, ValueError):
                 continue
-        return default
+        return float(default)
 
-    def _volume(self, proposal: TradeProposal, entry, spec, account, pyramid_leg_index: int = 0):
+    def _sizing_loss_per_lot(self, proposal: TradeProposal, loss_per_lot: float) -> float:
+        """Size the position as if the stop were at least ATR-floored.
+
+        Risk-based sizing assumes the stop holds. When the structural stop lands
+        inside the noise - a 0.45pt stop on gold against a 0.34 spread - it
+        cannot hold, budget/loss_per_lot explodes, and the only remaining brake
+        is spec.volume_max. That is how one gold position reached 30 lots and
+        lost 12.9% of equity on a 1.667% budget.
+
+        The stop itself is left exactly where the engine placed it, so R:R,
+        targets and the ratchet are unaffected. Only the lot size is computed
+        against a realistic adverse distance. Risk per trade is NOT reduced -
+        this is what makes the configured risk percentage true.
+        """
+        try:
+            setup = proposal.context.get("setup", {}) if isinstance(proposal.context, dict) else {}
+            atr = abs(float(setup.get("atr", 0.0) or 0.0))
+            actual = abs(float(setup.get("stop_distance", 0.0) or 0.0))
+            floor_mult = float(os.getenv("MT5_SIZING_ATR_FLOOR", "1.0") or 1.0)
+        except (TypeError, ValueError, AttributeError):
+            return loss_per_lot
+        if atr <= 0.0 or actual <= 0.0 or floor_mult <= 0.0:
+            return loss_per_lot
+        sizing_distance = max(actual, atr * floor_mult)
+        if sizing_distance <= actual:
+            return loss_per_lot
+        return loss_per_lot * (sizing_distance / actual)
+
+    def _legacy_volume(self, proposal: TradeProposal, entry: float, spec, account) -> float:
+        """Preserve the pre-Gold sizing path for every non-XAUUSD symbol."""
         budget = max(0.0, float(getattr(account, "equity", 0.0) or 0.0))
-        risk_pct = self._env_override("MT5_RISK_PCT", proposal, self.limits.risk_pct)
-        max_risk_pct = self._env_override("MT5_MAX_RISK_PCT", proposal, self.limits.max_risk_pct)
+        risk_pct = self._legacy_env_override("MT5_RISK_PCT", proposal, 0.25)
+        max_risk_pct = self._legacy_env_override("MT5_MAX_RISK_PCT", proposal, 1.0)
         budget *= min(risk_pct, max_risk_pct) / 100.0
-        # Pyramid legs scale down geometrically: leg 1 (index 0) gets full
-        # size, leg 2 gets size*decay, leg 3 gets size*decay^2, etc. Without
-        # this every add-on leg risked the same dollars as the first entry,
-        # so an 8-leg pyramid could compound to 8x the intended risk on one
-        # symbol. decay=1.0 (env override) restores the old flat behavior.
-        if pyramid_leg_index > 0:
-            decay = max(0.05, min(1.0, self._env_override("MT5_PYRAMID_SIZE_DECAY", proposal, 0.70)))
-            budget *= decay ** pyramid_leg_index
-        # capital_cap_usd/max_position_pct are an absolute ceiling on a single
-        # position's risk budget, independent of the equity-based sizing
-        # above - they don't scale up just because equity grows.
         capital_cap = max(0.0, float(getattr(self.config, "capital_cap_usd", 0.0) or 0.0))
-        default_position_pct = float(getattr(self.config, "max_position_pct", 1.0) or 1.0)
-        position_pct = max(0.0, self._env_override("MT5_MAX_POSITION_PCT", proposal, default_position_pct))
-        if capital_cap > 0:
+        position_pct = max(
+            0.0,
+            self._legacy_env_override(
+                "MT5_MAX_POSITION_PCT",
+                proposal,
+                float(getattr(self.config, "max_position_pct", 1.0) or 1.0),
+            ),
+        )
+        if capital_cap > 0.0:
             budget = min(budget, capital_cap * position_pct)
-        if budget <= 0:
-            return 0.0, 0.0, 0.0
-        loss_per_lot = abs(float(self.gateway.order_calc_profit(
-            proposal.symbol, proposal.side, 1.0, entry, proposal.stop_loss
-        )))
-        if loss_per_lot <= 0:
-            return 0.0, 0.0, 0.0
+        if budget <= 0.0:
+            return 0.0
+        try:
+            loss_per_lot = abs(float(self.gateway.order_calc_profit(
+                proposal.symbol, proposal.side, 1.0, entry, proposal.stop_loss
+            )))
+        except Exception:
+            return 0.0
+        if loss_per_lot <= 0.0:
+            return 0.0
+        loss_per_lot = self._sizing_loss_per_lot(proposal, loss_per_lot)
         volume = self.gateway.normalize_volume(
             spec,
-            min(float(spec.volume_max), max(float(spec.volume_min), budget / loss_per_lot)),
+            min(
+                float(spec.volume_max),
+                max(float(spec.volume_min), budget / loss_per_lot),
+            ),
         )
-        initial_risk = abs(float(self.gateway.order_calc_profit(
-            proposal.symbol, proposal.side, volume, entry, proposal.stop_loss
-        ))) if volume > 0 else 0.0
         margin = float(self.gateway.order_calc_margin(
             proposal.symbol, proposal.side, volume, entry
         )) if volume > 0 else 0.0
-
-        # Fit the already risk-sized request to current broker free margin.
-        # This changes only volume; it never bypasses the broker margin check
-        # and never changes the immutable proposal geometry.
         free_margin = max(0.0, float(getattr(account, "free_margin", 0.0) or 0.0))
-        if volume > 0 and free_margin > 0.0 and margin > free_margin:
+        if volume > 0.0 and free_margin > 0.0 and margin > free_margin:
             low = 0.0
             high = float(volume)
             best_volume = 0.0
-            best_margin = 0.0
             for _ in range(20):
                 candidate = self.gateway.normalize_volume(spec, (low + high) / 2.0)
                 if candidate <= low or candidate <= 0.0:
@@ -136,426 +267,326 @@ class ExecutionEngine:
                 ))
                 if candidate_margin <= free_margin:
                     best_volume = candidate
-                    best_margin = candidate_margin
                     low = candidate
                 else:
                     high = candidate
-            if best_volume > 0.0:
-                volume = best_volume
-                margin = best_margin
-            else:
-                volume = 0.0
-            initial_risk = abs(float(self.gateway.order_calc_profit(
-                proposal.symbol, proposal.side, volume, entry, proposal.stop_loss
-            ))) if volume > 0 else 0.0
-        return volume, margin, initial_risk
+            volume = best_volume
+        return float(volume)
 
-    def _loss_cooldown_reason(self, proposal: TradeProposal) -> str:
-        seconds = max(0, int(getattr(self.config, "loss_cooldown_seconds", 0) or 0))
-        if seconds <= 0:
-            return ""
-        engine = str(proposal.context.get("engine", proposal.strategy_name) or "").upper()
-        latest = self.database.latest_loss_for(self._canonical_symbol(proposal.symbol), engine)
-        if not latest:
-            return ""
+    def _volume(self, proposal: TradeProposal, entry: float, spec, account) -> float:
+        canonical = str(getattr(proposal, "symbol", "") or "").upper().replace(".", "_")
+        if canonical != "XAUUSD":
+            return self._legacy_volume(proposal, entry, spec, account)
+
+        balance = float(getattr(account, "balance", 0.0) or 0.0)
+        if balance <= 0.0:
+            balance = float(getattr(account, "equity", 0.0) or 0.0)
+        risk_percent = self._risk_percent(proposal.symbol, proposal.asset_class)
+        risk_budget = balance * risk_percent / 100.0
         try:
-            closed_at = datetime.fromisoformat(str(latest["closed_at"]))
-            if closed_at.tzinfo is None:
-                closed_at = closed_at.replace(tzinfo=timezone.utc)
+            loss_per_lot = abs(
+                float(
+                    self.gateway.order_calc_profit(
+                        spec.symbol,
+                        proposal.side,
+                        1.0,
+                        float(entry),
+                        float(proposal.stop_loss),
+                    )
+                )
+            )
+        except Exception:
+            return 0.0
+        if risk_budget <= 0.0 or loss_per_lot <= 0.0:
+            return 0.0
+        loss_per_lot = self._sizing_loss_per_lot(proposal, loss_per_lot)
+        volume_by_risk = risk_budget / loss_per_lot
+        free_margin = float(getattr(account, "free_margin", 0.0) or 0.0)
+        leverage = max(1.0, float(getattr(account, "leverage", 1) or 1))
+        contract = max(0.0000001, float(getattr(spec, "contract_size", 0.0) or 0.0))
+        usage = float(os.getenv("MT5_MARGIN_USAGE_PERCENT", "100") or 100.0)
+        usage = min(100.0, max(1.0, usage))
+        notional_per_lot = max(entry * contract, 0.0000001)
+        volume_by_margin = free_margin * (usage / 100.0) * leverage / notional_per_lot
+        max_lot = self._max_lot(proposal.symbol, proposal.asset_class)
+        caps = [
+            volume_by_risk,
+            volume_by_margin,
+            float(getattr(spec, "volume_max", volume_by_risk) or volume_by_risk),
+        ]
+        if max_lot > 0.0:
+            caps.append(max_lot)
+        requested = min(caps)
+        return float(self.gateway.normalize_volume(spec, requested))
+
+    @staticmethod
+    def _leg_count(config) -> int:
+        # The production env sets this to one to prevent bursts. Keep the
+        # existing config contract for isolated tests and controlled overrides.
+        raw = os.getenv("MT5_MAX_PYRAMID_TRADES")
+        configured = raw if raw is not None else getattr(config, "max_pyramid_trades", 4)
+        try:
+            return max(1, min(4, int(float(configured))))
+        except (TypeError, ValueError):
+            return 4
+
+    @staticmethod
+    def _entry_drift_reason(proposal: TradeProposal, live_entry: float) -> str:
+        setup = proposal.context.get("setup", {}) if isinstance(proposal.context, dict) else {}
+        try:
+            stop_distance = abs(float(setup.get("stop_distance", 0.0) or 0.0))
+            fraction = float(os.getenv("MT5_MAX_ENTRY_DRIFT_STOP_FRACTION", "0.10") or 0.10)
+            fraction = min(1.0, max(0.01, fraction))
+            proposed = float(proposal.entry_price)
+            live = float(live_entry)
         except (TypeError, ValueError):
             return ""
-        remaining = seconds - int((datetime.now(timezone.utc) - closed_at).total_seconds())
-        return f"LOSS_COOLDOWN_ACTIVE:{max(1, remaining)}" if remaining > 0 else ""
-
-    def _win_cooldown_reason(self, proposal: TradeProposal) -> str:
-        # Patience gate: don't let a fresh proposal re-enter the same symbol
-        # immediately after it just took profit there. A win above the "big
-        # win" threshold gets a longer cooldown - chasing a move that already
-        # paid out is exactly the pattern that gives the profit back.
-        engine = str(proposal.context.get("engine", proposal.strategy_name) or "").upper()
-        latest = self.database.latest_win_for(self._canonical_symbol(proposal.symbol), engine)
-        if not latest:
+        if stop_distance <= 0.0 or proposed <= 0.0 or live <= 0.0:
             return ""
-        try:
-            closed_at = datetime.fromisoformat(str(latest["closed_at"]))
-            if closed_at.tzinfo is None:
-                closed_at = closed_at.replace(tzinfo=timezone.utc)
-        except (TypeError, ValueError):
-            return ""
-        base_seconds = max(0, int(os.getenv("MT5_WIN_COOLDOWN_SECONDS", "300")))
-        big_win_usd = max(0.0, float(os.getenv("MT5_BIG_WIN_COOLDOWN_USD", "50")))
-        big_win_seconds = max(0, int(os.getenv("MT5_BIG_WIN_COOLDOWN_SECONDS", "900")))
-        realized = float(latest.get("realized_pnl") or 0.0)
-        is_big_win = realized >= big_win_usd
-        seconds = max(base_seconds, big_win_seconds) if is_big_win else base_seconds
-        if seconds <= 0:
-            return ""
-        remaining = seconds - int((datetime.now(timezone.utc) - closed_at).total_seconds())
-        if remaining <= 0:
-            return ""
-        label = "BIG_WIN_COOLDOWN_ACTIVE" if is_big_win else "WIN_COOLDOWN_ACTIVE"
-        return f"{label}:{max(1, remaining)}"
-
-    def _correlated_exposure_reason(self, proposal: TradeProposal, positions) -> str:
-        # The whole watchlist is scored against the same market snapshot
-        # every scan cycle (see runtime.py run_once), so correlated
-        # instruments (e.g. EU50/FRA40/GER40/UK100) routinely all pass
-        # threshold together and open within seconds of each other - that's
-        # one position's worth of real market exposure sized and risked
-        # three or four times over. Block a new entry if a correlated symbol
-        # already has an open position, unless explicitly disabled.
-        if str(os.getenv("MT5_CORRELATION_GATE_ENABLED", "1")).strip().lower() in {"0", "false", "no"}:
-            return ""
-        proposal_symbol = self._canonical_symbol(proposal.symbol)
-        group = next((g for g in CORRELATION_GROUPS if proposal_symbol in g), None)
-        if not group:
-            return ""
-        for position in positions:
-            other_symbol = self._canonical_symbol(position.symbol)
-            if other_symbol != proposal_symbol and other_symbol in group:
-                return f"CORRELATED_EXPOSURE_BLOCKED:{other_symbol}"
+        allowance = stop_distance * fraction
+        adverse = (live - proposed) if proposal.side == "BUY" else (proposed - live)
+        if adverse > allowance:
+            return (
+                f"ENTRY_PRICE_DRIFT:{proposal.side}:"
+                f"proposed={proposed:.8f}:live={live:.8f}:"
+                f"adverse={adverse:.8f}:allowance={allowance:.8f}"
+            )
         return ""
 
-    def _lock_prior_legs_to_breakeven(self, symbol: str, side: str, new_ticket: int) -> None:
-        # A pyramid add is only safe to treat as "scaling the same trade" if
-        # adding it doesn't leave the earlier leg(s) still exposed to their
-        # full original stop. Without this, each leg is a fully independent
-        # MT5 position (own SL, own management cycle) - one can hit its stop
-        # and lose while another wins, netting the "pyramid" to roughly
-        # breakeven instead of compounding one correct trade idea.
-        if str(os.getenv("MT5_PYRAMID_LOCK_PRIOR_LEGS_BREAKEVEN", "1")).strip().lower() in {"0", "false", "no"}:
-            return
-        canonical = self._canonical_symbol(symbol)
-        try:
-            positions = self.gateway.positions()
-        except Exception:
-            return
-        for position in positions:
-            if int(getattr(position, "ticket", 0) or 0) == int(new_ticket):
-                continue
-            if self._canonical_symbol(position.symbol) != canonical:
-                continue
-            if str(position.direction).upper() != side:
-                continue
-            if float(getattr(position, "profit", 0.0) or 0.0) <= 0.0:
-                continue
-            entry = float(position.price_open)
-            sl = float(position.sl)
-            improves = entry > sl if side == "BUY" else entry < sl
-            if not improves:
-                continue
-            # Exact-entry stops get whipsawed closed by ordinary price noise
-            # within minutes (confirmed live 2026-07-20). Add a small buffer.
-            buffer_points = max(0.0, float(os.getenv("MT5_BREAKEVEN_BUFFER_POINTS", "2")))
-            try:
-                buffer_price = buffer_points * float(self.gateway.symbol_info(position.symbol).point)
-            except Exception:
-                buffer_price = 0.0
-            entry = entry + buffer_price if side == "BUY" else entry - buffer_price
-            try:
-                self.gateway.modify_position(int(position.ticket), position.symbol, entry, float(position.tp))
-                self.database.event(
-                    "PYRAMID_PRIOR_LEG_BREAKEVEN_LOCKED",
-                    {"new_leg_ticket": int(new_ticket), "sl": entry},
-                    symbol=position.symbol,
-                )
-            except Exception as exc:
-                LOG.warning("breakeven lock failed for prior leg %s: %s", position.ticket, exc)
 
-    def _pyramid_cooldown_reason(self, same_direction) -> str:
-        # Profitable + under the leg cap isn't enough on its own to add
-        # another leg - with trades now able to run for hours (not minutes),
-        # nothing else stops a new leg firing every scan cycle (900s) for as
-        # long as the position stays green, stacking up to max_pyramid_trades
-        # full-size legs in a few hours. Require the most recent leg to have
-        # had real time to develop first.
-        if not same_direction:
-            return ""
-        pyramid_cooldown_seconds = max(0, int(os.getenv("MT5_PYRAMID_ADD_COOLDOWN_SECONDS", "1800")))
-        if pyramid_cooldown_seconds <= 0:
-            return ""
-        most_recent_open = max(
-            (getattr(position, "time", None) for position in same_direction if getattr(position, "time", None)),
-            default=None,
+    @staticmethod
+    def _effective_leg_count(total_volume: float, requested: int, spec) -> int:
+        step = float(getattr(spec, "volume_step", 0.01) or 0.01)
+        minimum = float(getattr(spec, "volume_min", step) or step)
+        step = max(step, 1e-12)
+        minimum_steps = max(1, int(math.ceil((minimum / step) - 1e-9)))
+        available_steps = max(0, int(math.floor((float(total_volume) / step) + 1e-9)))
+        supported = available_steps // minimum_steps
+        return max(1, min(int(requested), supported)) if supported else 0
+
+    @staticmethod
+    def _leg_volumes(total_volume: float, count: int, spec) -> list[float]:
+        count = max(1, int(count))
+        decay = float(os.getenv("MT5_PYRAMID_SIZE_DECAY", "0.70") or 0.70)
+        decay = min(1.0, max(0.05, decay))
+        weights = [decay ** index for index in range(count)]
+        weight_total = sum(weights)
+        step = float(getattr(spec, "volume_step", 0.01) or 0.01)
+        minimum = float(getattr(spec, "volume_min", step) or step)
+        step = max(step, 1e-12)
+        minimum_steps = max(1, int(math.ceil((minimum / step) - 1e-9)))
+        total_steps = max(0, int(math.floor((float(total_volume) / step) + 1e-9)))
+        if total_steps < count * minimum_steps:
+            raise ValueError("TOTAL_VOLUME_CANNOT_SUPPORT_REQUESTED_LEGS")
+
+        units = [minimum_steps] * count
+        remaining = total_steps - sum(units)
+        if remaining:
+            raw = [remaining * weight / weight_total for weight in weights]
+            extras = [int(math.floor(value)) for value in raw]
+            for index, extra in enumerate(extras):
+                units[index] += extra
+            left = remaining - sum(extras)
+            order = sorted(
+                range(count),
+                key=lambda index: raw[index] - extras[index],
+                reverse=True,
+            )
+            for index in order[:left]:
+                units[index] += 1
+        return [round(unit * step, 8) for unit in units]
+
+    def _send_leg(
+        self,
+        proposal: TradeProposal,
+        symbol: str,
+        volume: float,
+        leg_index: int,
+    ) -> dict:
+        comment = f"cipherfx:{proposal.proposal_id}:leg{leg_index:02d}"
+        resolved_symbol, fill_price, broker = self.gateway.place_market_order(
+            symbol,
+            proposal.side,
+            volume,
+            proposal.stop_loss,
+            proposal.take_profit,
+            comment,
         )
-        if most_recent_open is None:
-            return ""
-        open_time = most_recent_open
-        if open_time.tzinfo is None:
-            open_time = open_time.replace(tzinfo=timezone.utc)
-        elapsed = (datetime.now(timezone.utc) - open_time).total_seconds()
-        if elapsed >= pyramid_cooldown_seconds:
-            return ""
-        remaining = int(pyramid_cooldown_seconds - elapsed)
-        return f"PYRAMID_COOLDOWN_ACTIVE:{remaining}"
-
-    def _preflight(self, proposal: TradeProposal):
-        if proposal.side not in SIDES:
-            return False, "INVALID_SIDE", 0.0, 0.0
-        if datetime.now(timezone.utc) >= proposal.expires_at:
-            return False, "PROPOSAL_EXPIRED", 0.0, 0.0
-
-        window = market_window(proposal.symbol, proposal.asset_class)
-        if not window["open"]:
-            return False, f"MARKET_WINDOW_CLOSED:{window['market']}:{window['reason']}", 0.0, 0.0
-
-        cooldown_reason = self._loss_cooldown_reason(proposal)
-        if cooldown_reason:
-            return False, cooldown_reason, 0.0, 0.0
-        win_cooldown_reason = self._win_cooldown_reason(proposal)
-        if win_cooldown_reason:
-            return False, win_cooldown_reason, 0.0, 0.0
-
-        account = self.gateway.account_info()
-        if not getattr(account, "terminal_connected", True):
-            return False, "BROKER_DISCONNECTED", 0.0, 0.0
-        if not getattr(account, "trade_allowed", True) or not getattr(account, "account_trade_allowed", True):
-            return False, "TRADING_NOT_ALLOWED", 0.0, 0.0
-        if self.database.count_today() >= int(self.config.max_daily_trades):
-            return False, "MAX_DAILY_TRADES", 0.0, 0.0
-
-        daily_loss_limit = float(getattr(self.config, "daily_loss_limit_usd", 0.0) or 0.0)
-        if daily_loss_limit > 0 and self.database.realized_pnl_today() <= -daily_loss_limit:
-            return False, "DAILY_LOSS_LIMIT", 0.0, 0.0
-
-        positions = self.gateway.positions()
-        if len(positions) >= int(self.config.max_open_trades):
-            return False, "MAX_OPEN_TRADES", 0.0, 0.0
-        correlation_reason = self._correlated_exposure_reason(proposal, positions)
-        if correlation_reason:
-            return False, correlation_reason, 0.0, 0.0
-        proposal_symbol = self._canonical_symbol(proposal.symbol)
-
-        max_per_symbol = int(getattr(self.config, "max_trades_per_symbol", 0) or 0)
-        if max_per_symbol > 0 and self.database.count_today_for_symbol(proposal_symbol) >= max_per_symbol:
-            return False, "MAX_TRADES_PER_SYMBOL", 0.0, 0.0
-
-        same_direction = [
-            position
-            for position in positions
-            if self._canonical_symbol(position.symbol) == proposal_symbol
-            and str(position.direction).upper() == proposal.side
-        ]
-        if any(float(getattr(position, "profit", 0.0) or 0.0) <= 0.0 for position in same_direction):
-            return False, "PYRAMID_LOSS_BLOCKED", 0.0, 0.0
-        max_pyramid = int(getattr(self.config, "max_pyramid_trades", 0) or 0)
-        if max_pyramid > 0 and len(same_direction) >= max_pyramid:
-            return False, "MAX_PYRAMID_TRADES", 0.0, 0.0
-        pyramid_cooldown_reason = self._pyramid_cooldown_reason(same_direction)
-        if pyramid_cooldown_reason:
-            return False, pyramid_cooldown_reason, 0.0, 0.0
-
-        _, tick = self.gateway.symbol_tick(proposal.symbol)
-        entry = float(getattr(tick, "ask" if proposal.side == "BUY" else "bid", 0.0) or 0.0)
-        if entry <= 0:
-            return False, "INVALID_TICK", 0.0, 0.0
-
-        spec = self.gateway.symbol_info(proposal.symbol)
-        spread = (float(tick.ask) - float(tick.bid)) / max(float(spec.point), 1e-12)
-        if self.limits.max_spread_points and spread > self.limits.max_spread_points:
-            return False, "SPREAD_LIMIT", 0.0, 0.0
-
-        geometry = (
-            proposal.stop_loss < entry < proposal.take_profit
-            if proposal.side == "BUY"
-            else proposal.take_profit < entry < proposal.stop_loss
-        )
-        if not geometry:
-            return False, "INVALID_SL_TP_GEOMETRY", 0.0, 0.0
-
-        volume, margin, initial_risk = self._volume(proposal, entry, spec, account, len(same_direction))
-        free = float(getattr(account, "free_margin", 0.0) or 0.0)
-        if volume < float(spec.volume_min):
-            if free > 0.0 and margin > free:
-                return False, "INSUFFICIENT_MARGIN", 0.0, 0.0
-            return False, "MIN_VOLUME", 0.0, 0.0
-        # A non-positive free margin is already an operational broker stop.
-        # Do not send an impossible request and wait for MT5 to reject it.
-        if free <= 0.0 or margin > free:
-            return False, "INSUFFICIENT_MARGIN", 0.0, 0.0
-        return True, "PASS", volume, initial_risk
-
-    def _persist_result(self, proposal: TradeProposal, result: ExecutionResult, payload=None):
-        self.database.save_execution_result(proposal, result, response=payload)
+        retcode = int(getattr(broker, "retcode", 0) or 0)
+        deal_ticket = int(getattr(broker, "deal", 0) or 0)
+        return {
+            "leg": leg_index,
+            "symbol": resolved_symbol,
+            "volume": float(volume),
+            "retcode": retcode,
+            "order_ticket": int(getattr(broker, "order", 0) or 0),
+            "deal_ticket": deal_ticket,
+            "position_ticket": int(getattr(broker, "position", 0) or 0),
+            "fill_price": float(fill_price or 0.0),
+            "status": "FILLED" if deal_ticket > 0 and retcode in {10009, 10010} else "REJECTED",
+            "reason": str(getattr(broker, "comment", "") or f"MT5_RETCODE_{retcode}"),
+        }
 
     def submit(self, proposal: TradeProposal) -> ExecutionResult:
         with self._lock:
             if proposal.proposal_id in self._claimed or self.database.proposal_seen(proposal.proposal_id):
-                result = ExecutionResult(
-                    proposal.proposal_id,
+                return self._result(
+                    proposal,
                     "DUPLICATE_SUPPRESSED",
-                    proposal.symbol,
-                    proposal.side,
-                    0.0,
-                    reason="IDEMPOTENCY_KEY_ALREADY_USED",
+                    reason="PROPOSAL_ID_ALREADY_CLAIMED",
                 )
-                self.database.event(
-                    "DUPLICATE_SUPPRESSED",
-                    {"reason": result.reason},
-                    symbol=proposal.symbol,
-                    proposal_id=proposal.proposal_id,
-                )
-                return result
             self._claimed.add(proposal.proposal_id)
 
+        if self._now() >= proposal.expires_at:
+            return self._result(proposal, "EXECUTION_BLOCKED", reason="PROPOSAL_EXPIRED")
+
+        gold_loss_reason = self._gold_daily_loss_reason(proposal)
+        if gold_loss_reason:
+            return self._result(proposal, "EXECUTION_BLOCKED", reason=gold_loss_reason)
+
+        for control_reason in (
+            self._symbol_reentry_cooldown_reason(proposal),
+            self._setup_duplicate_reason(proposal),
+        ):
+            if control_reason:
+                return self._result(
+                    proposal,
+                    "EXECUTION_BLOCKED",
+                    reason=control_reason,
+                )
+
         try:
-            # Held for the whole preflight-through-submission critical section
-            # (not just the idempotency claim above) so a concurrent submit()
-            # can't read stale position/margin state before this one commits.
-            with self._lock:
-                try:
-                    ok, reason, volume, initial_risk = self._preflight(proposal)
-                except Exception as exc:
-                    reason = f"BROKER_ERROR:{type(exc).__name__}:{str(exc)[:180]}"
-                    result = ExecutionResult(
-                        proposal.proposal_id,
-                        "EXECUTION_BLOCKED",
-                        proposal.symbol,
-                        proposal.side,
-                        0.0,
-                        reason=reason,
-                    )
-                    self._persist_result(proposal, result, {"reason": reason})
-                    self.database.event(
-                        "EXECUTION_BLOCKED",
-                        {"reason": reason},
-                        symbol=proposal.symbol,
-                        proposal_id=proposal.proposal_id,
-                    )
-                    return result
+            account = self.gateway.account_info()
+            if not bool(getattr(account, "terminal_connected", True)):
+                return self._result(proposal, "EXECUTION_BLOCKED", reason="BROKER_DISCONNECTED")
+            if not bool(getattr(account, "trade_allowed", True)) or not bool(
+                getattr(account, "account_trade_allowed", True)
+            ):
+                return self._result(proposal, "EXECUTION_BLOCKED", reason="TRADING_NOT_ALLOWED")
 
-                if not ok:
-                    result = ExecutionResult(
-                        proposal.proposal_id,
-                        "EXECUTION_BLOCKED",
-                        proposal.symbol,
-                        proposal.side,
-                        0.0,
-                        reason=reason,
-                    )
-                    self._persist_result(proposal, result, {"reason": reason})
-                    self.database.event(
-                        "EXECUTION_BLOCKED",
-                        {"reason": reason},
-                        symbol=proposal.symbol,
-                        proposal_id=proposal.proposal_id,
-                    )
-                    return result
-
-                if self.config.dry_run or self.config.trade_mode == "paper":
-                    result = ExecutionResult(
-                        proposal.proposal_id,
-                        "DRY_RUN",
-                        proposal.symbol,
-                        proposal.side,
-                        volume,
-                        reason="PAPER_OR_DRY_RUN",
-                        initial_risk=initial_risk,
-                    )
-                    self._persist_result(proposal, result, {"reason": result.reason})
-                    self.database.event(
-                        "EXECUTION_DRY_RUN",
-                        {"volume": volume},
-                        symbol=proposal.symbol,
-                        proposal_id=proposal.proposal_id,
-                    )
-                    return result
-
-                submitted = datetime.now(timezone.utc)
-                resolved, price, broker = self.gateway.place_market_order(
-                    proposal.symbol,
-                    proposal.side,
-                    volume,
-                    proposal.stop_loss,
-                    proposal.take_profit,
-                    "cipherfx:" + proposal.proposal_id,
+            positions = list(self.gateway.positions() or [])
+            symbol_key = self._symbol_key(proposal.symbol)
+            same_symbol = [
+                pos for pos in positions
+                if self._symbol_key(getattr(pos, "symbol", "")) == symbol_key
+            ]
+            if same_symbol:
+                tickets = ",".join(str(getattr(pos, "ticket", "")) for pos in same_symbol[:5])
+                return self._result(
+                    proposal,
+                    "EXECUTION_BLOCKED",
+                    reason=f"SYMBOL_ALREADY_HAS_OPEN_POSITION:{proposal.symbol}:{tickets}",
                 )
-                retcode = int(getattr(broker, "retcode", 0) or 0)
-                order = int(getattr(broker, "order", 0) or 0)
-                deal = int(getattr(broker, "deal", 0) or 0)
-                position = int(getattr(broker, "position", 0) or 0)
-                comment = str(getattr(broker, "comment", "") or "").strip()
-                if retcode in (10009, 10010) and deal > 0:
-                    status = "FILLED"
-                    reason = comment or ("MT5_DONE" if retcode == 10009 else "MT5_DONE_PARTIAL")
-                elif retcode == 10008 and order > 0 and deal == 0:
-                    status = "REJECTED"
-                    reason = "BROKER_ORDER_PLACED_NOT_FILLED"
-                elif deal == 0:
-                    status = "REJECTED"
-                    reason = comment or f"BROKER_NO_DEAL_RETCODE_{retcode}"
-                else:
-                    status = "REJECTED"
-                    reason = comment or f"MT5_RETCODE_{retcode}"
-                result = ExecutionResult(
-                    proposal.proposal_id,
-                    status,
-                    resolved,
-                    proposal.side,
-                    volume,
-                    order_ticket=order,
-                    deal_ticket=deal,
-                    position_ticket=position,
-                    fill_price=float(price or 0.0),
-                    reason=reason,
-                    submitted_at=submitted,
-                    filled_at=datetime.now(timezone.utc) if status == "FILLED" else None,
-                    initial_risk=initial_risk,
+            max_open = max(1, int(getattr(self.config, "max_open_trades", 30)))
+            requested_levels = self._leg_count(self.config)
+            levels = requested_levels
+            if len(positions) + levels > max_open:
+                return self._result(proposal, "EXECUTION_BLOCKED", reason="MAX_OPEN_TRADES")
+
+            resolved, tick = self.gateway.symbol_tick(proposal.symbol)
+            entry = float(getattr(tick, "ask" if proposal.side == "BUY" else "bid", 0.0) or 0.0)
+            if entry <= 0.0:
+                return self._result(proposal, "EXECUTION_BLOCKED", reason="INVALID_LIVE_TICK")
+            drift_reason = self._entry_drift_reason(proposal, entry)
+            if drift_reason:
+                return self._result(proposal, "EXECUTION_BLOCKED", reason=drift_reason)
+
+            spec = self.gateway.symbol_info(resolved)
+            total_volume = self._volume(proposal, entry, spec, account)
+            levels = self._effective_leg_count(total_volume, requested_levels, spec)
+            if levels <= 0:
+                return self._result(
+                    proposal,
+                    "EXECUTION_BLOCKED",
+                    volume=total_volume,
+                    reason="BROKER_MIN_VOLUME_FOR_LEG_PLAN",
                 )
-                # The broker outcome above is already final. A database
-                # write failure from here on must never relabel a real fill
-                # as REJECTED - that would permanently hide a live, broker-
-                # managed position from reconciliation and learning while
-                # leaving the position itself open and untouched. Retry once
-                # (most failures here are a transient lock timeout), and if
-                # it still fails, log loudly for manual reconciliation but
-                # keep returning the true broker result, not a fabricated one.
-                persist_payload = {"retcode": retcode, "order": order, "deal": deal, "position": position, "comment": comment, "reason": reason}
-                try:
-                    self._persist_result(proposal, result, persist_payload)
-                    self.database.event(
-                        "ORDER_FILLED" if status == "FILLED" else "ORDER_REJECTED",
-                        persist_payload,
-                        symbol=resolved,
-                        proposal_id=proposal.proposal_id,
+            if total_volume < float(getattr(spec, "volume_min", 0.0) or 0.0):
+                return self._result(
+                    proposal,
+                    "EXECUTION_BLOCKED",
+                    volume=total_volume,
+                    reason="BROKER_MIN_VOLUME",
+                )
+
+            leg_volumes = self._leg_volumes(total_volume, levels, spec)
+            if bool(getattr(self.config, "dry_run", False)) or str(
+                getattr(self.config, "trade_mode", "")
+            ).lower() == "paper":
+                legs = [
+                    {
+                        "leg": index,
+                        "volume": volume,
+                        "status": "DRY_RUN",
+                        "reason": "PAPER_OR_DRY_RUN",
+                    }
+                    for index, volume in enumerate(leg_volumes, start=1)
+                ]
+                return self._result(
+                    proposal,
+                    "DRY_RUN",
+                    volume=sum(leg_volumes),
+                    reason="PAPER_OR_DRY_RUN",
+                    response={"legs": legs, "leg_count": levels},
+                )
+
+            legs: list[dict] = []
+            for leg_index, volume in enumerate(leg_volumes, start=1):
+                _, leg_tick = self.gateway.symbol_tick(resolved)
+                leg_entry = float(
+                    getattr(leg_tick, "ask" if proposal.side == "BUY" else "bid", 0.0) or 0.0
+                )
+                leg_drift_reason = self._entry_drift_reason(proposal, leg_entry)
+                if leg_drift_reason:
+                    legs.append(
+                        {
+                            "leg": leg_index,
+                            "symbol": resolved,
+                            "volume": float(volume),
+                            "status": "REJECTED",
+                            "reason": leg_drift_reason,
+                        }
                     )
-                except Exception as persist_exc:
-                    try:
-                        time.sleep(0.5)
-                        self._persist_result(proposal, result, persist_payload)
-                        self.database.event(
-                            "ORDER_FILLED" if status == "FILLED" else "ORDER_REJECTED",
-                            persist_payload,
-                            symbol=resolved,
-                            proposal_id=proposal.proposal_id,
-                        )
-                    except Exception as retry_exc:
-                        LOG.critical(
-                            "PERSIST_FAILED_AFTER_BROKER_RESULT proposal_id=%s symbol=%s status=%s "
-                            "order_ticket=%s deal_ticket=%s position_ticket=%s first_error=%s retry_error=%s",
-                            proposal.proposal_id, resolved, status, order, deal, position, persist_exc, retry_exc,
-                        )
-                if status == "FILLED" and position > 0:
-                    self._lock_prior_legs_to_breakeven(resolved, proposal.side, position)
-                return result
+                    break
+                leg = self._send_leg(proposal, resolved, volume, leg_index)
+                legs.append(leg)
+                if leg["status"] != "FILLED":
+                    break
+
+            filled = [leg for leg in legs if leg["status"] == "FILLED"]
+            first = filled[0] if filled else (legs[0] if legs else {})
+            if not filled:
+                return self._result(
+                    proposal,
+                    "REJECTED",
+                    volume=sum(float(leg["volume"]) for leg in legs),
+                    reason=first.get("reason", "MT5_ORDER_REJECTED"),
+                    response={"legs": legs, "leg_count": levels},
+                    order_ticket=first.get("order_ticket", 0),
+                    deal_ticket=first.get("deal_ticket", 0),
+                    position_ticket=first.get("position_ticket", 0),
+                    fill_price=first.get("fill_price", 0.0),
+                )
+
+            status_reason = (
+                "ALL_LEGS_FILLED"
+                if len(filled) == levels
+                else f"PARTIAL_BURST_{len(filled)}_OF_{levels}"
+            )
+            return self._result(
+                proposal,
+                "FILLED",
+                volume=sum(float(leg["volume"]) for leg in filled),
+                reason=status_reason,
+                response={"legs": legs, "leg_count": levels},
+                order_ticket=first.get("order_ticket", 0),
+                deal_ticket=first.get("deal_ticket", 0),
+                position_ticket=first.get("position_ticket", 0),
+                fill_price=first.get("fill_price", 0.0),
+            )
         except Exception as exc:
-            reason = f"BROKER_ERROR:{type(exc).__name__}:{str(exc)[:180]}"
-            result = ExecutionResult(
-                proposal.proposal_id,
-                "REJECTED",
-                proposal.symbol,
-                proposal.side,
-                0.0,
-                reason=reason,
+            return self._result(
+                proposal,
+                "EXECUTION_BLOCKED",
+                reason=f"BROKER_ERROR:{type(exc).__name__}:{str(exc)[:180]}",
             )
-            self._persist_result(proposal, result, {"reason": reason})
-            self.database.event(
-                "ORDER_REJECTED",
-                {"reason": reason},
-                symbol=proposal.symbol,
-                proposal_id=proposal.proposal_id,
-            )
-            return result
-        finally:
-            with self._lock:
-                self._claimed.discard(proposal.proposal_id)

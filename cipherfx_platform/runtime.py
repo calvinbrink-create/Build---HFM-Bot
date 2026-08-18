@@ -21,37 +21,28 @@ from .execution import ExecutionEngine
 from .feedback import LearningFeedbackEngine
 from .management import TradeManagementEngine
 from .market_data import MarketDataEngine, MarketDataError
-from .planning import PremarketPlanningEngine
 from portfolio_intelligence import PortfolioIntelligenceEngine
 
 LOG = logging.getLogger("cipherfx.platform")
 
 
 class ModularTradingRuntime:
-    """Authoritative orchestration of market snapshots, proposals, and operations."""
+    """One active route: live tick -> H4 -> M15 -> M5 -> proposal -> execution."""
 
     ASSET_GROUPS = {"forex": "forex", "indices": "index", "metals": "metal"}
-    LIFECYCLE_STATES = (
-        "IDLE", "SCANNING", "MARKET_DATA_VERIFIED", "ENGINE_ANALYSIS",
-        "PROPOSAL_CREATED", "RISK_VALIDATED", "BROKER_VALIDATED",
-        "ORDER_EXECUTED", "POSITION_MANAGED", "POSITION_CLOSED",
-        "DATABASE_UPDATED", "COOLDOWN", "NEXT_SCAN", "RECOVERY",
-    )
     LIFECYCLE_TRANSITIONS = {
         "IDLE": {"SCANNING", "RECOVERY"},
-        "SCANNING": {"MARKET_DATA_VERIFIED", "COOLDOWN", "RECOVERY"},
+        "SCANNING": {"MARKET_DATA_VERIFIED", "RECOVERY"},
         "MARKET_DATA_VERIFIED": {"ENGINE_ANALYSIS", "RECOVERY"},
-        "ENGINE_ANALYSIS": {"PROPOSAL_CREATED", "RISK_VALIDATED", "POSITION_MANAGED", "COOLDOWN", "RECOVERY"},
-        "PROPOSAL_CREATED": {"RISK_VALIDATED", "COOLDOWN", "RECOVERY"},
-        "RISK_VALIDATED": {"BROKER_VALIDATED", "COOLDOWN", "RECOVERY"},
-        "BROKER_VALIDATED": {"ORDER_EXECUTED", "POSITION_MANAGED", "DATABASE_UPDATED", "COOLDOWN", "RECOVERY"},
-        "ORDER_EXECUTED": {"POSITION_MANAGED", "DATABASE_UPDATED", "RECOVERY"},
-        "POSITION_MANAGED": {"POSITION_CLOSED", "DATABASE_UPDATED", "COOLDOWN", "RECOVERY"},
-        "POSITION_CLOSED": {"DATABASE_UPDATED", "COOLDOWN"},
-        "DATABASE_UPDATED": {"COOLDOWN", "NEXT_SCAN"},
+        "ENGINE_ANALYSIS": {"PROPOSAL_CREATED", "DATABASE_UPDATED", "RECOVERY"},
+        "PROPOSAL_CREATED": {"RISK_VALIDATED", "DATABASE_UPDATED", "RECOVERY"},
+        "RISK_VALIDATED": {"BROKER_VALIDATED", "DATABASE_UPDATED", "RECOVERY"},
+        "BROKER_VALIDATED": {"ORDER_EXECUTED", "DATABASE_UPDATED", "RECOVERY"},
+        "ORDER_EXECUTED": {"DATABASE_UPDATED", "RECOVERY"},
+        "DATABASE_UPDATED": {"COOLDOWN", "RECOVERY"},
         "COOLDOWN": {"NEXT_SCAN", "RECOVERY"},
-        "NEXT_SCAN": {"SCANNING", "IDLE", "RECOVERY"},
-        "RECOVERY": {"NEXT_SCAN", "IDLE"},
+        "NEXT_SCAN": {"IDLE", "SCANNING", "RECOVERY"},
+        "RECOVERY": {"IDLE", "NEXT_SCAN"},
     }
 
     def __init__(self, settings: ServiceSettings):
@@ -70,15 +61,7 @@ class ModularTradingRuntime:
         self.execution = ExecutionEngine(self.gateway, self.config, self.database)
         self.management = TradeManagementEngine(self.gateway, self.database)
         self.feedback = LearningFeedbackEngine(self.database, self.learning.record_outcome)
-        self.planning = PremarketPlanningEngine(
-            self.database,
-            self.learning,
-            self.config,
-            interval_seconds=float(os.getenv("MT5_PREMARKET_PLAN_INTERVAL_SECONDS", "300")),
-        )
         self.portfolio_intelligence = PortfolioIntelligenceEngine()
-        self._last_portfolio_event_at = 0.0
-        self._last_portfolio_event_signature = ""
         self.heartbeat_path = Path(
             os.getenv(
                 "MT5_HEARTBEAT_FILE",
@@ -88,7 +71,8 @@ class ModularTradingRuntime:
         self._stop = False
         self._last_market_feed_persist_at = 0.0
         self._last_db_checkpoint_at = 0.0
-        self._last_planning_at = 0.0
+        self._last_portfolio_event_at = 0.0
+        self._last_portfolio_event_signature = ""
         self._lifecycle_state = "IDLE"
 
     def _record_lifecycle(self, state: str, reason: str = "", **details) -> bool:
@@ -115,7 +99,8 @@ class ModularTradingRuntime:
             "state": state,
             "updated_at": datetime.now(timezone.utc).isoformat(),
             "pid": os.getpid(),
-            "route": "cipherfx_platform",
+            "route": "H4_M15_M5_SETUP",
+            "market_data_source": "websocket",
         }
         temporary = Path(str(self.heartbeat_path) + ".tmp")
         temporary.write_text(json.dumps(payload, sort_keys=True))
@@ -126,20 +111,13 @@ class ModularTradingRuntime:
         self.gateway.request_shutdown()
 
     def _wait_for_initial_feed(self) -> bool:
-        """Avoid consuming the first scan before the live WebSocket has a tick."""
-        timeout = max(
-            5.0,
-            min(120.0, float(os.getenv("MT5_STARTUP_HEALTH_GRACE_SECONDS", "90"))),
-        )
+        timeout = max(5.0, min(120.0, float(os.getenv("MT5_STARTUP_HEALTH_GRACE_SECONDS", "90"))))
         deadline = time.monotonic() + timeout
         last_status = {}
         while not self._stop and time.monotonic() < deadline:
             last_status = self.market_data.live_tick_status()
             if int(last_status.get("fresh_symbols", 0) or 0) > 0:
-                self.database.event(
-                    "MARKET_FEED_READY",
-                    {"fresh_symbols": last_status.get("fresh_symbols", 0)},
-                )
+                self.database.event("MARKET_FEED_READY", {"fresh_symbols": last_status.get("fresh_symbols", 0)})
                 return True
             time.sleep(0.2)
         self.database.event(
@@ -153,69 +131,128 @@ class ModularTradingRuntime:
         return False
 
     @staticmethod
-    def _payload(report: dict, proposal=None) -> dict:
-        payload = dict(report)
-        payload["proposal_id"] = proposal.proposal_id if proposal else ""
-        payload["proposal_side"] = proposal.side if proposal else ""
-        payload["confidence"] = proposal.confidence if proposal else 0.0
-        payload["probability"] = proposal.probability if proposal else 0.0
-        payload["proposal_reasoning"] = proposal.reasoning if proposal else ()
-        return payload
-
-    @staticmethod
     def _snapshot_id(snapshot) -> str:
         frame_times = "|".join(
             f"{name}:{frame.last.timestamp.isoformat() if frame.last else ''}"
             for name, frame in sorted(snapshot.frames.items())
         )
         material = "|".join(
-            [
+            (
                 snapshot.symbol,
                 snapshot.asset_class,
                 snapshot.tick.timestamp.isoformat(),
                 frame_times,
-            ]
+            )
         )
         return hashlib.sha256(material.encode()).hexdigest()[:32]
+
+    @staticmethod
+    def _decision_payload(report: dict, proposal=None) -> dict:
+        setup = dict(report.get("setup") or {})
+        return {
+            "engine": report.get("engine", "SETUP_ENGINE"),
+            "decision": report.get("decision", "NO_SETUP"),
+            "symbol": report.get("symbol", ""),
+            "asset_class": report.get("asset_class", ""),
+            "side": setup.get("side", "NO_TRADE"),
+            "setup_type": setup.get("setup_type", ""),
+            "entry_model": setup.get("entry_model", ""),
+            "h4_direction": setup.get("h4_direction", "NO_TRADE"),
+            "m15_aoi": bool(setup.get("m15_aoi", False)),
+            "m15_confirmation": bool(setup.get("m15_confirmation", False)),
+            "m15_retracement": bool(setup.get("m15_retracement", False)),
+            "m5_trigger": bool(setup.get("m5_trigger", False)),
+            "m5_trigger_type": setup.get("m5_trigger_type", "NONE"),
+            "memory": setup.get("memory", {}),
+            "reasons": setup.get("reasons", ()),
+            "proposal_id": proposal.proposal_id if proposal else "",
+        }
+
+    def _run_live_trigger(self, canonical: str) -> bool:
+        """Evaluate one changed WebSocket symbol without waiting for full scan."""
+        group = self.config.group_for_symbol(canonical)
+        asset = self.ASSET_GROUPS.get(group)
+        if not asset:
+            return False
+        try:
+            snapshot = self.market_data.cached_snapshot(canonical, asset)
+            proposal = self.learning.propose(snapshot)
+            setup = dict((proposal.context if proposal else {}).get("setup") or {})
+            chart = dict(setup.get("chart_setup") or {})
+            if proposal is None or chart.get("trigger_source") != "LIVE_TICK":
+                return False
+            if self.database.proposal_seen(proposal.proposal_id):
+                return False
+            self.database.save_proposal(proposal)
+            self.database.event(
+                "LIVE_TICK_PROPOSAL_CREATED",
+                {
+                    "proposal_id": proposal.proposal_id,
+                    "side": proposal.side,
+                    "entry": proposal.entry_price,
+                    "trigger_price": chart.get("trigger_price", proposal.entry_price),
+                    "trigger_age_seconds": chart.get("trigger_age_seconds"),
+                    "trigger_source": chart.get("trigger_source"),
+                },
+                symbol=canonical,
+                proposal_id=proposal.proposal_id,
+            )
+            result = self.execution.submit(proposal)
+            self.database.event(
+                "LIVE_TICK_EXECUTION",
+                {
+                    "status": result.status,
+                    "reason": result.reason,
+                    "volume": result.volume,
+                    "order_ticket": result.order_ticket,
+                    "deal_ticket": result.deal_ticket,
+                    "position_ticket": result.position_ticket,
+                },
+                symbol=canonical,
+                proposal_id=proposal.proposal_id,
+            )
+            return True
+        except MarketDataError:
+            return False
+        except Exception as exc:
+            LOG.exception("live tick trigger failed for %s", canonical)
+            self.database.event(
+                "LIVE_TICK_TRIGGER_ERROR",
+                {"error": f"{type(exc).__name__}:{str(exc)[:180]}"},
+                symbol=canonical,
+            )
+            return False
+
+    def _run_live_triggers(self) -> int:
+        triggered = 0
+        for symbol in self.market_data.drain_changed_symbols():
+            if self._run_live_trigger(symbol):
+                triggered += 1
+        return triggered
 
     def _expire_feedback(self) -> int:
         expired = self.database.expired_proposals()
         for row in expired:
-            self.feedback.record_expired_proposal(
+            self.learning.record_expired(
+                row["asset_class"],
                 row["proposal_id"],
                 row["symbol"],
-                row["side"],
-                row["asset_class"],
+                {"source": "proposal_expiry"},
+            )
+            self.database.update_proposal_state(row["proposal_id"], "EXPIRED")
+            self.database.event(
+                "PROPOSAL_EXPIRED",
+                {"reason": "proposal deadline elapsed"},
+                symbol=row["symbol"],
+                proposal_id=row["proposal_id"],
             )
         return len(expired)
 
-    def _position_engine(self, symbol: str) -> str:
-        """Attribute an open position from symbol metadata only."""
-        canonical = self.config.canonical_symbol(symbol)
-        group = self.config.group_for_symbol(canonical)
-        if group in {"forex", "indices", "metals"}:
-            return {"forex": "FOREX", "indices": "INDICES", "metals": "METALS"}[group]
-        try:
-            info = self.gateway.symbol_info(symbol)
-            text = " ".join(
-                str(value or "") for value in (
-                    getattr(info, "path", ""),
-                    getattr(info, "description", ""),
-                    symbol,
-                )
-            ).upper()
-        except Exception:
-            text = str(symbol or "").upper()
-        if any(token in text for token in ("METAL", "XAU", "XAG", "GOLD", "SILVER")):
-            return "METALS"
-        if any(token in text for token in ("FOREX", "FX", "CURRENCY")):
-            return "FOREX"
-        if any(token in text for token in ("INDEX", "INDICES", "CASH", "GER40", "UK100", "US30", "US100", "US500")):
-            return "INDICES"
-        return "UNATTRIBUTED"
+    def _position_engine(self, _symbol: str) -> str:
+        return "SETUP_ENGINE"
 
     def _publish_portfolio_intelligence(self) -> None:
-        """Publish portfolio facts without participating in any trade decision."""
+        """Publish portfolio facts only; this method has no trade authority."""
         try:
             account = self.gateway.account_info()
             account_payload = dict(vars(account)) if hasattr(account, "__dict__") else {}
@@ -235,7 +272,7 @@ class ModularTradingRuntime:
                         (self.database.position_baseline(position.ticket) or {}).get("initial_risk") or 0.0
                     ),
                 }
-                for position in self.gateway.positions()
+                for position in (self.gateway.positions() or [])
             ]
             orders = [
                 {
@@ -248,7 +285,7 @@ class ModularTradingRuntime:
                     "tp": order.tp,
                     "state": order.state,
                 }
-                for order in self.gateway.orders()
+                for order in (self.gateway.orders() or [])
             ]
             feed = self.market_data.live_tick_status()
             operational = {
@@ -275,24 +312,21 @@ class ModularTradingRuntime:
             self.database.status("portfolio_intelligence", snapshot)
             signature = json.dumps(
                 {
-                    "health": snapshot["portfolio_health"],
-                    "open_positions": snapshot["exposure"]["open_positions"],
-                    "pending_proposals": snapshot["proposals"]["pending"],
+                    "health": snapshot.get("portfolio_health"),
+                    "open_positions": snapshot.get("exposure", {}).get("open_positions", 0),
+                    "pending_proposals": snapshot.get("proposals", {}).get("pending", 0),
                 },
                 sort_keys=True,
             )
             now = time.monotonic()
-            if (
-                signature != self._last_portfolio_event_signature
-                or now - self._last_portfolio_event_at >= 30.0
-            ):
+            if signature != self._last_portfolio_event_signature or now - self._last_portfolio_event_at >= 30.0:
                 self.database.event(
                     "PORTFOLIO_INTELLIGENCE",
                     {
-                        "health": snapshot["portfolio_health"],
+                        "health": snapshot.get("portfolio_health"),
                         "risk": snapshot.get("risk", {}),
-                        "open_positions": snapshot["exposure"]["open_positions"],
-                        "pending_proposals": snapshot["proposals"]["pending"],
+                        "open_positions": snapshot.get("exposure", {}).get("open_positions", 0),
+                        "pending_proposals": snapshot.get("proposals", {}).get("pending", 0),
                     },
                 )
                 self._last_portfolio_event_signature = signature
@@ -302,64 +336,76 @@ class ModularTradingRuntime:
             self.database.status(
                 "portfolio_intelligence",
                 {
-                    "contract_version": "portfolio-intelligence-v1",
-                    "generated_at": datetime.now(timezone.utc).isoformat(),
                     "status": "UNAVAILABLE",
                     "reason": str(exc),
-                    "authority": {
-                        "informational_only": True,
-                        "trade_decision_authority": False,
-                    },
+                    "generated_at": datetime.now(timezone.utc).isoformat(),
+                    "authority": {"informational_only": True, "trade_decision_authority": False},
                 },
             )
 
     def run_once(self, *, perform_scan: bool = True) -> dict[str, int]:
         summary = {
             "symbols": 0,
+            "snapshots": 0,
             "proposals": 0,
             "filled": 0,
             "blocked": 0,
             "rejected": 0,
             "closed": 0,
             "expired": 0,
+            "live_triggers": 0,
         }
+        decisions: list[dict] = []
+
+        if not perform_scan:
+            summary["live_triggers"] = self._run_live_triggers()
+
         if perform_scan:
-            self._record_lifecycle("SCANNING", "configured scan interval elapsed")
+            self._record_lifecycle("SCANNING", "configured scan cycle")
             for canonical in self.config.all_symbols():
                 group = self.config.group_for_symbol(canonical)
                 asset = self.ASSET_GROUPS.get(group)
                 if not asset:
-                    self.database.event("SYMBOL_UNSUPPORTED_GROUP", {"group": group}, symbol=canonical)
+                    self.database.event(
+                        "SYMBOL_UNSUPPORTED_GROUP",
+                        {"group": group, "reason": "not in active setup universe"},
+                        symbol=canonical,
+                    )
                     continue
                 summary["symbols"] += 1
                 try:
                     snapshot = self.market_data.snapshot(canonical, asset)
+                    summary["snapshots"] += 1
                     self.database.save_snapshot(self._snapshot_id(snapshot), snapshot)
                     proposal = self.learning.propose(snapshot)
-                    payload = self._payload(self.learning.last_report, proposal)
-                    self.database.event("ENGINE_EVALUATED", payload, symbol=canonical)
-                    self.database.status(f"scan:{canonical}", payload)
+                    decision = self._decision_payload(self.learning.last_report, proposal)
+                    decisions.append(decision)
+                    self.database.event(
+                        "SETUP_DECISION",
+                        decision,
+                        symbol=canonical,
+                        proposal_id=proposal.proposal_id if proposal else "",
+                    )
                     if proposal is None:
-                        self.database.event(
-                            "NO_TRADE_PROPOSAL",
-                            {"reason": "ENGINE_THRESHOLD_OR_DIRECTION", "report": payload},
-                            symbol=canonical,
-                        )
                         continue
+
+                    # The proposal identity is stable for the active M5 setup.
+                    # Do not publish or submit the same setup again on every
+                    # fast scan; execution idempotency remains the final guard.
+                    if self.database.proposal_seen(proposal.proposal_id):
+                        continue
+
                     summary["proposals"] += 1
                     self.database.save_proposal(proposal)
                     self.database.event(
                         "TRADE_PROPOSAL_CREATED",
                         {
                             "proposal_id": proposal.proposal_id,
-                            "engine": proposal.context.get("engine", ""),
-                            "score": proposal.score,
-                            "confidence": proposal.confidence,
-                            "probability": proposal.probability,
                             "side": proposal.side,
                             "entry": proposal.entry_price,
                             "stop_loss": proposal.stop_loss,
                             "take_profit": proposal.take_profit,
+                            "setup_type": proposal.context.get("setup", {}).get("setup_type", ""),
                         },
                         symbol=canonical,
                         proposal_id=proposal.proposal_id,
@@ -371,60 +417,87 @@ class ModularTradingRuntime:
                         summary["blocked"] += 1
                     else:
                         summary["rejected"] += 1
+                    self.database.event(
+                        "EXECUTION_DECISION",
+                        {
+                            "status": result.status,
+                            "reason": result.reason,
+                            "volume": result.volume,
+                            "order_ticket": result.order_ticket,
+                            "deal_ticket": result.deal_ticket,
+                            "position_ticket": result.position_ticket,
+                        },
+                        symbol=canonical,
+                        proposal_id=proposal.proposal_id,
+                    )
                 except MarketDataError as exc:
-                    self.database.event("MARKET_DATA_REJECTED", {"reason": str(exc)}, symbol=canonical)
+                    decisions.append(
+                        {
+                            "symbol": canonical,
+                            "decision": "NO_SETUP",
+                            "reason": "MARKET_DATA_UNAVAILABLE",
+                            "detail": str(exc),
+                        }
+                    )
+                    self.database.event(
+                        "MARKET_DATA_REJECTED",
+                        {"reason": str(exc), "decision": "NO_SETUP"},
+                        symbol=canonical,
+                    )
                 except Exception as exc:
                     LOG.exception("symbol cycle failed for %s", canonical)
-                    self.database.event("RUNTIME_ERROR", {"error": str(exc)}, symbol=canonical)
-        if perform_scan:
-            self._record_lifecycle("MARKET_DATA_VERIFIED", "scan cycle completed", symbols=summary["symbols"])
-            self._record_lifecycle("ENGINE_ANALYSIS", "engine evaluation completed")
-            if summary["proposals"]:
-                self._record_lifecycle("PROPOSAL_CREATED", "proposal stage completed", proposals=summary["proposals"])
-                self._record_lifecycle("RISK_VALIDATED", "execution preflight stage entered")
-                self._record_lifecycle("BROKER_VALIDATED", "broker submission stage entered")
+                    decisions.append(
+                        {
+                            "symbol": canonical,
+                            "decision": "NO_SETUP",
+                            "reason": "RUNTIME_ERROR",
+                            "detail": f"{type(exc).__name__}:{str(exc)[:180]}",
+                        }
+                    )
+                    self.database.event(
+                        "RUNTIME_ERROR",
+                        {"error": str(exc), "decision": "NO_SETUP"},
+                        symbol=canonical,
+                    )
 
-        self.management.monitor()
-        summary["closed"] = self.feedback.reconcile_closed_trades(self.gateway)
+            self._record_lifecycle("MARKET_DATA_VERIFIED", "scan cycle complete", snapshots=summary["snapshots"])
+            self._record_lifecycle("ENGINE_ANALYSIS", "asset-specific learning engines evaluated all snapshots")
+            if summary["proposals"]:
+                self._record_lifecycle("PROPOSAL_CREATED", "immutable proposals created", proposals=summary["proposals"])
+                self._record_lifecycle("RISK_VALIDATED", "operational checks completed by execution")
+                self._record_lifecycle("BROKER_VALIDATED", "broker response recorded")
+                if summary["filled"]:
+                    self._record_lifecycle("ORDER_EXECUTED", "proposal accepted by MT5", filled=summary["filled"])
+
+        try:
+            self.management.monitor()
+        except Exception as exc:
+            LOG.exception("position management cycle failed")
+            self.database.event("POSITION_MANAGEMENT_ERROR", {"error": str(exc)})
+        try:
+            summary["closed"] = self.feedback.reconcile_closed_trades(self.gateway)
+        except Exception as exc:
+            LOG.exception("closed-trade reconciliation failed")
+            self.database.event("LEARNING_RECONCILIATION_ERROR", {"error": str(exc)})
         summary["expired"] = self._expire_feedback()
         self._publish_portfolio_intelligence()
-        now_monotonic = time.monotonic()
-        if now_monotonic - self._last_planning_at >= self.planning.interval_seconds:
-            try:
-                planning = self.planning.refresh()
-                self.database.status("planning", planning)
-                self.database.event(
-                    "PREMARKET_PLANS_REFRESHED",
-                    {
-                        "target_market_date": planning.get("target_market_date"),
-                        "symbols": planning.get("symbols", 0),
-                        "planned": planning.get("planned", 0),
-                        "watching": planning.get("watching", 0),
-                        "waiting_for_snapshot": planning.get("waiting_for_snapshot", 0),
-                    },
-                )
-            except Exception as exc:
-                LOG.exception("premarket planning refresh failed")
-                self.database.status(
-                    "planning",
-                    {
-                        "status": "ERROR",
-                        "source": "persisted_market_snapshots",
-                        "reason": str(exc),
-                        "planned_at": datetime.now(timezone.utc).isoformat(),
-                    },
-                )
-            finally:
-                self._last_planning_at = now_monotonic
-        if perform_scan and summary["filled"]:
-            self._record_lifecycle("ORDER_EXECUTED", "one or more orders filled", filled=summary["filled"])
+
         if perform_scan:
-            self._record_lifecycle("POSITION_MANAGED", "position manager cycle completed")
-            if summary["closed"]:
-                self._record_lifecycle("POSITION_CLOSED", "closed positions reconciled", closed=summary["closed"])
-            self._record_lifecycle("DATABASE_UPDATED", "cycle state persisted")
+            self.database.status(
+                "scan",
+                {
+                    "route": "H4_POI_5M_SWEEP_MSS_FVG_OB",
+                    "frames": ["H4", "M5"],
+                    "decision_authority": "LearningEngine",
+                    "score_logic": "NOT_USED",
+                    "decisions": decisions,
+                    "summary": summary,
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                },
+            )
+            self._record_lifecycle("DATABASE_UPDATED", "scan, execution, management and learning persisted")
             self._record_lifecycle("COOLDOWN", "cycle complete")
-            self._record_lifecycle("NEXT_SCAN", "awaiting configured scan interval")
+            self._record_lifecycle("NEXT_SCAN", "awaiting next live scan")
 
         self.database.status(
             "runtime",
@@ -432,11 +505,14 @@ class ModularTradingRuntime:
                 "last_cycle": datetime.now(timezone.utc).isoformat(),
                 "scan_performed": bool(perform_scan),
                 "scan_interval_seconds": int(self.config.scan_seconds),
+                "route": "H4_POI_5M_SWEEP_MSS_FVG_OB",
+                "market_data_source": "websocket",
                 **summary,
             },
         )
-        now_monotonic = time.monotonic()
-        if now_monotonic - self._last_market_feed_persist_at >= 0.5:
+
+        now = time.monotonic()
+        if now - self._last_market_feed_persist_at >= 0.5:
             self.database.status(
                 "market_feed",
                 {
@@ -448,11 +524,11 @@ class ModularTradingRuntime:
                     "last_transport_event_at": self.websocket.last_event_at,
                 },
             )
-            self._last_market_feed_persist_at = now_monotonic
-        if time.monotonic() - self._last_db_checkpoint_at >= 300.0:
+            self._last_market_feed_persist_at = now
+        if now - self._last_db_checkpoint_at >= 300.0:
             checkpoint = self.database.checkpoint()
             self.database.status("database_health", checkpoint)
-            self._last_db_checkpoint_at = time.monotonic()
+            self._last_db_checkpoint_at = now
         self._write_heartbeat("RUNNING")
         return summary
 
@@ -462,13 +538,13 @@ class ModularTradingRuntime:
         try:
             self.gateway.connect()
             self._wait_for_initial_feed()
-            self._write_heartbeat("RUNNING")
             self.database.status(
                 "service",
                 {
                     "state": "CONNECTED",
                     "mode": self.gateway.mode,
                     "market_data_source": "websocket",
+                    "route": "H4_POI_5M_SWEEP_MSS_FVG_OB",
                     "websocket_host": self.websocket.host,
                     "websocket_port": self.websocket.port,
                     "max_daily_trades": int(self.config.max_daily_trades),
@@ -497,7 +573,7 @@ class ModularTradingRuntime:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    parser = argparse.ArgumentParser(description="CipherFX modular platform")
+    parser = argparse.ArgumentParser(description="CipherFX active setup bot")
     parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args(argv)
     settings = load_settings()

@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import sqlite3
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 from pathlib import Path
 from typing import Any
 
@@ -220,6 +222,7 @@ class DatabaseLayer:
                 conn.execute("ALTER TABLE engine_performance ADD COLUMN metrics_json TEXT NOT NULL DEFAULT '{}'")
 
     def checkpoint(self) -> dict[str, int]:
+        deleted = self.retention_sweep()
         with self._lock, self._connect() as conn:
             row = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
         values = list(row or (0, 0, 0))
@@ -228,16 +231,20 @@ class DatabaseLayer:
             "log_pages": int(values[1] if len(values) > 1 else 0),
             "checkpointed_pages": int(values[2] if len(values) > 2 else 0),
         }
-        result.update({f"pruned_{table}": count for table, count in self.retention_sweep().items()})
+        result.update({f"pruned_{table}": count for table, count in deleted.items()})
         return result
 
-    def retention_sweep(self, days: int = 14) -> dict[str, int]:
+    def retention_sweep(self, days: int | None = None) -> dict[str, int]:
         """Bound the growth of high-frequency append-only telemetry tables.
 
         Only pure event/telemetry logs are pruned here - trade_history,
         learning_metrics, executions/orders/positions and proposals are
         permanent trading records and are never touched by this sweep.
         """
+        if days is None:
+            days = max(1, int(os.getenv("MT5_TELEMETRY_RETENTION_DAYS", "2")))
+        else:
+            days = max(1, int(days))
         cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
         deleted: dict[str, int] = {}
         with self._lock, self._connect() as conn:
@@ -745,6 +752,38 @@ class DatabaseLayer:
                 ),
             )
 
+    def prune_closed_positions(self, open_tickets: set[int], open_symbols: set[str]) -> None:
+        """Delete rows for positions the broker no longer reports as open.
+
+        save_position() is a pure upsert with no corresponding delete, so
+        without this the positions table only ever grows - closed positions
+        stay visible forever. Handles both the current schema (keyed by
+        position_ticket, safe with multiple simultaneous same-symbol
+        positions under hedging) and the legacy pre-Phase-3 schema (keyed by
+        symbol alone, one row per symbol) that this specific deployment's
+        database still uses.
+        """
+        with self._lock, self._connect() as conn:
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(positions)")}
+            if "position_ticket" in columns:
+                if open_tickets:
+                    placeholders = ",".join("?" for _ in open_tickets)
+                    conn.execute(
+                        f"DELETE FROM positions WHERE position_ticket NOT IN ({placeholders})",
+                        tuple(open_tickets),
+                    )
+                else:
+                    conn.execute("DELETE FROM positions")
+                return
+            if open_symbols:
+                placeholders = ",".join("?" for _ in open_symbols)
+                conn.execute(
+                    f"DELETE FROM positions WHERE sym NOT IN ({placeholders})",
+                    tuple(open_symbols),
+                )
+            else:
+                conn.execute("DELETE FROM positions")
+
     def open_filled_executions(self) -> list[dict[str, Any]]:
         with self._lock, self._connect() as conn:
             rows = conn.execute(
@@ -1135,6 +1174,120 @@ class DatabaseLayer:
             ).fetchone()
         return int(row[0] if row else 0)
 
+    def burst_results_today_for_symbol(self, symbol: str) -> tuple[int, int]:
+        """Net win/loss count for TODAY's closed bursts on this symbol.
+
+        Verified 2026-08-15 against the broker's own deal ledger: a
+        trade_history row's realized_pnl matches the broker's DEAL_ENTRY_OUT
+        profit exactly for the position it tracks, and every burst produces
+        exactly one trade_history row (checked across all 62 rows in history -
+        none had a second row sharing the same root proposal_id). No join or
+        grouping is needed; each row already IS one burst's tracked outcome.
+
+        NOTE: some pyramid legs beyond the first are recorded with
+        position_ticket=0 in the executions table and never independently
+        verified against a broker close - flagged for review, not resolved
+        here. This does not affect the figure used below, which is exactly
+        what trade_history already reports.
+
+        Returns (wins, losses): closed trades today, net positive vs net
+        non-positive.
+        """
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT realized_pnl FROM trade_history
+                WHERE closed_at LIKE ? AND UPPER(symbol)=?
+                """,
+                (datetime.now(timezone.utc).date().isoformat() + "%", str(symbol).upper()),
+            ).fetchall()
+        wins = sum(1 for (pnl,) in rows if float(pnl or 0.0) > 0)
+        losses = sum(1 for (pnl,) in rows if float(pnl or 0.0) <= 0)
+        return wins, losses
+
+    def count_realized_losses_today_for_symbol(self, symbol: str) -> int:
+        """Count closed losing trades in the current Africa/Johannesburg day."""
+        local_now = datetime.now(timezone.utc).astimezone(ZoneInfo("Africa/Johannesburg"))
+        local_start = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+        utc_start = local_start.astimezone(timezone.utc).isoformat()
+        utc_end = (local_start + timedelta(days=1)).astimezone(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*)
+                FROM trade_history
+                WHERE closed_at>=? AND closed_at<?
+                  AND UPPER(symbol)=?
+                  AND realized_pnl < 0
+                """,
+                (utc_start, utc_end, str(symbol).upper()),
+            ).fetchone()
+        return int(row[0] if row else 0)
+
+    def latest_filled_execution_at_for_symbol(self, symbol: str) -> datetime | None:
+        """Return the latest filled entry timestamp for a canonical symbol.
+
+        This is an operational re-entry control. It deliberately counts a
+        filled burst regardless of BUY or SELL, so a fresh opposite-direction
+        proposal cannot immediately follow the first burst.
+        """
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT created_at
+                FROM platform_executions
+                WHERE UPPER(symbol)=?
+                  AND status IN ('FILLED', 'DRY_RUN', 'CLOSED')
+                ORDER BY created_at DESC
+                LIMIT 1
+                """,
+                (str(symbol).upper(),),
+            ).fetchone()
+        if not row or not row[0]:
+            return None
+        try:
+            value = datetime.fromisoformat(str(row[0]))
+        except (TypeError, ValueError):
+            return None
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def setup_fingerprint_seen_recently(
+        self,
+        symbol: str,
+        fingerprint: str,
+        since: datetime,
+        *,
+        exclude_proposal_id: str = "",
+    ) -> bool:
+        """Find a repeated setup identity without recalculating strategy logic."""
+        if not fingerprint:
+            return False
+        cutoff = since.astimezone(timezone.utc).isoformat()
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                """
+                SELECT proposal_id,payload_json
+                FROM trade_proposals
+                WHERE UPPER(symbol)=? AND created_at>=?
+                ORDER BY created_at DESC
+                LIMIT 250
+                """,
+                (str(symbol).upper(), cutoff),
+            ).fetchall()
+        for proposal_id, payload_json in rows:
+            if str(proposal_id) == str(exclude_proposal_id):
+                continue
+            try:
+                payload = json.loads(payload_json or "{}")
+                context = payload.get("context") or {}
+            except (TypeError, ValueError, AttributeError):
+                continue
+            if str(context.get("setup_fingerprint") or "") == str(fingerprint):
+                return True
+        return False
+
     def realized_pnl_today(self) -> float:
         with self._lock, self._connect() as conn:
             row = conn.execute(
@@ -1146,3 +1299,15 @@ class DatabaseLayer:
                 (datetime.now(timezone.utc).date().isoformat() + "%",),
             ).fetchone()
         return float(row[0] if row else 0.0)
+
+    def todays_closed_trades(self) -> list[tuple[str, float]]:
+        # Raw (symbol, realized_pnl) rows for today, unfiltered by symbol -
+        # callers that need alias-aware symbol matching (e.g. SILVER vs
+        # XAGUSD) should filter in Python with their own canonicalizer,
+        # since UPPER(symbol)=? exact-match queries silently miss aliases.
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT symbol, realized_pnl FROM trade_history WHERE closed_at LIKE ?",
+                (datetime.now(timezone.utc).date().isoformat() + "%",),
+            ).fetchall()
+        return [(str(r[0]), float(r[1] or 0.0)) for r in rows]

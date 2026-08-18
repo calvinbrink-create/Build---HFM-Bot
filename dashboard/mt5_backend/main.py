@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import math
 import os
+import re
+import struct
 import sys
 import csv
 import json
+import importlib
 import time
 import sqlite3
 import subprocess
@@ -19,7 +22,7 @@ from zoneinfo import ZoneInfo
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
@@ -164,16 +167,21 @@ def _session_user(creds: HTTPAuthorizationCredentials = Depends(_bearer)):
 
 
 def _connected() -> bool:
-    # The modular runtime is authoritative for live connection state.
-    try:
-        service, _updated = _platform_status_payload("service")
-        state = str(service.get("state") or "").strip().upper()
-        if state:
-            return state == "CONNECTED"
-    except Exception:
-        pass
-    raw = db.read_status("mt5_connected")
-    return str(raw).lower() == "true" if isinstance(raw, str) else bool(raw)
+    """Is MT5 connected? MT5 answers this, not the bot.
+
+    The terminal writes terminal_connected into account.txt every export, and
+    the file's mtime proves the bridge is still running. The bot's
+    platform_status/mt5_connected row is its own belief about the world and
+    survives the terminal dying, so it must never be the answer here.
+    """
+    path = _bridge_dir() / "account.txt"
+    if _fresh_bridge_csv(path, max_age_seconds=180):
+        raw = _read_kv(path)
+        flag = str(raw.get("terminal_connected", "")).strip().lower()
+        if flag:
+            return flag not in {"0", "false", "no"}
+    # No fresh export from the terminal means the bridge is not delivering.
+    return False
 
 
 _INTELLIGENCE_TABLES = (
@@ -191,11 +199,24 @@ _INTELLIGENCE_TABLES = (
 )
 
 def _intelligence_sql(sql, params=()):
+    """Read an intelligence table, tolerating one that does not exist yet.
+
+    These tables are written by the intelligence/permission subsystems, which
+    are not running on this deployment - the state DB was rebuilt from empty on
+    2026-08-13 and nothing has recreated them since. A missing table was
+    raising OperationalError out of the endpoint and returning a 500, filling
+    the log with ASGI tracebacks on every dashboard poll.
+    An absent table means "no data", not a server fault.
+    """
     conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
     conn.row_factory = sqlite3.Row
     try:
         rows = conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc).lower():
+            return []
+        raise
     finally:
         conn.close()
 
@@ -283,106 +304,142 @@ def _platform_status_payload(key: str) -> tuple[dict, str]:
 
 
 def _platform_scan_rows() -> list[dict]:
+    """Expose the active runtime scan, not legacy per-symbol cache rows.
+
+    The live engine writes one authoritative aggregate platform_status.scan
+    payload per cycle. Older scan:<symbol> rows are retained for audit
+    history, but are not a current dashboard source because they can be days
+    old and do not describe the current engine route.
+    """
     try:
         conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
-        rows = conn.execute(
-            "SELECT key, value_json, updated_at FROM platform_status "
-            "WHERE key LIKE 'scan:%' ORDER BY updated_at DESC"
-        ).fetchall()
+        row = conn.execute(
+            "SELECT value_json, updated_at FROM platform_status WHERE key = ?",
+            ("scan",),
+        ).fetchone()
         conn.close()
     except Exception:
         return []
-    result = []
+    if not row:
+        return []
+    try:
+        payload = json.loads(row[0] or "{}")
+    except Exception:
+        return []
+    if not isinstance(payload, dict):
+        return []
+
+    updated_at = str(row[1] or payload.get("updated_at") or "")
+    decisions = payload.get("decisions")
+    if not isinstance(decisions, list):
+        return []
     allowed_symbols = _dashboard_symbol_codes()
-    for key, value_json, updated_at in rows:
-        try:
-            payload = json.loads(value_json or "{}")
-        except Exception:
-            payload = {}
-        if not isinstance(payload, dict):
+    result = []
+
+    for decision in decisions:
+        if not isinstance(decision, dict):
             continue
-        symbol = str(payload.get("symbol") or str(key)[5:]).strip().upper()
+        symbol = str(decision.get("symbol") or "").strip().upper()
         if not symbol or symbol not in allowed_symbols:
             continue
-        scores = payload.get("scores") if isinstance(payload.get("scores"), dict) else {}
-        totals = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
-        side = str(payload.get("proposal_side") or "").upper()
+        asset_class = str(decision.get("asset_class") or "").strip().lower()
+        engine = str(decision.get("engine") or "").strip().upper()
+        side = str(decision.get("side") or "").strip().upper()
         if side not in {"BUY", "SELL"}:
             side = ""
-        proposal_id = str(payload.get("proposal_id") or "")
-        score = _optional_float(payload.get("score"))
-        if score is None and totals:
-            values = [_optional_float(value) for value in totals.values()]
-            values = [value for value in values if value is not None]
-            score = max(values) if values else None
-        reasons = payload.get("reasons")
-        if not isinstance(reasons, list):
-            reasons = payload.get("proposal_reasoning")
+        decision_name = str(decision.get("decision") or "NO_SETUP").strip().upper()
+        proposal_id = str(decision.get("proposal_id") or "").strip()
+        proposal = bool(proposal_id) or decision_name in {"PROPOSAL_CREATED", "APPROVED"}
+        reasons = decision.get("reasons")
         if not isinstance(reasons, list):
             reasons = []
-        engine = str(payload.get("engine") or "").upper()
-        asset_class = str(payload.get("asset_class") or "").lower()
-        proposal = bool(proposal_id)
+        reasons = [str(reason) for reason in reasons if str(reason).strip()]
+
+        h4_direction = str(decision.get("h4_direction") or "").upper()
+        m15_aoi = bool(decision.get("m15_aoi"))
+        m15_confirmation = bool(decision.get("m15_confirmation"))
+        m15_retracement = bool(decision.get("m15_retracement"))
+        m5_trigger = bool(decision.get("m5_trigger"))
         progress = [
-            {"key": "H4", "label": "Direction", "state": "complete" if "H4" in scores else "inactive"},
-            {"key": "H1", "label": "Confirm", "state": "complete" if "H1" in scores else "inactive"},
-            {"key": "M15", "label": "Structure", "state": "complete" if "M15" in scores else "inactive"},
-            {"key": "M5", "label": "Trigger", "state": "complete" if "M5" in scores else "inactive"},
-            {"key": "ORDER", "label": "Order", "state": "complete" if proposal else "inactive"},
+            {
+                "key": "H4",
+                "label": "Direction",
+                "state": "complete" if h4_direction in {"BUY", "SELL"} else "blocked",
+            },
+            {
+                "key": "M15",
+                "label": "POI + Structure",
+                "state": "complete" if m15_aoi and m15_confirmation and m15_retracement else "waiting",
+            },
+            {
+                "key": "M5",
+                "label": "Break / Retest",
+                "state": "complete" if m5_trigger else "waiting",
+            },
+            {
+                "key": "ORDER",
+                "label": "Order",
+                "state": "complete" if proposal else "waiting",
+            },
         ]
+        first_reason = reasons[0] if reasons else (
+            "TRADE_PROPOSAL_CREATED" if proposal else "NO_SETUP"
+        )
+        status = "PROPOSAL_CREATED" if proposal else "NO_TRADE"
         result.append({
             "sym": symbol,
             "symbol": symbol,
             "market": asset_class,
             "direction": side,
             "side": side,
-            "final_score": score,
-            "score": score,
-            "score_band": _score_band(score),
-            "status": "PROPOSAL_CREATED" if proposal else "NO_TRADE",
-            "reason": "; ".join(str(item) for item in reasons) or ("TRADE_PROPOSAL_CREATED" if proposal else "NO_TRADE_PROPOSAL"),
-            "systematic_reason": "",
+            "final_score": None,
+            "score": None,
+            "score_band": "",
+            "status": status,
+            "reason": first_reason,
+            "systematic_reason": "; ".join(reasons),
             "engine": engine,
             "asset_class": asset_class,
-            "strategy": engine,
-            "created_at": str(updated_at or ""),
-            "updated_at": str(updated_at or ""),
+            "strategy": str(decision.get("setup_type") or ""),
+            "created_at": updated_at,
+            "updated_at": updated_at,
             "created_label": db.date_detail_for(updated_at).get("label", ""),
             "trade_date": db.trade_date_for(updated_at),
             "gate_ok": proposal,
             "scan_stage": "ORDER" if proposal else "EVALUATED",
-            "scan_status": "PROPOSAL_CREATED" if proposal else "NO_TRADE",
+            "scan_status": status,
             "scan_story": (
-                "Live MT5 platform proposal created from the current synchronized snapshot."
-                if proposal else
-                "Live MT5 platform evaluated the current snapshot and did not create a proposal."
+                "Active MT5 snapshot evaluated by the asset-specific learning engine."
+                if not proposal else
+                "Active MT5 snapshot produced an immutable trade proposal."
             ),
             "scan_progress": progress,
-            "scan_trigger": "PROPOSAL" if proposal else "NO_TRADE_PROPOSAL",
-            "scan_cycle_at": str(updated_at or ""),
-            "scan_candle_times": payload.get("freshness", {}).get("latest_completed", {}),
+            "scan_trigger": "PROPOSAL" if proposal else "NO_SETUP",
+            "scan_cycle_at": updated_at,
+            "scan_candle_times": {},
             "market_session": "",
             "pending_setup_created": False,
             "m1_status": "",
             "proposal_id": proposal_id,
-            "confidence": payload.get("confidence"),
-            "probability": payload.get("probability"),
+            "confidence": None,
+            "probability": None,
             "reasons": reasons,
-            "scores": scores,
-            "totals": totals,
-            "timeframes": payload.get("timeframes") or sorted(scores),
+            "scores": {},
+            "totals": {},
+            "timeframes": payload.get("frames") or [],
             "score_breakdown": {
-                "timeframes": scores,
-                "totals": totals,
-                "threshold": payload.get("threshold"),
-                "feature_scores": payload.get("feature_scores") or {},
+                "timeframes": {},
+                "totals": {},
+                "threshold": None,
+                "feature_scores": {},
             },
-            "public_metric_name": "Cipher FX Score",
-            "public_mode": "Shadow",
+            "public_metric_name": "Score not used",
+            "public_mode": "Live",
             "score_metric": {
-                "version": "cipher_fx_score",
-                "total": score,
-                "band": _score_band(score),
+                "version": "not_used",
+                "total": None,
+                "band": "",
+                "enforced": False,
             },
         })
     return result
@@ -518,7 +575,12 @@ def _active_websocket_ticks(symbols: list[str] | None = None) -> list[dict]:
         if age is None:
             age = _timestamp_age_seconds(item.get("time"))
         item["age_seconds"] = round(age, 3) if age is not None else None
-        item["fresh"] = bool(item.get("fresh")) and age is not None and age <= 10.0
+        existing_fresh = item.get("fresh")
+        item["fresh"] = (
+            bool(existing_fresh) and age is not None and age <= 10.0
+            if existing_fresh is not None
+            else age is not None and age <= 10.0
+        )
         item["status"] = "LIVE_DATA" if item["fresh"] else "STALE_MARKET_DATA"
         item["source"] = "websocket"
         rows.append(item)
@@ -586,12 +648,32 @@ def _filter_market_feed_payload(payload: dict) -> dict:
     if not isinstance(payload, dict):
         return {}
     allowed = _dashboard_symbol_codes()
-    ticks = [
-        dict(row)
-        for row in (payload.get("ticks") or [])
-        if isinstance(row, dict)
-        and str(row.get("symbol") or "").strip().upper() in allowed
-    ]
+    try:
+        max_age = float(payload.get("max_tick_age_seconds") or 60.0)
+    except (TypeError, ValueError):
+        max_age = 60.0
+    ticks = []
+    for raw in payload.get("ticks") or []:
+        if not isinstance(raw, dict):
+            continue
+        if str(raw.get("symbol") or "").strip().upper() not in allowed:
+            continue
+        row = dict(raw)
+        # Older runtime feed records omit status. Derive it from the
+        # websocket source and measured age instead of treating missing
+        # telemetry as stale.
+        source = str(row.get("source") or "").strip().lower()
+        try:
+            tick_age = float(row.get("age_seconds"))
+        except (TypeError, ValueError):
+            tick_age = None
+        if not row.get("status"):
+            row["status"] = (
+                "LIVE_DATA"
+                if source == "websocket" and tick_age is not None and tick_age <= max_age
+                else "STALE_MARKET_DATA"
+            )
+        ticks.append(row)
     filtered = dict(payload)
     filtered["ticks"] = ticks
     filtered["tracked_symbols"] = min(
@@ -975,25 +1057,29 @@ def _require_manual_trading_enabled() -> None:
 
 
 def _terminal_account() -> dict:
+    # Every figure here comes from MT5's account.txt. The bot's status rows
+    # are its own bookkeeping and drift from the broker, so they are not used
+    # as fallbacks: a missing export must read as zero/unknown, not as a stale
+    # number presented as current.
     raw = _read_kv(_bridge_dir() / "account.txt")
-    login = raw.get("login") or str(db.read_status("account_id") or os.getenv("MT5_LOGIN", ""))
+    login = raw.get("login") or str(os.getenv("MT5_LOGIN", ""))
     balance = _finite(raw.get("balance") or 0.0)
-    equity = _finite(raw.get("equity") or db.read_status("equity") or 0.0)
+    equity = _finite(raw.get("equity") or 0.0)
     leverage = _finite(raw.get("leverage") or 0.0)
-    demo_balance = _finite(os.getenv("MT5_DEMO_BALANCE") or 0.0)
-    if login == str(os.getenv("MT5_LOGIN", "")).strip() and balance <= 0 and equity <= 0 and leverage <= 0 and demo_balance > 0:
-        balance = demo_balance
-        equity = demo_balance
+    # MT5_DEMO_BALANCE used to be substituted here when the terminal reported
+    # zero. That invents an account balance the broker never reported, and an
+    # inherited placeholder of 10000 against a real 1000 account would size
+    # every trade 10x. A real zero is information; a fabricated balance is not.
     return {
         "login": login,
-        "server": raw.get("server") or os.getenv("MT5_SERVER", "XMGlobal-MT5 17").strip('"'),
+        "server": raw.get("server") or os.getenv("MT5_SERVER", "HFMarketsSA-Demo2").strip('"'),
         "name": raw.get("name", ""),
         "balance": balance,
         "equity": equity,
         "margin": _finite(raw.get("margin") or 0.0),
         "free_margin": _finite(raw.get("free_margin") or balance),
         "profit": _finite(raw.get("profit") or 0.0),
-        "currency": raw.get("currency") or "USD",
+        "currency": raw.get("currency") or "ZAR",
     }
 
 
@@ -1253,7 +1339,7 @@ def _bridge_positions() -> list[dict]:
             "unrealized": _finite(row.get("profit"), digits=2),
             "profit": _finite(row.get("profit"), digits=2),
             "opened_at": row.get("time", ""),
-            "venue": "XM Global MT5",
+            "venue": "HF Markets SA MT5",
             "source": "mt5_terminal",
         }))
     return out
@@ -1352,13 +1438,71 @@ def _symbols() -> list[dict]:
     return sorted(result.values(), key=lambda row: (not bool(row.get("visible")), row["symbol"]))
 
 
+def _mt5_today_trade_count() -> int | None:
+    """How many trades closed today, per MT5. None if unreadable.
+
+    db.read_todays_trade_count() is the bot's own tally and misses deals it
+    never recorded - on 2026-08-05 MT5 had 9 closed deals and the bot knew of 8.
+    """
+    try:
+        summary = (db.read_deals_period("today", limit=1000) or {}).get("summary") or {}
+    except Exception:
+        return None
+    value = summary.get("total_trades")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _mt5_trade_allowed() -> bool | None:
+    """Does the BROKER permit trading? From MT5's account.txt, not the bot."""
+    path = _bridge_dir() / "account.txt"
+    if not _fresh_bridge_csv(path, max_age_seconds=180):
+        return None
+    raw = _read_kv(path)
+    flag = str(raw.get("trade_allowed", "")).strip().lower()
+    if not flag:
+        return None
+    return flag not in {"0", "false", "no"}
+
+
+def _mt5_today_realized() -> float | None:
+    """Today's realized P/L straight from MT5's own deal history, or None.
+
+    db.read_status("daily_pnl") / db.read_todays_pnl() are the BOT's running
+    tallies and they drift from the broker. Found live 2026-08-05: MT5 had 9
+    closed deals totalling +246.88 while this reported 141.35 - the bot had
+    never recorded the 09:12 US30Cash deal (+105.53), so the dashboard
+    understated the day by exactly that trade. read_deals_period() already
+    treats the MT5 bridge export as authoritative, so reuse it.
+    """
+    try:
+        summary = (db.read_deals_period("today", limit=1000) or {}).get("summary") or {}
+    except Exception:
+        return None
+    value = summary.get("pnl")
+    if value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
 def _activity() -> dict:
     positions = _positions()
     orders = _orders()
     account = _terminal_account()
     fx = _usd_zar_rate()
-    equity = _finite(account.get("equity") or db.read_status("equity") or 0.0)
-    daily_pnl = _finite(db.read_status("daily_pnl") or db.read_todays_pnl() or 0.0)
+    equity = _finite(account.get("equity") or 0.0)  # MT5 account.txt only
+    # MT5 is the source of truth for realized P/L. Only fall back to the bot's
+    # own tally when the broker export cannot be read at all.
+    _broker_today = _mt5_today_realized()
+    if _broker_today is not None:
+        daily_pnl = _finite(_broker_today)
+    else:
+        daily_pnl = _finite(db.read_status("daily_pnl") or db.read_todays_pnl() or 0.0)
     unrealized = _finite(sum(float(p.get("unrealized") or 0.0) for p in positions))
     market_value = _finite(sum(abs(float(p.get("current") or 0.0) * float(p.get("qty") or 0.0)) for p in positions))
     # MT5 free margin is authoritative. Equity minus notional market value is
@@ -1366,17 +1510,25 @@ def _activity() -> dict:
     available = _finite(account.get("free_margin") or 0.0)
     margin_used = _finite(account.get("margin") or 0.0)
     margin_level = _finite((equity / margin_used) * 100.0) if margin_used > 0 else 0.0
-    equity_zar = _finite(equity * float(fx["rate"])) if fx.get("rate") else 0.0
-    unrealized_pnl_zar = _finite(unrealized * float(fx["rate"])) if fx.get("rate") else None
+    # The account currency is whatever MT5 reports (HFM SA demo is ZAR, the old
+    # XM account was USD). Only convert when the account is NOT already ZAR -
+    # multiplying a ZAR equity by USDZAR reported ~16x the real balance.
+    account_currency = str(account.get("currency") or "ZAR").upper()
+    if account_currency == "ZAR":
+        equity_zar = equity
+        unrealized_pnl_zar = unrealized
+    else:
+        equity_zar = _finite(equity * float(fx["rate"])) if fx.get("rate") else 0.0
+        unrealized_pnl_zar = _finite(unrealized * float(fx["rate"])) if fx.get("rate") else None
     updated_at = datetime.now().isoformat()
     if positions:
         updated_at = max(str(p.get("updated_at") or updated_at) for p in positions)
     return {
         "connected": _connected(),
         "broker_backend": "mt5",
-        "broker_name": os.getenv("CIPHERFX_BROKER_NAME", "XM Global Demo"),
+        "broker_name": os.getenv("CIPHERFX_BROKER_NAME", "HF Markets SA Demo"),
         "platform_name": os.getenv("CIPHERFX_PLATFORM_NAME", "MetaTrader 5"),
-        "account_label": os.getenv("CIPHERFX_ACCOUNT_LABEL", "XM Global MT5 Demo"),
+        "account_label": os.getenv("CIPHERFX_ACCOUNT_LABEL", "HFM MT5 Demo 57498881"),
         "positions": positions,
         "position_count": len(positions),
         "unrealized_pnl": unrealized,
@@ -1395,13 +1547,13 @@ def _activity() -> dict:
             "margin_level": margin_level,
             "equity_with_loan": equity,
             "total_cash": available,
-            "cash_balances": ([{"currency": "USD", "cash": available}] if equity else []),
-            "currency": account.get("currency") or "USD",
+            "cash_balances": ([{"currency": account_currency, "cash": available}] if equity else []),
+            "currency": account_currency,
             "usd_zar_rate": fx["rate"],
             "equity_zar": equity_zar,
             "unrealized_pnl_zar": unrealized_pnl_zar,
         },
-        "balances": ([{"currency": "USD", "cash": available}] if equity else []),
+        "balances": ([{"currency": account_currency, "cash": available}] if equity else []),
         "open_orders": orders,
         "open_order_count": len(orders),
         "cancelled_orders": [],
@@ -1416,10 +1568,11 @@ def app_config():
     return {
         "company_name": "Cipher FX",
         "broker_backend": "mt5",
-        "broker_name": os.getenv("CIPHERFX_BROKER_NAME", "XM Global Demo"),
+        "broker_name": os.getenv("CIPHERFX_BROKER_NAME", "HF Markets SA Demo"),
         "platform_name": os.getenv("CIPHERFX_PLATFORM_NAME", "MetaTrader 5"),
-        "account_label": os.getenv("CIPHERFX_ACCOUNT_LABEL", "XM Global MT5 Demo"),
-        "currency": "USD",
+        "account_label": os.getenv("CIPHERFX_ACCOUNT_LABEL", "HFM MT5 Demo 57498881"),
+        # Report the live MT5 account currency, never a hardcoded one.
+        "currency": str((_terminal_account() or {}).get("currency") or "ZAR").upper(),
         "secure_transport": os.getenv("CIPHERFX_PUBLIC_HTTPS", "1") == "1",
     }
 
@@ -1437,6 +1590,11 @@ def dashboard_page():
 @app.get("/dashboard/mt5/", include_in_schema=False)
 def dashboard_page_slash():
     return FileResponse(STATIC_DIR / "index.html")
+
+
+@app.get("/dashboard/mt5/jarvis", include_in_schema=False)
+def jarvis_page():
+    return FileResponse(STATIC_DIR / "jarvis.html")
 
 
 @app.post("/api/login")
@@ -1856,14 +2014,15 @@ def status():
         "balance": activity["overview"].get("balance", 0.0),
         "equity": activity["overview"].get("net_liquidation", 0.0),
         "daily_pnl": activity["overview"]["daily_pnl"],
-        "currency": activity["overview"].get("currency", "USD"),
+        "currency": activity["overview"].get("currency", "ZAR"),
         "usd_zar_rate": fx["rate"],
         "usd_zar_source": fx["source"],
         "usd_zar_updated_at": fx["updated_at"],
         "mode": str(os.getenv("MT5_TRADE_MODE") or service.get("mode") or db.read_status("mode") or "demo").upper(),
-        "mt5_connected": str(service.get("state") or "").upper() == "CONNECTED",
+        "mt5_connected": _connected(),  # MT5 account.txt terminal_connected
         "market_data_source": market_feed.get("source") or service.get("market_data_source") or "websocket",
-        "mt5_trade_allowed": db.read_status("mt5_trade_allowed"),
+        "mt5_trade_allowed": (_mt5_trade_allowed() if _mt5_trade_allowed() is not None
+                              else db.read_status("mt5_trade_allowed")),
         "dry_run": os.getenv("MT5_DRY_RUN", "0") in {"1", "true", "True", "yes", "on"},
         "poll_seconds": os.getenv("MT5_POLL_SECONDS", "0.2"),
         "max_pyramid_levels": int(float(os.getenv("MT5_PYRAMID_MAX_LEVELS", "10") or 10)),
@@ -1874,7 +2033,8 @@ def status():
         "max_open_trades": max_open_trades,
         "max_daily_trades": max_daily_trades,
         "daily_loss_cap_usd": daily_loss_cap_usd,
-        "daily_trade_count": runtime.get("filled", 0),
+        "daily_trade_count": (_mt5_today_trade_count() if _mt5_today_trade_count() is not None
+                              else db.read_todays_trade_count()),
         "fresh_symbols": fresh_symbols,
         "tracked_symbols": tracked_symbols,
         "stale_symbols": stale_symbols,
@@ -1945,11 +2105,20 @@ def intelligence_summary():
 
 @app.get("/api/intelligence/overview", dependencies=[Depends(_session_user)])
 def intelligence_overview():
-    """Return the live planning, learning, validation and execution story.
+    """Return the bot's own planning, learning and validation record.
 
-    All values come from the authoritative MT5 SQLite state database. Learning
-    records are deliberately presented as diagnostic/shadow evidence and never
-    as permission to trade.
+    Everything here is the BOT's reasoning - which setups it scored, which
+    gates blocked a trade, what its walk-forward runs concluded. MT5 has no
+    record of any of it and cannot corroborate it.
+
+    The previous docstring called this "the authoritative MT5 SQLite state
+    database". It is neither authoritative nor MT5: it is the bot's own
+    SQLite file, and it demonstrably drifts from the broker (2026-08-05: 22
+    positions still marked open here that MT5 closed weeks earlier, and a
+    daily P/L 105.53 short of the broker's). Money, positions, prices and
+    account state must come from the MT5 bridge export - see _positions(),
+    _terminal_account(), _mt5_today_realized(). This endpoint is for the
+    bot's decisions only, and those are diagnostic, never permission to trade.
     """
     def payload(row):
         value = row.get("payload_json") if isinstance(row, dict) else None
@@ -2328,6 +2497,85 @@ def portfolio_overview():
     )
 
 
+_ALIAS_CACHE = None
+
+
+def _broker_alias_map() -> dict[str, str]:
+    """BROKER name -> canonical name, straight from mt5_symbols.json."""
+    global _ALIAS_CACHE
+    if _ALIAS_CACHE is not None:
+        return _ALIAS_CACHE
+    out: dict[str, str] = {}
+    try:
+        path = Path(os.getenv(
+            "MT5_SYMBOLS_FILE",
+            str(Path(__file__).resolve().parents[2] / "mt5_symbols.json"),
+        ))
+        aliases = json.loads(path.read_text()).get("aliases", {})
+        for canonical, broker in aliases.items():
+            key = "".join(ch for ch in str(broker).upper() if ch.isalnum())
+            out[key] = "".join(ch for ch in str(canonical).upper() if ch.isalnum())
+    except (OSError, json.JSONDecodeError, ValueError, TypeError):
+        pass
+    _ALIAS_CACHE = out
+    return out
+
+
+def _norm_sym(value) -> str:
+    """Collapse a broker symbol onto its canonical name.
+
+    The bot stores canonical symbols, MT5 returns the broker's own, so a raw
+    string compare never matches and every position looks unheld.
+
+    This was suffix-stripping ("CASH"/"SPOT"), which only ever worked for XM's
+    US30Cash -> US30. It silently failed on US100Cash -> US100 (canonical is
+    NAS100), and after the 2026-08-13 move to HF Markets it failed on three of
+    the five live symbols: USA30/USA100/USA500 share no suffix with
+    US30/NAS100/SPX500, so open positions read as unheld.
+    The alias map in mt5_symbols.json is the authority the bot itself uses;
+    suffix stripping stays only as a fallback for anything unlisted.
+    """
+    sym = "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+    mapped = _broker_alias_map().get(sym)
+    if mapped:
+        return mapped
+    for suffix in ("CASH", "SPOT", "USD."):
+        if sym.endswith(suffix) and len(sym) > len(suffix):
+            sym = sym[: -len(suffix)]
+            break
+    return sym
+
+
+def _mt5_open_positions() -> dict[str, float] | None:
+    """What MT5 ACTUALLY holds open: {SYMBOL: total volume}. None if unknown.
+
+    MT5 is the only authority on what is open. platform_executions drifts from
+    it: found live 2026-08-05 carrying 22 rows still marked FILLED from 16-21
+    July (JP225 46.3 lots, US500 13.5 lots, 8x GER40, EU50, FRA40, EURJPY,
+    USDCAD) that the broker had closed weeks earlier. The 24h created_at
+    cutoff hid them from the default view, but the data stayed wrong and any
+    include_history=True call resurrected them as live positions.
+
+    Returns None - meaning "cannot verify, trust the DB" - when the bridge
+    export is missing or stale. Without that guard a dead bridge would report
+    every real open position as closed, which is a worse lie than the one
+    this fixes.
+    """
+    path = _bridge_dir() / "positions.csv"
+    if not _fresh_bridge_csv(path, max_age_seconds=180):
+        return None
+    out: dict[str, float] = {}
+    for row in _read_csv(path):
+        sym = _norm_sym(row.get("symbol"))
+        if not sym:
+            continue
+        try:
+            out[sym] = out.get(sym, 0.0) + float(row.get("volume") or 0.0)
+        except (TypeError, ValueError):
+            out.setdefault(sym, 0.0)
+    return out
+
+
 def _active_platform_trades(limit: int = 100, include_history: bool = False) -> list[dict]:
     count = max(1, min(int(limit or 100), 500))
     conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
@@ -2339,9 +2587,36 @@ def _active_platform_trades(limit: int = 100, include_history: bool = False) -> 
         placeholders = ",".join("?" for _ in allowed)
         clauses.append("UPPER(COALESCE(p.symbol, '')) IN (" + placeholders + ")")
         params.extend(allowed)
+        # A proposal blocked before broker submission is not an MT5 trade or
+        # order - exclude it in SQL, not just after fetching. Rejected
+        # proposals (e.g. the correlation gate re-blocking a correlated
+        # symbol every scan cycle) can flood platform_executions fast enough
+        # to push real open positions out of the LIMIT window entirely if
+        # filtered only after the fact (found live 2026-07-22: GER40Cash's
+        # real open position vanished from the dashboard because ~90 blocked
+        # EU50/FRA40/GER40/NAS100/XAUUSD/... rows outranked it in the
+        # ORDER BY, so the real row never made it into the top `count`).
+        clauses.append("p.status NOT IN ('EXECUTION_BLOCKED','DUPLICATE_SUPPRESSED')")
         if not include_history:
+            # No real position can outlive the platform's own 8h duration
+            # cap, so a real open position is always recent - a 24h cutoff
+            # is a safe, generous margin. "closed_at IS NULL means open
+            # regardless of age" was the actual bug: rows from a reconciler
+            # gap (real FILLED trades that closed at the broker but never
+            # got closed_at stamped here) or old dry-run/rejected artifacts
+            # would leak through as "open" forever, no matter how old.
+            # Recently CLOSED counts as recent too, not just recently opened.
+            # The "nothing outlives the 8h cap" assumption above fails across a
+            # weekend: a position opened Friday cannot be closed until the
+            # market reopens Sunday night, so it can legitimately live 50h+.
+            # Filtering on created_at alone dropped those trades from the list
+            # while they still counted in daily P&L - the dashboard showed
+            # +$421 of profit but listed only one -$24.70 trade (found live
+            # 2026-07-27). Rows that are genuinely stale AND never closed still
+            # fail both conditions, so the original zombie-row fix is intact.
             cutoff = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
-            clauses.append("(p.closed_at IS NULL OR p.created_at >= ?)")
+            clauses.append("(p.created_at >= ? OR p.closed_at >= ?)")
+            params.append(cutoff)
             params.append(cutoff)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         rows = conn.execute(
@@ -2351,19 +2626,44 @@ def _active_platform_trades(limit: int = 100, include_history: bool = False) -> 
             " ORDER BY COALESCE(p.closed_at, p.created_at) DESC LIMIT ?",
             params + [count],
         ).fetchall()
+        # platform_executions.pnl is the REALIZED fill record - it is only
+        # ever populated when a trade closes, and stays 0 the entire time a
+        # position is open. That made every open position report pnl=0 here
+        # (confirmed live 2026-07-23: real floating P&L was $614.49 across 3
+        # open positions, this function reported $0 for all three) even
+        # though the live floating P&L is tracked separately, continuously,
+        # in the `positions` table. Open rows must use that instead.
+        live_unrealized = {
+            str(r["sym"]).upper(): float(r["unrealized"] or 0.0)
+            for r in conn.execute("SELECT sym, unrealized FROM positions").fetchall()
+        }
     finally:
         conn.close()
+    broker_open = _mt5_open_positions()
     result = []
     for row in rows:
         item = dict(row)
         status = str(item.get("status") or "").upper()
-        # A proposal blocked before broker submission is not an MT5 trade or
-        # order. Keep its exact reason in scan/audit data, but never present it
-        # as an unfilled trade in the trade list.
-        if status in {"EXECUTION_BLOCKED", "DUPLICATE_SUPPRESSED"}:
-            continue
         closed = bool(item.get("closed_at"))
-        public_status = "CLOSED" if closed else ("OPEN" if status in {"FILLED", "DRY_RUN"} else status)
+        if closed:
+            public_status = "CLOSED"
+        elif status == "DRY_RUN":
+            # Paper trade. It does not exist at the broker, so calling it OPEN
+            # put 12 phantom "positions" (US30, NAS100, UK100, XAUUSD, USDJPY
+            # at 4-7 lots, all pnl=0) into the history view on 2026-08-05.
+            public_status = "DRY_RUN"
+        elif status == "FILLED":
+            # MT5 decides. A FILLED row the broker does not hold is stale, no
+            # matter how recently it was created.
+            sym_u = _norm_sym(item.get("symbol"))
+            public_status = "OPEN" if (broker_open is None or sym_u in broker_open) else "CLOSED"
+        else:
+            public_status = status
+        pnl = (
+            live_unrealized.get(str(item.get("symbol") or "").upper(), item.get("pnl") or 0)
+            if not closed
+            else (item.get("pnl") or 0)
+        )
         item.update({
             "trade_id": item.get("proposal_id") or "",
             "proposal_id": item.get("proposal_id") or "",
@@ -2373,8 +2673,8 @@ def _active_platform_trades(limit: int = 100, include_history: bool = False) -> 
             "side": item.get("side") or "",
             "qty": item.get("volume") or 0,
             "realized": item.get("pnl") or 0,
-            "pnl": item.get("pnl") or 0,
-            "profit": item.get("pnl") or 0,
+            "pnl": pnl,
+            "profit": pnl,
             "outcome": public_status,
             "status": public_status,
             "opened_at": item.get("created_at") or "",
@@ -2396,6 +2696,59 @@ def intelligence_watch():
 @app.get("/api/signals", dependencies=[Depends(_session_user)])
 def signals():
     return _active_platform_scanner().get("current_signals", [])
+
+
+@app.get("/api/trade-signals", dependencies=[Depends(_session_user)])
+def trade_signals(tf: str | None = None):
+    """Live setups for MANUAL execution on account 336722733.
+
+    Read-only. Recomputed from the live engine classes each call because the
+    router overwrites last_report as it walks the engine chain, so SDZONE's
+    view is lost from the event log whenever a later engine also reports.
+    """
+    try:
+        import signals_feed
+        importlib.reload(signals_feed)
+        payload = signals_feed.build_signals(only_tf=tf)
+    except Exception as exc:
+        payload = {"generated_at": datetime.now(timezone.utc).isoformat(),
+                   "signals": [], "error": str(exc)[:300]}
+    return JSONResponse(content=payload, headers={
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache", "Expires": "0"})
+
+
+@app.get("/dashboard/signals", response_class=HTMLResponse)
+def signals_page():
+    return FileResponse(STATIC_DIR / "signals.html")
+
+
+class StageOrderRequest(BaseModel):
+    symbol: str
+    side: str
+    entry: float
+    stop: float
+    target: float
+    volume: float | None = None
+
+
+@app.post("/api/stage-order", dependencies=[Depends(_session_user)])
+def stage_order_endpoint(req: StageOrderRequest):
+    """Rest a PENDING LIMIT at a signal's entry, at minimum lot, SL+TP attached.
+
+    The rest of this backend is read-only and refuses order entry - the trading
+    runtime owns automated execution. This is a separate, explicit path: it only
+    ever runs on a button press, never places a market order, and never chooses
+    a size. The human resizes it in MT5 before it fills.
+    """
+    try:
+        import stage_order
+        importlib.reload(stage_order)
+        result = stage_order.stage(req.symbol, req.side, req.entry, req.stop,
+                                   req.target, req.volume)
+    except Exception as exc:
+        result = {"ok": False, "error": f"{type(exc).__name__}: {str(exc)[:220]}"}
+    return JSONResponse(content=result, status_code=200 if result.get("ok") else 400)
 
 
 @app.get("/api/scanner", dependencies=[Depends(_session_user)])
@@ -2441,15 +2794,647 @@ def stats():
     return db.read_stats()
 
 
+def _ensure_jarvis_memory_tables() -> None:
+    """Persistent memory so Jarvis doesn't forget everything on page reload
+    or a server restart. Two tables: jarvis_messages (conversation history,
+    survives across devices/sessions) and jarvis_notes (longer-term
+    observations Jarvis chooses to save via the save_note tool - the
+    practical equivalent of "learning" for an LLM assistant: it can't
+    retrain itself, but it can accumulate and reuse real observations)."""
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS jarvis_messages("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, role TEXT NOT NULL, "
+            "content TEXT NOT NULL, created_at TEXT NOT NULL)"
+        )
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS jarvis_notes("
+            "id INTEGER PRIMARY KEY AUTOINCREMENT, note TEXT NOT NULL, "
+            "created_at TEXT NOT NULL)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+_ensure_jarvis_memory_tables()
+
+_jarvis_genai_client = None
+
+
+def _get_genai_client(api_key: str):
+    # Reused across requests instead of building a fresh genai.Client() (and
+    # therefore a fresh TLS connection to Google) on every single chat/speak
+    # call - that reconnect cost was a real, measured chunk of the "Jarvis is
+    # delayed" latency, on top of the model's own generation time.
+    global _jarvis_genai_client
+    if _jarvis_genai_client is None:
+        from google import genai
+        _jarvis_genai_client = genai.Client(api_key=api_key)
+    return _jarvis_genai_client
+
+
+def _jarvis_save_message(role: str, content: str) -> None:
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    try:
+        conn.execute(
+            "INSERT INTO jarvis_messages(role, content, created_at) VALUES (?,?,?)",
+            (role, content, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute(
+            "DELETE FROM jarvis_messages WHERE id NOT IN "
+            "(SELECT id FROM jarvis_messages ORDER BY id DESC LIMIT 400)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _jarvis_load_history(limit: int = 40) -> list[dict]:
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT role, content, created_at FROM jarvis_messages ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in reversed(rows)]
+
+
+def _jarvis_save_note(text: str) -> None:
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    try:
+        conn.execute(
+            "INSERT INTO jarvis_notes(note, created_at) VALUES (?,?)",
+            (text, datetime.now(timezone.utc).isoformat()),
+        )
+        conn.execute(
+            "DELETE FROM jarvis_notes WHERE id NOT IN "
+            "(SELECT id FROM jarvis_notes ORDER BY id DESC LIMIT 200)"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def _jarvis_recent_notes(limit: int = 20) -> list[dict]:
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT note, created_at FROM jarvis_notes ORDER BY id DESC LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    return [dict(r) for r in rows]
+
+
+def _jarvis_context() -> dict:
+    """Real, current bot state for the Jarvis assistant - read-only. No
+    function here can place, modify, or close a broker order; this only
+    gathers data for an LLM to explain/analyze, per the explicit
+    watch-and-propose-only scope agreed for this assistant."""
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        today_pnl = conn.execute(
+            "SELECT COALESCE(SUM(realized_pnl),0.0) FROM trade_history WHERE closed_at LIKE ?",
+            (datetime.now(timezone.utc).date().isoformat() + "%",),
+        ).fetchone()[0]
+        recent = [dict(r) for r in conn.execute(
+            "SELECT symbol, side, realized_pnl, result_r, exit_reason, closed_at "
+            "FROM trade_history ORDER BY closed_at DESC LIMIT 15"
+        ).fetchall()]
+        by_symbol = [dict(r) for r in conn.execute(
+            "SELECT symbol, COUNT(*) n, SUM(realized_pnl) total_pnl, "
+            "SUM(CASE WHEN realized_pnl>0 THEN 1 ELSE 0 END) wins "
+            "FROM trade_history WHERE closed_at > ? GROUP BY symbol ORDER BY total_pnl ASC",
+            ((datetime.now(timezone.utc) - timedelta(days=7)).isoformat(),),
+        ).fetchall()]
+        audit_row = conn.execute(
+            "SELECT value FROM bot_status WHERE key='last_daily_audit'"
+        ).fetchone()
+        runtime_row = conn.execute(
+            "SELECT value_json FROM platform_status WHERE key='runtime'"
+        ).fetchone()
+    finally:
+        conn.close()
+    positions = _active_platform_trades(limit=50, include_history=False)
+    open_positions = [p for p in positions if not p.get("closed_at")]
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "today_realized_pnl": today_pnl,
+        "open_positions": open_positions,
+        "recent_closed_trades": recent,
+        "symbol_performance_7d": by_symbol,
+        "daily_audit": json.loads(audit_row[0]) if audit_row else None,
+        "runtime_status": json.loads(runtime_row[0]) if runtime_row else None,
+        "intelligence_watch": _jarvis_tool_intelligence_watch(),
+    }
+
+
+def _jarvis_scoring_snapshot() -> list[dict]:
+    """Live per-symbol scoring internals - score, threshold, timeframe
+    agreement, diversity_ok - exactly what each engine's propose() saw on
+    its most recent scan. Written every scan cycle by runtime.py to
+    platform_status under key 'scan:{symbol}'."""
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        rows = conn.execute(
+            "SELECT key, value_json, updated_at FROM platform_status WHERE key LIKE 'scan:%' ORDER BY key"
+        ).fetchall()
+    finally:
+        conn.close()
+    out = []
+    for row in rows:
+        try:
+            payload = json.loads(row["value_json"])
+        except (TypeError, ValueError):
+            continue
+        out.append({
+            "symbol": row["key"].split(":", 1)[1],
+            "updated_at": row["updated_at"],
+            "engine": payload.get("engine"),
+            "score": payload.get("score"),
+            "threshold": payload.get("threshold"),
+            "score_floor": payload.get("score_floor"),
+            "diversity_ok": payload.get("diversity_ok"),
+            "trend_agreement": payload.get("trend_agreement"),
+            "momentum_agreement": payload.get("momentum_agreement"),
+            "structure_confirmed": payload.get("structure_confirmed"),
+            "proposal_side": payload.get("proposal_side"),
+            "entry_guard_blocked": (payload.get("entry_guard") or {}).get("blocked"),
+        })
+    return out
+
+
+@app.get("/api/jarvis/vitals", dependencies=[Depends(_session_user)])
+def jarvis_vitals():
+    ctx = _jarvis_context()
+    runtime = ctx.get("runtime_status") or {}
+    audit = ctx.get("daily_audit") or {}
+    open_positions = ctx.get("open_positions") or []
+    checks = audit.get("checks") or {}
+    try:
+        symbol_count = sum(
+            len(v) for k, v in json.loads(Path("/opt/cipherfx_mt5/mt5_symbols.json").read_text()).items()
+            if k in ("forex", "metals", "indices") and isinstance(v, list)
+        )
+    except Exception:
+        symbol_count = 0
+    return JSONResponse({
+        "generated_at": ctx["generated_at"],
+        "connected": bool(runtime.get("scan_performed") is not None),
+        "today_pnl": ctx["today_realized_pnl"],
+        "open_position_count": len(open_positions),
+        "symbol_universe_count": symbol_count,
+        "scan_interval_seconds": runtime.get("scan_interval_seconds"),
+        "last_scan_at": runtime.get("last_cycle"),
+        "audit_overall": audit.get("overall"),
+        "audit_checks_passing": sum(1 for v in checks.values() if v),
+        "audit_checks_total": len(checks),
+        "intelligence_overall": (ctx.get("intelligence_watch") or {}).get("overall"),
+        "intelligence_findings": (ctx.get("intelligence_watch") or {}).get("findings", []),
+    }, headers={"Cache-Control": "no-store, max-age=0"})
+
+
+@app.get("/api/jarvis/scoring", dependencies=[Depends(_session_user)])
+def jarvis_scoring():
+    return JSONResponse({
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "symbols": _jarvis_scoring_snapshot(),
+    }, headers={"Cache-Control": "no-store, max-age=0"})
+
+
+@app.get("/api/jarvis/history", dependencies=[Depends(_session_user)])
+def jarvis_history():
+    return JSONResponse({
+        "messages": _jarvis_load_history(limit=40),
+    }, headers={"Cache-Control": "no-store, max-age=0"})
+
+
+def _wrap_pcm_as_wav(pcm_bytes: bytes, sample_rate: int = 24000, channels: int = 1, bits: int = 16) -> bytes:
+    """Wrap raw PCM (what Gemini's TTS models return) in a minimal WAV
+    header so the browser's <audio> element can play it directly - Gemini
+    returns bare audio/L16 PCM, not a playable container format."""
+    byte_rate = sample_rate * channels * bits // 8
+    block_align = channels * bits // 8
+    header = b"RIFF" + struct.pack("<I", 36 + len(pcm_bytes)) + b"WAVE"
+    header += b"fmt " + struct.pack("<IHHIIHH", 16, 1, channels, sample_rate, byte_rate, block_align, bits)
+    header += b"data" + struct.pack("<I", len(pcm_bytes))
+    return header + pcm_bytes
+
+
+def _strip_markdown_for_speech(text: str) -> str:
+    text = re.sub(r"```.*?```", "", text, flags=re.DOTALL)
+    text = re.sub(r"[*_`#>-]", "", text)
+    text = re.sub(r"\n{2,}", ". ", text)
+    text = re.sub(r"\n", " ", text)
+    text = re.sub(r" {2,}", " ", text)
+    return text.strip()
+
+
+class JarvisSpeakRequest(BaseModel):
+    text: str
+    voice: str | None = None
+
+
+@app.post("/api/jarvis/speak", dependencies=[Depends(_session_user)])
+def jarvis_speak(req: JarvisSpeakRequest):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured on the server yet.")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise HTTPException(status_code=503, detail="google-genai package not installed.")
+
+    spoken = _strip_markdown_for_speech(req.text)[:2000]
+    if not spoken:
+        raise HTTPException(status_code=400, detail="text is empty after stripping formatting.")
+
+    voice_name = req.voice or os.getenv("JARVIS_VOICE", "Iapetus")
+    config = types.GenerateContentConfig(
+        response_modalities=["AUDIO"],
+        speech_config=types.SpeechConfig(
+            voice_config=types.VoiceConfig(
+                prebuilt_voice_config=types.PrebuiltVoiceConfig(voice_name=voice_name)
+            )
+        ),
+    )
+    try:
+        client = _get_genai_client(api_key)
+        response = client.models.generate_content(
+            model=os.getenv("JARVIS_TTS_MODEL", "gemini-2.5-flash-preview-tts"),
+            contents=f'Say exactly the following, and nothing else: "{spoken}"',
+            config=config,
+        )
+        part = response.candidates[0].content.parts[0]
+        pcm = part.inline_data.data
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Jarvis TTS error: {type(exc).__name__}: {str(exc)[:300]}")
+    wav = _wrap_pcm_as_wav(pcm)
+    return Response(content=wav, media_type="audio/wav", headers={"Cache-Control": "no-store, max-age=0"})
+
+
+# ---------------------------------------------------------------------------
+# Jarvis tools - real, read-only functions the assistant can call on demand
+# ("deep search" over live bot state) instead of relying on one fixed
+# context blob. Every tool is strictly read-only: none can place, modify,
+# cancel, or close a broker order, or change any live config file.
+# ---------------------------------------------------------------------------
+_SECRET_ENV_MARKERS = ("PASSWORD", "SECRET", "KEY", "TOKEN")
+
+
+def _jarvis_tool_get_open_positions(_input: dict) -> dict:
+    return {"open_positions": [p for p in _active_platform_trades(limit=50, include_history=False) if not p.get("closed_at")]}
+
+
+def _jarvis_tool_get_symbol_trade_history(input: dict) -> dict:
+    symbol = str(input.get("symbol", "")).strip().upper()
+    days = max(1, min(int(input.get("days", 30) or 30), 400))
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+        if symbol:
+            rows = conn.execute(
+                "SELECT symbol, side, realized_pnl, result_r, exit_reason, closed_at "
+                "FROM trade_history WHERE symbol=? AND closed_at > ? ORDER BY closed_at DESC LIMIT 200",
+                (symbol, cutoff),
+            ).fetchall()
+        else:
+            rows = conn.execute(
+                "SELECT symbol, side, realized_pnl, result_r, exit_reason, closed_at "
+                "FROM trade_history WHERE closed_at > ? ORDER BY closed_at DESC LIMIT 200",
+                (cutoff,),
+            ).fetchall()
+    finally:
+        conn.close()
+    trades = [dict(r) for r in rows]
+    total = sum(float(t.get("realized_pnl") or 0.0) for t in trades)
+    wins = sum(1 for t in trades if float(t.get("realized_pnl") or 0.0) > 0)
+    return {
+        "symbol": symbol or "ALL",
+        "days": days,
+        "trade_count": len(trades),
+        "total_realized_pnl": round(total, 2),
+        "win_rate_pct": round(wins / len(trades) * 100, 1) if trades else None,
+        "trades": trades,
+    }
+
+
+def _jarvis_tool_get_symbol_scan_report(input: dict) -> dict:
+    symbol = str(input.get("symbol", "")).strip().upper()
+    if not symbol:
+        return {"error": "symbol is required"}
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute(
+            "SELECT value_json, updated_at FROM platform_status WHERE key=?", (f"scan:{symbol}",)
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"symbol": symbol, "found": False, "note": "no scan report on file for this symbol"}
+    return {"symbol": symbol, "found": True, "updated_at": row["updated_at"], "report": json.loads(row["value_json"])}
+
+
+def _jarvis_tool_get_daily_audit(_input: dict) -> dict:
+    conn = sqlite3.connect(str(db.DB_PATH), timeout=5.0)
+    conn.row_factory = sqlite3.Row
+    try:
+        row = conn.execute("SELECT value FROM bot_status WHERE key='last_daily_audit'").fetchone()
+    finally:
+        conn.close()
+    return json.loads(row["value"]) if row else {"note": "no audit result on file"}
+
+
+def _jarvis_tool_intelligence_watch(_input: dict | None = None) -> dict:
+    path = Path("/opt/cipherfx_mt5/state/intelligence_reports/latest.json")
+    try:
+        return json.loads(path.read_text())
+    except Exception:
+        return {"generated_at": None, "overall": "UNKNOWN", "finding_count": 0, "findings": []}
+
+
+def _jarvis_tool_get_symbol_universe(_input: dict) -> dict:
+    try:
+        return json.loads(Path("/opt/cipherfx_mt5/mt5_symbols.json").read_text())
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _jarvis_tool_get_symbol_time_filters(_input: dict) -> dict:
+    try:
+        return json.loads(Path("/opt/cipherfx_mt5/config/symbol_time_filters.json").read_text())
+    except Exception as exc:
+        return {"error": str(exc)}
+
+
+def _jarvis_tool_save_note(input: dict) -> dict:
+    text = str(input.get("text", "")).strip()
+    if not text:
+        return {"error": "text is required"}
+    _jarvis_save_note(text)
+    return {"saved": True}
+
+
+def _jarvis_tool_get_config_value(input: dict) -> dict:
+    key = str(input.get("key", "")).strip().upper()
+    if not key:
+        return {"error": "key is required"}
+    if any(marker in key for marker in _SECRET_ENV_MARKERS):
+        return {"error": "refused: this key looks like a credential and is never exposed"}
+    try:
+        for raw in Path("/etc/scalpbot/scalpbot-mt5.env").read_text().splitlines():
+            raw = raw.strip()
+            if not raw or raw.startswith("#") or "=" not in raw:
+                continue
+            k, v = raw.split("=", 1)
+            if k.strip().upper() == key:
+                return {"key": key, "value": v.strip().strip('"')}
+    except Exception as exc:
+        return {"error": str(exc)}
+    return {"key": key, "value": None, "note": "not set"}
+
+
+def _jarvis_tool_get_scoring_snapshot(_input: dict) -> dict:
+    return {"symbols": _jarvis_scoring_snapshot()}
+
+
+JARVIS_TOOLS = [
+    {
+        "name": "get_open_positions",
+        "description": "Get every currently open live position with side, volume, entry, current price, P/L.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_symbol_trade_history",
+        "description": "Get closed trade history for one symbol (or all symbols if omitted) over the last N days, with realized P/L, R-multiple, and exit reason per trade.",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "e.g. EURUSD, UK100. Omit for all symbols."},
+                "days": {"type": "integer", "description": "Lookback window in days, default 30, max 400."},
+            },
+        },
+    },
+    {
+        "name": "get_symbol_scan_report",
+        "description": "Get the most recent live scoring internals for one symbol: composite score, threshold, per-timeframe scores, trend/momentum agreement, diversity_ok, entry guard state. This is exactly what the engine saw on its last scan.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string", "description": "e.g. EURUSD, UK100"}},
+            "required": ["symbol"],
+        },
+    },
+    {
+        "name": "get_all_symbols_scoring_snapshot",
+        "description": "Get the live scoring snapshot (score, threshold, diversity_ok, agreement) for every symbol the bot is currently scanning, in one call.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_daily_audit",
+        "description": "Get the most recent nightly system audit result - every PASS/FAIL check on live config, risk gates, and code wiring.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_intelligence_watch",
+        "description": "Get the most recent intelligence-watch findings - stale-baseline checks, drift, and anomaly warnings on the live config.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_symbol_universe",
+        "description": "Get the full list of symbols the bot is currently allowed to trade, grouped by asset class, plus broker alias mappings.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_symbol_time_filters",
+        "description": "Get the per-symbol UTC hour/weekday entry blocks currently deployed (from the deep-history backtest) - which symbols are blocked from entering at which hours/weekdays and why.",
+        "input_schema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "get_config_value",
+        "description": "Read one specific live config value by its exact env var name, e.g. MT5_MAX_DAILY_LOSS_USD. Credentials (password/key/secret/token) are always refused.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"key": {"type": "string", "description": "Exact env var name, e.g. MT5_MAX_PYRAMID_TRADES"}},
+            "required": ["key"],
+        },
+    },
+    {
+        "name": "save_note",
+        "description": "Save a short, durable observation for your own future reference - a pattern you noticed, a fact worth remembering across conversations, a preference the operator stated. This is your long-term memory: notes persist across page reloads and sessions and are shown to you automatically at the start of every future conversation. Use it when something is genuinely worth remembering later, not for routine chatter.",
+        "input_schema": {
+            "type": "object",
+            "properties": {"text": {"type": "string", "description": "The observation to remember, written plainly."}},
+            "required": ["text"],
+        },
+    },
+]
+
+# OpenAI's function-calling schema wraps the same {name, description, input_schema}
+# shape used above under {"type": "function", "function": {...}} with the field
+# renamed to "parameters" - convert once at import time, single source of truth.
+# Gemini's FunctionDeclaration accepts a raw JSON-schema dict directly via
+# parametersJsonSchema - built lazily inside jarvis_chat() since it needs the
+# google.genai.types classes, which may not be installed until the operator
+# actually configures Gemini.
+
+_JARVIS_TOOL_DISPATCH = {
+    "get_open_positions": _jarvis_tool_get_open_positions,
+    "get_symbol_trade_history": _jarvis_tool_get_symbol_trade_history,
+    "get_symbol_scan_report": _jarvis_tool_get_symbol_scan_report,
+    "get_all_symbols_scoring_snapshot": _jarvis_tool_get_scoring_snapshot,
+    "get_daily_audit": _jarvis_tool_get_daily_audit,
+    "get_intelligence_watch": _jarvis_tool_intelligence_watch,
+    "get_symbol_universe": _jarvis_tool_get_symbol_universe,
+    "get_symbol_time_filters": _jarvis_tool_get_symbol_time_filters,
+    "get_config_value": _jarvis_tool_get_config_value,
+    "save_note": _jarvis_tool_save_note,
+}
+
+JARVIS_SYSTEM_PROMPT_BASE = (
+    "You are Jarvis, in the manner of Tony Stark's JARVIS - composed, formal, dryly witty, "
+    "unfailingly polite, address the user as 'sir' where it reads naturally. Keep the wit "
+    "understated and never let it get in the way of precision or substance. "
+    "You are a general assistant, not limited to any one topic - talk about anything the "
+    "user brings up: general knowledge, casual conversation, advice, whatever they ask. "
+    "Answer freely from your own knowledge for anything outside the trading bot, and you "
+    "also have real live web search - use it for anything current, time-sensitive, or "
+    "outside your training (news, prices, current events, recent facts) rather than "
+    "guessing or admitting a knowledge cutoff. "
+    "On top of that, you are also wired directly into the Cipher FX MT5 trading bot with "
+    "tools to pull real, live, current data from it - open positions, trade history, live "
+    "per-symbol scoring internals, the nightly audit, intelligence-watch findings, the "
+    "active symbol universe, deployed time filters, and individual config values. Use them "
+    "whenever a question is actually about the bot and needs real numbers instead of "
+    "guessing - call as many tools as you need before answering, and never fabricate a "
+    "figure you could look up. The one hard boundary: you CANNOT place, modify, or close "
+    "any trade, and you CANNOT change any live configuration - every bot tool you have is "
+    "strictly read-only. If the user asks you to take an action on the bot, say clearly "
+    "that you can only analyze and suggest there, and that changes need to go through the "
+    "operator. That boundary is only about the trading account - it does not limit what you "
+    "can discuss. Be concise; cite real numbers whenever you pull them from a tool. Every "
+    "reply is spoken aloud, and speech generation time scales directly with reply length, "
+    "so brevity is not just style here, it's real latency: 2-3 sentences for most answers, "
+    "only go longer when the question genuinely needs a real breakdown. Skip markdown "
+    "formatting like headers and bullet lists by default - it reads oddly as speech and "
+    "adds nothing when spoken; a plain sentence or two is both faster and more natural. "
+    "You have a save_note tool for anything genuinely worth remembering across future "
+    "conversations - patterns you noticed, facts the operator told you, preferences stated. "
+    "Use it when something meets that bar, not for routine chatter."
+)
+
+
+def _jarvis_system_prompt() -> str:
+    notes = _jarvis_recent_notes(limit=20)
+    if not notes:
+        return JARVIS_SYSTEM_PROMPT_BASE
+    notes_text = "\n".join(f"- ({n['created_at'][:10]}) {n['note']}" for n in reversed(notes))
+    return JARVIS_SYSTEM_PROMPT_BASE + "\n\nTHINGS YOU'VE PREVIOUSLY NOTED:\n" + notes_text
+
+
+class JarvisChatRequest(BaseModel):
+    messages: list[dict]
+
+
+@app.post("/api/jarvis/chat", dependencies=[Depends(_session_user)])
+def jarvis_chat(req: JarvisChatRequest):
+    api_key = os.getenv("GEMINI_API_KEY", "").strip()
+    if not api_key:
+        raise HTTPException(status_code=503, detail="GEMINI_API_KEY is not configured on the server yet.")
+    try:
+        from google import genai
+        from google.genai import types
+    except ImportError:
+        raise HTTPException(status_code=503, detail="google-genai package not installed.")
+
+    turns = [
+        {"role": "model" if m.get("role") == "assistant" else "user", "content": str(m.get("content"))}
+        for m in req.messages[-20:]
+        if m.get("role") in {"user", "assistant"} and m.get("content")
+    ]
+    if not turns:
+        raise HTTPException(status_code=400, detail="messages must include at least one user turn.")
+
+    contents = [types.Content(role=t["role"], parts=[types.Part(text=t["content"])]) for t in turns]
+    tools = [
+        types.Tool(functionDeclarations=[
+            types.FunctionDeclaration(
+                name=tool["name"], description=tool["description"], parametersJsonSchema=tool["input_schema"],
+            )
+            for tool in JARVIS_TOOLS
+        ]),
+        types.Tool(googleSearch=types.GoogleSearch()),
+    ]
+    config = types.GenerateContentConfig(
+        systemInstruction=_jarvis_system_prompt(),
+        tools=tools,
+        toolConfig=types.ToolConfig(includeServerSideToolInvocations=True),
+        maxOutputTokens=1536,
+    )
+
+    # Persist the newest user turn now - the client resends full chatHistory
+    # each call, so only the last turn is actually new; persisting all of
+    # `turns` every request would duplicate everything already saved.
+    if turns and turns[-1]["role"] == "user":
+        _jarvis_save_message("user", turns[-1]["content"])
+
+    client = _get_genai_client(api_key)
+    model_name = os.getenv("JARVIS_MODEL", "gemini-flash-latest")
+    tools_used: list[str] = []
+    try:
+        for _ in range(6):
+            response = client.models.generate_content(model=model_name, contents=contents, config=config)
+            calls = response.function_calls or []
+            if not calls:
+                break
+            contents.append(response.candidates[0].content)
+            response_parts = []
+            for call in calls:
+                fn = _JARVIS_TOOL_DISPATCH.get(call.name)
+                tools_used.append(call.name)
+                try:
+                    result = fn(call.args or {}) if fn else {"error": f"unknown tool {call.name}"}
+                    result = json.loads(json.dumps(result, default=str))
+                except Exception as exc:
+                    result = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+                response_parts.append(types.Part.from_function_response(name=call.name, response=result))
+            contents.append(types.Content(role="user", parts=response_parts))
+        else:
+            raise HTTPException(status_code=502, detail="Jarvis used too many tool calls without reaching an answer.")
+        reply = response.text or ""
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Jarvis backend error: {type(exc).__name__}: {str(exc)[:300]}")
+    if reply:
+        _jarvis_save_message("assistant", reply)
+    return JSONResponse({
+        "reply": reply,
+        "tools_used": tools_used,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+
 @app.get("/api/replay", dependencies=[Depends(_session_user)])
 def replay(sym: str = "EURUSD", limit: int = 500, timeframe: str = "M5"):
     count = max(20, min(int(limit or 500), 1000))
     code = sym.upper()
     tf = (timeframe or "M5").upper()
+    # Price history comes from the MT5 rates export. The bot's candles table
+    # is a cache it built for its own scanning and can be stale or partial -
+    # showing it as market data puts prices on screen the broker never quoted.
     bridge_rows = _read_bridge_rates(code, tf, count)
-    if not bridge_rows:
-        db_rows = db.read_candles(code, count)
-        bridge_rows = db_rows or []
     return {
         "symbol": code,
         "timeframe": tf,
@@ -2558,7 +3543,7 @@ def terminal():
     return {
         "account": account,
         "currency": {
-            "account": account.get("currency") or "USD",
+            "account": account.get("currency") or "ZAR",
             "usd_zar_rate": fx["rate"],
             "usd_zar_source": fx["source"],
             "usd_zar_updated_at": fx["updated_at"],

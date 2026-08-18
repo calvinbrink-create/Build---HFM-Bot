@@ -1190,7 +1190,8 @@ void ExportSymbols(bool export_ticks)
          "symbol", "visible", "description", "path", "digits", "point",
          "volume_min", "volume_max", "volume_step", "contract_size",
          "tick_value", "tick_value_profit", "tick_value_loss", "tick_size",
-         "stops_level", "trade_mode", "filling_mode", "currency_profit"
+         "stops_level", "trade_mode", "filling_mode", "currency_profit",
+         "volume_limit"
       );
    int totalAll = exportStatic ? ArraySize(configuredSymbols) : 0;
    for(int idx = 0; idx < totalAll; idx++)
@@ -1219,7 +1220,8 @@ void ExportSymbols(bool export_ticks)
             IntegerToString((int)SymbolInfoInteger(allSymbol, SYMBOL_TRADE_STOPS_LEVEL)),
             IntegerToString((int)SymbolInfoInteger(allSymbol, SYMBOL_TRADE_MODE)),
             IntegerToString((int)SymbolInfoInteger(allSymbol, SYMBOL_FILLING_MODE)),
-            SymbolInfoString(allSymbol, SYMBOL_CURRENCY_PROFIT)
+            SymbolInfoString(allSymbol, SYMBOL_CURRENCY_PROFIT),
+            DoubleToString(SymbolInfoDouble(allSymbol, SYMBOL_VOLUME_LIMIT), 8)
          );
       }
    }
@@ -1267,6 +1269,18 @@ void ExportSymbols(bool export_ticks)
          ExportRatesIfChanged(visibleSymbol, PERIOD_M30, "M30");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H1, "H1");
          ExportRatesIfChanged(visibleSymbol, PERIOD_H4, "H4");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_D1, "D1");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_H4, "H4");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_H1, "H1");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_M30, "M30");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_M15, "M15");
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_M5, "M5");
+         // M1 was omitted from the deep-history list, so the only M1 on disk
+         // was the 7-day HistoricalM1Bars rolling window (10080 bars). That
+         // is too shallow to replay the 10s scan cadence against. Writes to
+         // deephistory_<sym>_M1.csv and self-gates on file existence, so it
+         // cannot disturb the live rates_*.csv the bot trades on.
+         ExportDeepHistoryOnce(visibleSymbol, PERIOD_M1, "M1");
       }
       // Keep broker calculations and order requests ahead of the next symbol.
       ProcessCommands();
@@ -1386,6 +1400,49 @@ bool ExportRates(string symbol, ENUM_TIMEFRAMES timeframe, string label)
       return false;
    RememberRateExport(symbol, timeframe, label);
    return true;
+}
+
+// One-time deep history export, requested 2026-07-22. Writes to brand-new
+// filenames (deephistory_*) so it can never collide with or disturb the
+// live rolling-window rates_*.csv files the running bot trades on. Gated
+// by the output file already existing on disk, so each symbol/timeframe
+// only ever gets exported once, regardless of how many timer cycles pass.
+// Requests far more bars than any broker will actually have (default
+// 50000) so CopyRates returns the true retention ceiling for that
+// symbol/timeframe rather than an arbitrary guess.
+void ExportDeepHistoryOnce(string symbol, ENUM_TIMEFRAMES timeframe, string label, int requested_bars = 500000)
+{
+   string final_path = BRIDGE_DIR + "\\deephistory_" + symbol + "_" + label + ".csv";
+   if(FileIsExist(final_path)) return;
+   long series_synchronized = 0;
+   if(!SeriesInfoInteger(symbol, timeframe, SERIES_SYNCHRONIZED, series_synchronized) || series_synchronized == 0)
+      return;
+   MqlRates rates[];
+   ArraySetAsSeries(rates, false);
+   int copied = CopyRates(symbol, timeframe, 0, requested_bars, rates);
+   if(copied <= 0) return;
+   string temp_path = final_path + ".tmp";
+   int handle = FileOpen(temp_path, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
+   if(handle == INVALID_HANDLE) return;
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   FileWrite(handle, "time", "open", "high", "low", "close", "volume", "spread_points", "spread_price");
+   for(int i = 0; i < copied; i++)
+   {
+      FileWrite(
+         handle,
+         IntegerToString((int)rates[i].time),
+         DoubleToString(rates[i].open, 8),
+         DoubleToString(rates[i].high, 8),
+         DoubleToString(rates[i].low, 8),
+         DoubleToString(rates[i].close, 8),
+         IntegerToString((int)rates[i].tick_volume),
+         IntegerToString((int)rates[i].spread),
+         DoubleToString((double)rates[i].spread * point, 10)
+      );
+   }
+   FileClose(handle);
+   AtomicReplaceFile(temp_path, final_path);
+   PrintFormat("CipherFX deep history exported symbol=%s tf=%s bars=%d", symbol, label, copied);
 }
 
 void ExportHistoricalM1Slice()

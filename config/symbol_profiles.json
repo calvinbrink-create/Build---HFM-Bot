@@ -6,23 +6,23 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
     "EU50": {
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 3548
     },
     "EURGBP": {
       "breakeven_trigger_r": 1.0,
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 3,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -31,8 +31,8 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -41,23 +41,23 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
     "FRA40": {
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 3548
     },
     "GBPJPY": {
       "breakeven_trigger_r": 1.0,
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 3,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -66,8 +66,8 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -76,23 +76,23 @@
       "enabled": true,
       "market": "index_cfd_eu",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 3548,
       "max_position_pct": 12.0,
       "trail_start_r": 1.2
     },
     "JP225": {
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 3548
     },
     "NAS100": {
       "breakeven_trigger_r": 1.0,
       "enabled": true,
       "market": "index_cfd",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 6.0,
       "trail_start_r": 1.2
     },
@@ -101,8 +101,8 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -111,33 +111,70 @@
       "enabled": true,
       "market": "index_cfd",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0,
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 3548,
       "max_position_pct": 12.0,
       "trail_start_r": 1.2
     },
     "UK100": {
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 220.0
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 3548
     },
     "US30": {
-      "breakeven_trigger_r": 1.0,
+      "breakeven_trigger_r": 0.5,
       "enabled": true,
       "market": "index_cfd",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 200.0,
+      "max_duration_minutes": 7200,
+      "max_open_position_loss_usd": 3225,
       "max_position_pct": 8.0,
-      "trail_start_r": 1.2
+      "trail_start_r": 1.0,
+      "profit_take_r": 99.0,
+      "giveback_trigger_r": 4.0,
+      "giveback_max_r": 1.0,
+      "ratchet_tiers": [
+        [
+          0.5,
+          0.25
+        ],
+        [
+          0.8,
+          0.3
+        ],
+        [
+          1.0,
+          0.4
+        ],
+        [
+          1.5,
+          0.3
+        ],
+        [
+          2.0,
+          0.25
+        ],
+        [
+          3.0,
+          0.3
+        ],
+        [
+          5.0,
+          0.35
+        ],
+        [
+          8.0,
+          0.4
+        ]
+      ]
     },
     "USDCAD": {
       "breakeven_trigger_r": 1.0,
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -146,8 +183,8 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 3,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -156,8 +193,8 @@
       "enabled": true,
       "market": "forex",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 150.0,
+      "max_duration_minutes": 480,
+      "max_open_position_loss_usd": 2419,
       "max_position_pct": 25.0,
       "trail_start_r": 1.2
     },
@@ -166,8 +203,8 @@
       "engine": "METALS_ENGINE",
       "market": "metal",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 300.0
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 4838
     },
     "XAUUSD": {
       "breakeven_trigger_r": 1.0,
@@ -175,8 +212,8 @@
       "engine": "METALS_ENGINE",
       "market": "metal",
       "max_daily_trades": 10,
-      "max_duration_minutes": 240,
-      "max_open_position_loss_usd": 80.0,
+      "max_duration_minutes": 1440,
+      "max_open_position_loss_usd": 1290,
       "max_position_pct": 3.0,
       "trail_start_r": 1.2
     }

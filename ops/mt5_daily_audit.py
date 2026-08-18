@@ -128,12 +128,45 @@ def audit() -> int:
         and "initial_risk * 1.5" in management_source
     )
 
+    # 4e. Per-symbol UTC hour/weekday time filters wired into all three
+    # engines. Added 2026-07-22 after the deep-history backtest (~15 months
+    # / ~11,600 trades via the MQL5 deephistory export) found reproducible
+    # bad windows (validated independently in both halves of the sample)
+    # for 11 of 14 symbols. Turned the full-universe backtest total from
+    # -145.86R to +37.47R with zero symbols made worse. Config lives in
+    # config/symbol_time_filters.json. Extended 2026-07-23: hour 0 UTC
+    # (02:00 SAST) added for every index symbol including US30 (a fresh
+    # entry - previously untouched) after real live losses clustered there,
+    # pending a full cross-validated backtest of that specific window like
+    # the rest of this file already has. XAUUSD/XAGUSD legitimately have no
+    # entries (no qualifying windows found) and must stay untouched.
+    try:
+        time_filters_config = json.loads((APP / "config/symbol_time_filters.json").read_text())
+    except Exception:
+        time_filters_config = None
+    time_filters_ok = (
+        time_filters_config is not None
+        and set(time_filters_config.keys())
+        == {"EURUSD", "GBPUSD", "USDJPY", "USDCAD", "NAS100", "SPX500",
+            "GER40", "UK100", "FRA40", "EU50", "JP225", "US30"}
+    )
+    for engine_file in ("forex.py", "indices.py", "metals.py"):
+        engine_source = (APP / "cipherfx_platform/engines" / engine_file).read_text()
+        if "time_filters.blocked(snapshot.symbol" not in engine_source:
+            time_filters_ok = False
+            details[f"time_filters_missing_{engine_file}"] = True
+    checks["symbol_time_filters_wired"] = time_filters_ok
+
     # 5. Configured limits match the approved values.
+    # MT5_MAX_DAILY_LOSS_USD raised 1000->5000 on 2026-07-20 (old cap was
+    # silently blocking every symbol for hours with no dashboard indication).
+    # MT5_MAX_PYRAMID_TRADES dropped 8->1 on 2026-07-21 (pyramiding disabled
+    # entirely after the 8-leg simultaneous burst-fire proved too risky).
     checks["limits_aligned"] = (
         env("MT5_MAX_DAILY_TRADES") == "100"
-        and env("MT5_MAX_DAILY_LOSS_USD") == "1000"
+        and env("MT5_MAX_DAILY_LOSS_USD") == "5000"
         and env("MT5_MAX_DAILY_TRADES_PER_SYMBOL") == "10"
-        and env("MT5_MAX_PYRAMID_TRADES") == "8"
+        and env("MT5_MAX_PYRAMID_TRADES") == "1"
     )
 
     # 5b. Pyramid legs decay in size, and gold stays sized down.
@@ -149,7 +182,21 @@ def audit() -> int:
         gold_risk_pct, metals_default = 999.0, 1.0
     checks["gold_sized_conservatively"] = 0 < gold_risk_pct <= metals_default
 
-    # 6. Symbol universe intact (17 canonical instruments).
+    # 6. Symbol universe intact (9 canonical instruments). EURJPY removed
+    # 2026-07-21 (4.2% all-time win rate, worst forex symbol by a wide
+    # margin). AUDUSD/NZDUSD removed 2026-07-22 after a fresh backtest
+    # confirmed both still net negative even in the recent out-of-sample
+    # window (avg -0.28R and -0.11R/trade) while the rest of forex had
+    # turned net positive. EURUSD removed 2026-07-22 after the deep-history
+    # backtest (~15 months, 839 trades via the MQL5 deephistory export)
+    # showed a dead-stable -0.057R/trade edge in both halves of the sample -
+    # the worst and most reliably negative symbol in the whole universe.
+    # GER40/FRA40/EU50 removed 2026-07-23 - full-history realized P&L was
+    # net negative for every single index symbol (-$7,201.57 combined across
+    # all 8), and these three were the worst three (-$1,931.73/-$1,527.16/
+    # -$1,292.14, win rates 21%/14%/29%). USDCAD removed 2026-07-23 - 11%
+    # win rate (1 win in 9 trades), -$1,830.85, worse than every symbol
+    # already removed from forex.
     try:
         catalog = json.loads((APP / "mt5_symbols.json").read_text())
         active = [
@@ -159,7 +206,17 @@ def audit() -> int:
         ]
     except Exception:
         active = []
-    checks["symbol_universe_17"] = len(active) == 17
+    checks["symbol_universe_9"] = (
+        len(active) == 9
+        and "EURJPY" not in active
+        and "AUDUSD" not in active
+        and "NZDUSD" not in active
+        and "EURUSD" not in active
+        and "GER40" not in active
+        and "FRA40" not in active
+        and "USDCAD" not in active
+        and "EU50" not in active
+    )
     details["active_symbols"] = len(active)
 
     # 7. Database healthy.

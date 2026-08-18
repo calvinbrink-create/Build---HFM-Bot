@@ -1,176 +1,207 @@
 from __future__ import annotations
-
-import hashlib
+import os as _os
 import os
-from datetime import timedelta
+from math import isfinite
+from pathlib import Path
 from typing import Any
+from ..contracts import Candle, MarketSnapshot
+from ..market_regime import classify_market
 
-from ..contracts import MarketSnapshot, TradeProposal, SIDES, utc_now
-from ..database import DatabaseLayer
-from .. import entry_timing
+FRAME_ORDER = ("H4", "M15", "M5")
+ENGINE = "METALS_ENGINE"
+STRATEGY = "METALS_CHART_LIQUIDITY_GRAB_IMPULSE"
+_MEMORY = None
+_MEMORY_MTIME = None
+
+def _candles(frame) -> list[Candle]:
+    return list(getattr(frame, "candles", ())) if frame is not None else []
+
+def _side(c: Candle | None) -> str:
+    return "BUY" if c and c.close > c.open else "SELL" if c and c.close < c.open else "NONE"
+
+def _live_bar_age_seconds(candles, tick) -> float | None:
+    if not candles or tick is None:
+        return None
+    current_start = (tick.timestamp.timestamp() // 300.0) * 300.0
+    expected_last = current_start - 300.0
+    last_start = candles[-1].timestamp.timestamp()
+    if abs(last_start - expected_last) > 5.0:
+        return None
+    return max(0.0, tick.timestamp.timestamp() - current_start)
+
+def _atr(frame, period=14) -> float:
+    c=_candles(frame)
+    if len(c)<2: return 0.0
+    tr=[max(x.high-x.low,abs(x.high-(c[i-1].close if i else x.open)),abs(x.low-(c[i-1].close if i else x.open))) for i,x in enumerate(c)]
+    return sum(tr[-period:])/min(period,len(tr))
+
+def _direction(frame, lookback: int = 20) -> str:
+    """Direction over a RECENT window, not the whole frame.
+
+    Was comparing c[-1] against c[0] - the OLDEST bar in a 220-bar frame,
+    which on H4 is 37 days back. That made every index read "BUY" simply
+    because price sat above its level from a month earlier, and the engine
+    then forced BUY into intraday downtrends. Measured 2026-08-17 on the
+    live ledger: 221 of 650 trades fought both H4 and H1 trend, losing
+    110,614 ZAR while trend-aligned trades made +63,809.
+
+    forex.py already used a recent window (c[-8]); indices/metals did not.
+    20 bars matches the lookback classify_market() uses for the same frame.
+    """
+    c=_candles(frame)
+    if len(c)<8: return "NONE"
+    w=c[-(min(lookback,len(c)-1)+1):]
+    if w[-1].close>w[0].close and w[-1].low>=w[0].low: return "BUY"
+    if w[-1].close<w[0].close and w[-1].high<=w[0].high: return "SELL"
+    return "MIXED"
+
+def _recent_direction(frame, lookback: int) -> str | None:
+    """Simple close-vs-N-bars-ago direction on a recent window.
+
+    Deliberately NOT the strict high/low monotonic test used by
+    _direction() - that returns MIXED too often and was the source of
+    the fail-open hole. Returns None when there is not enough data.
+    """
+    c=_candles(frame)
+    if len(c)<lookback+1: return None
+    return "BUY" if c[-1].close>c[-1-lookback].close else "SELL"
 
 
-class MetalsLearningEngine:
-    """Independent metals intelligence, scoring, probability and history."""
+def _chart_setup(frame, tick=None, expected_side: str | None = None) -> dict[str,Any]:
+    c=_candles(frame)
+    if len(c)<20: return {"valid":False,"side":"NONE","type":"NONE","liquidity_grab":False,"impulse":False}
+    cur,ref,recent=c[-1],c[-15:-5],c[-5:-1]
+    hi,lo=max(x.high for x in ref),min(x.low for x in ref)
+    live_ask = float(getattr(tick, "ask", 0.0) or 0.0) if tick is not None else 0.0
+    live_bid = float(getattr(tick, "bid", 0.0) or 0.0) if tick is not None else 0.0
+    live_age = _live_bar_age_seconds(c, tick)
+    if live_age is not None:
+        _trig=_atr(frame)*float(_os.getenv("MT5_TRIGGER_ATR","0.10"))
+        if live_age <= 120.0 and live_ask > cur.close+_trig and expected_side in ("BUY","ANY"):
+            return {"valid":True,"side":"BUY","type":"LIVE_STRUCTURE_BREAK","liquidity_grab":False,"impulse":False,"level":cur.close,"reference_level":hi,"candle_color":"GREEN","trigger_source":"LIVE_TICK","trigger_price":live_ask,"trigger_age_seconds":live_age,"forming_open":cur.close,"forming_direction":"BUY"}
+        if live_age <= 120.0 and live_bid < cur.close-_trig and expected_side in ("SELL","ANY"):
+            return {"valid":True,"side":"SELL","type":"LIVE_STRUCTURE_BREAK","liquidity_grab":False,"impulse":False,"level":cur.close,"reference_level":lo,"candle_color":"RED","trigger_source":"LIVE_TICK","trigger_price":live_bid,"trigger_age_seconds":live_age,"forming_open":cur.close,"forming_direction":"SELL"}
+        return {"valid":False,"side":"NONE","type":"NONE","liquidity_grab":False,"impulse":False,"trigger_source":"LIVE_WINDOW_CLOSED","trigger_age_seconds":live_age}
+    atr,body=_atr(frame),abs(cur.close-cur.open);impulse=bool(atr>0 and body>=atr*.5)
+    gr_buy=any(x.low<lo for x in recent) and _side(cur)=="BUY" and cur.close>lo
+    gr_sell=any(x.high>hi for x in recent) and _side(cur)=="SELL" and cur.close<hi
+    br_buy=_side(cur)=="BUY" and cur.close>hi and impulse;br_sell=_side(cur)=="SELL" and cur.close<lo and impulse
+    if gr_buy and impulse: typ,side="LIQUIDITY_GRAB_PRESSURE","BUY"
+    elif gr_sell and impulse: typ,side="LIQUIDITY_GRAB_PRESSURE","SELL"
+    elif br_buy: typ,side="IMPULSE_STRUCTURE_BREAK","BUY"
+    elif br_sell: typ,side="IMPULSE_STRUCTURE_BREAK","SELL"
+    else: return {"valid":False,"side":"NONE","type":"NONE","liquidity_grab":gr_buy or gr_sell,"impulse":impulse}
+    # FAIL-CLOSED. Was: only blocked when expected_side was BUY/SELL, so an
+    # unknown direction (None) permitted BOTH sides - the filter disabled
+    # itself exactly when the trend was unclear. Measured 2026-08-17: this
+    # costs ~0.4% of scans to close, not meaningful trade volume.
+    if expected_side == "ANY":
+        pass
+    elif expected_side not in {"BUY", "SELL"} or side != expected_side:
+        return {"valid": False, "side": "NONE", "type": typ, "trigger_source": "SETUP_DIRECTION_MISMATCH", "setup_direction": expected_side, "detected_direction": side}
+    return {"valid":True,"side":side,"type":typ,"liquidity_grab":gr_buy or gr_sell,"impulse":True,"level":lo if side=="BUY" else hi,"trigger_source":"COMPLETED_CANDLE"}
 
-    ENGINE="METALS"
-    MODEL_VERSION = "cfx-learning-v2"
-    # Collapsed to the 5 timeframes that actually drive the immediate
-    # snapshot-score-execute decision (no MN1/W1/D1/M30/M3) - see forex.py
-    # for why.
-    # M1 dropped - see forex.py TIME_WEIGHTS comment for the backtest evidence.
-    TIME_WEIGHTS={"H4":12,"H1":14,"M15":14,"M5":13}
-    THRESHOLD=57.0
-    ADAPTIVE_ADJUSTMENT_CAP=7.0
-    FEATURE_MAX=108.0
-    FEATURE_WEIGHT=8.0
-    _score_scale=float(sum(TIME_WEIGHTS.values()))
-    # Quality-over-quantity gate: require independent agreement across
-    # trend, momentum, AND at least one structural price-action pattern
-    # before a proposal can pass, regardless of total score.
-    MIN_TREND_TIMEFRAME_AGREEMENT = 3
-    MIN_MOMENTUM_TIMEFRAME_AGREEMENT = 3
-    STRUCTURE_REASONS = frozenset({"IMPULSE", "LIQUIDITY_GRAB", "FVG", "ORDER_BLOCK_LOCATION"})
+def _memory(frame, side: str) -> dict[str,Any]:
+    global _MEMORY,_MEMORY_MTIME
+    out={"role":"SETUP_RECOGNITION","recognized":False,"shape":None,"neighbours":0}
+    try:
+        from ..pattern_memory import PatternMemory,encode_shape
+        path=Path(os.getenv("MT5_PATTERN_MEMORY_PATH","/opt/cipherfx_mt5/config/pattern_memory.npz"))
+        stamp=path.stat().st_mtime_ns if path.exists() else None
+        if _MEMORY is None or stamp!=_MEMORY_MTIME: _MEMORY,_MEMORY_MTIME=PatternMemory.load(str(path)),stamp
+        shape=encode_shape([x.close for x in _candles(frame)]);out["shape"]=shape
+        result=_MEMORY.query(shape) if _MEMORY is not None else None
+        if result:
+            taken=result["buy"] if side=="BUY" else result["sell"];other=result["sell"] if side=="BUY" else result["buy"]
+            out.update({"recognized":True,"expected_r":round(taken,4),"opposite_r":round(other,4),"neighbours":result["n"]})
+    except Exception: pass
+    return out
 
-    def __init__(self,database:DatabaseLayer|None=None):
-        self.database=database
-        # SCORE_FLOOR is a true safety floor below THRESHOLD by exactly the max
-        # adaptive adjustment by default, so the reward half of the adaptive
-        # loop (good performance lowering the bar) stays reachable instead of
-        # being clamped away - but MT5_SCORE_FLOOR lets an operator raise this
-        # floor at runtime (e.g. during an incident) without a code change.
-        default_floor = self.THRESHOLD - self.ADAPTIVE_ADJUSTMENT_CAP
+def _context(frame)->dict[str,Any]:
+    c=_candles(frame)
+    return {"available":bool(c),"direction":_direction(frame),"bar_time":c[-1].timestamp.isoformat() if c else ""}
+
+
+
+def build_setup(snapshot: MarketSnapshot)->dict[str,Any]:
+    # HOUR FILTER. Measured 2026-08-18 on M1-resolution backtest, 69 days:
+    # hours 4,5,20,22 UTC are net negative or flat; 0,8,17,18 are weakest.
+    # Excluding them lifted R/trade 0.149 -> 0.221 and cut the worst losing
+    # streak from 9 to 7. MT5_BLOCKED_HOURS_UTC="" disables the filter.
+    _bh = str(_os.getenv("MT5_BLOCKED_HOURS_UTC", "0,4,5,8,17,18,20,22")).strip()
+    if _bh:
         try:
-            self.SCORE_FLOOR = float(os.getenv("MT5_SCORE_FLOOR", str(default_floor)))
-        except (TypeError, ValueError):
-            self.SCORE_FLOOR = default_floor
-        self.base_threshold=max(
-            self.SCORE_FLOOR,
-            float(os.getenv("MT5_MIN_SCORE_METALS", os.getenv("MT5_SCORE_FLOOR", str(self.THRESHOLD)))),
-        )
-        try:self.learning_min_samples=max(5,int(os.getenv("MT5_METALS_LEARNING_MIN_SAMPLES","5")))
-        except (TypeError,ValueError):self.learning_min_samples=5
-        self.last_learning_sample_size=0
-        self.last_learning_average_r=0.0
-        self.last_report={}
-
-    @staticmethod
-    def _ema(frame,period):
-        v=[c.close for c in frame.candles]
-        if not v:return 0.0
-        a=2/(period+1); out=v[0]
-        for x in v[1:]:out=a*x+(1-a)*out
-        return out
-    @staticmethod
-    def _atr(frame,period=14):
-        if len(frame.candles)<2:return 0.0
-        tr=[]
-        for i,c in enumerate(frame.candles):
-            p=frame.candles[i-1].close if i else c.open;tr.append(max(c.high-c.low,abs(c.high-p),abs(c.low-p)))
-        sample=tr[-period:];return sum(sample)/len(sample)
-    @staticmethod
-    def _rmi(frame):
-        v=[c.close for c in frame.candles]
-        if len(v)<8:return 50.0
-        g=[max(v[i]-v[i-5],0) for i in range(5,len(v))];l=[max(v[i-5]-v[i],0) for i in range(5,len(v))]
-        ag=sum(g[-14:])/max(1,len(g[-14:]));al=sum(l[-14:])/max(1,len(l))
-        return 100 if al==0 and ag else 50 if al==0 else 100-100/(1+ag/al)
-    @staticmethod
-    def _body(c):return abs(c.close-c.open)/max(c.high-c.low,1e-12)
-    @staticmethod
-    def _location(c):return (c.close-c.low)/max(c.high-c.low,1e-12)
-    @staticmethod
-    def _volatility(frame):return (frame.candles[-1].high-frame.candles[-1].low)/max(MetalsLearningEngine._atr(frame),1e-12) if frame.candles else 0.0
-    @staticmethod
-    def _relative_volume(frame):
-        volumes=[float(c.volume or 0.0) for c in frame.candles]
-        if len(volumes)<5 or volumes[-1]<=0.0:return 0.0
-        baseline=[value for value in volumes[-21:-1] if value>0.0]
-        if len(baseline)<4:return 0.0
-        return volumes[-1]/(sum(baseline)/len(baseline))
-    @classmethod
-    def _normalize_score(cls,timeframe_total,feature_score):
-        bounded_features=max(0.0,min(cls.FEATURE_MAX,float(feature_score)))
-        raw_total=max(0.0,float(timeframe_total))+bounded_features*cls.FEATURE_WEIGHT/cls.FEATURE_MAX
-        maximum=cls._score_scale+cls.FEATURE_WEIGHT
-        return round(max(0.0,min(100.0,raw_total/maximum*100.0)),2)
-
-    def _timeframe(self,frame,side):
-        if not frame or not frame.candles:return 0.0
-        c=frame.candles[-1];e20=self._ema(frame,20);e50=self._ema(frame,50);rmi=self._rmi(frame);vol=self._volatility(frame);body=self._body(c)
-        pts=0.0
-        pts+=20 if (c.close>e20 if side=="BUY" else c.close<e20) else 0
-        pts+=20 if (e20>e50 if side=="BUY" else e20<e50) else 0
-        pts+=25 if (rmi>=52 if side=="BUY" else rmi<=48) else 0
-        pts+=20 if vol>=0.80 else 0
-        pts+=10 if (self._location(c)>=0.55 if side=="BUY" else self._location(c)<=0.45) else 0
-        pts+=5 if (c.close>c.open if side=="BUY" else c.close<c.open) and body>=0.25 else 0
-        return pts
-
-    def _trend_confirms(self, frame, side) -> bool:
-        if not frame or not frame.candles:
-            return False
-        c = frame.candles[-1]
-        e20 = self._ema(frame, 20); e50 = self._ema(frame, 50)
-        price_side = c.close > e20 if side == "BUY" else c.close < e20
-        cross_side = e20 > e50 if side == "BUY" else e20 < e50
-        return bool(price_side and cross_side)
-
-    def _momentum_confirms(self, frame, side) -> bool:
-        if not frame or not frame.candles:
-            return False
-        rmi = self._rmi(frame); vol = self._volatility(frame)
-        rmi_side = rmi >= 52 if side == "BUY" else rmi <= 48
-        return bool(rmi_side and vol >= 0.80)
-
-    def _features(self,snapshot,side):
-        m15=snapshot.frames["M15"];m5=snapshot.frames["M5"];c15=m15.candles[-1];c5=m5.candles[-1];pts=0.0;reasons=[]
-        atr15=max(self._atr(m15),1e-12);atr5=max(self._atr(m5),1e-12)
-        if (c15.high-c15.low)>=atr15*1.10:pts+=18;reasons.append("IMPULSE")
-        if self._volatility(m5)>=1.20:pts+=18;reasons.append("VOLATILITY_EXPANSION")
-        if ((c5.low<min(x.low for x in m5.candles[-8:-1]) and c5.close>c5.open) if side=="BUY" else (c5.high>max(x.high for x in m5.candles[-8:-1]) and c5.close<c5.open)):pts+=16;reasons.append("LIQUIDITY_GRAB")
-        if self._body(c5)>=0.35:pts+=12;reasons.append("PRESSURE_CANDLE")
-        if ((c15.close>self._ema(m15,20)) if side=="BUY" else (c15.close<self._ema(m15,20))):pts+=12;reasons.append("ORDER_BLOCK_LOCATION")
-        if len(m15.candles)>=3 and ((m15.candles[-3].high<m15.candles[-1].low) if side=="BUY" else (m15.candles[-3].low>m15.candles[-1].high)):pts+=10;reasons.append("FVG")
-        if ((c5.close>c5.open) if side=="BUY" else (c5.close<c5.open)):pts+=8;reasons.append("MOMENTUM")
-        if abs(c15.close-self._ema(m15,20))<=atr15*0.5:pts+=6;reasons.append("MEAN_REVERSION_ZONE")
-        if self._relative_volume(m5) >= 1.15:pts+=8;reasons.append("VOLUME_PRESSURE_PROXY")
-        return min(self.FEATURE_MAX,pts),reasons
-
-    def _adjustment(self):
-        self.last_learning_sample_size=0
-        self.last_learning_average_r=0.0
-        if not self.database:return 0.0
-        rows=self.database.engine_history(self.ENGINE,50, model_version=self.MODEL_VERSION, learning_only=True)
-        self.last_learning_sample_size=len(rows)
-        if len(rows)<self.learning_min_samples:return 0.0
-        average_r=sum(float(x["result_r"]) for x in rows)/len(rows)
-        self.last_learning_average_r=average_r
-        return max(-self.ADAPTIVE_ADJUSTMENT_CAP,min(self.ADAPTIVE_ADJUSTMENT_CAP,average_r*2.0))
-
-    def propose(self,snapshot:MarketSnapshot)->TradeProposal|None:
-        scores={side:{tf:self._timeframe(snapshot.frames[tf],side) for tf in self.TIME_WEIGHTS} for side in SIDES}
-        features={side:self._features(snapshot,side) for side in SIDES};raw_totals={side:sum(self.TIME_WEIGHTS[tf]*scores[side][tf]/100 for tf in self.TIME_WEIGHTS) for side in SIDES};totals={side:self._normalize_score(raw_totals[side],features[side][0]) for side in SIDES}
-        side=max(totals,key=totals.get);raw=totals[side];adj=self._adjustment();threshold=max(self.SCORE_FLOOR,self.base_threshold-adj)
-        trend_agreement = sum(1 for tf in self.TIME_WEIGHTS if self._trend_confirms(snapshot.frames[tf], side))
-        momentum_agreement = sum(1 for tf in self.TIME_WEIGHTS if self._momentum_confirms(snapshot.frames[tf], side))
-        structure_confirmed = any(reason in self.STRUCTURE_REASONS for reason in features[side][1])
-        diversity_ok = (
-            trend_agreement >= self.MIN_TREND_TIMEFRAME_AGREEMENT
-            and momentum_agreement >= self.MIN_MOMENTUM_TIMEFRAME_AGREEMENT
-            and structure_confirmed
-        )
-        entry_guard=entry_timing.evaluate(snapshot,side)
-        self.last_report={"engine":self.ENGINE,"scores":scores,"feature_scores":{k:v[0] for k,v in features.items()},"raw_totals":raw_totals,"totals":totals,"score":raw,"score_scale":"0-100","feature_max":self.FEATURE_MAX,"feature_weight":self.FEATURE_WEIGHT,"score_floor":self.SCORE_FLOOR,"threshold":round(threshold,2),"base_threshold":round(self.base_threshold,2),"adaptive_adjustment":adj,"learning_min_samples":self.learning_min_samples,"learning_sample_size":self.last_learning_sample_size,"learning_average_r":round(self.last_learning_average_r,4),"timeframes":list(self.TIME_WEIGHTS),"reasons":features[side][1],"trend_agreement":trend_agreement,"momentum_agreement":momentum_agreement,"structure_confirmed":structure_confirmed,"diversity_ok":diversity_ok,"entry_guard":entry_guard}
-        if raw<threshold or totals[side]<=totals["SELL" if side=="BUY" else "BUY"] or side not in SIDES or not diversity_ok or entry_guard["blocked"]:return None
-        # Stop/target anchored to H4 (not M5) - see forex.py propose() comment.
-        c=snapshot.frames["M5"].candles[-1];stop_distance=max(self._atr(snapshot.frames["H4"])*1.50,snapshot.tick.mid*0.0007);entry=snapshot.tick.ask if side=="BUY" else snapshot.tick.bid;target_distance=stop_distance*1.80
-        pid=hashlib.sha256(f"{self.ENGINE}|{snapshot.symbol}|{side}|{c.timestamp.isoformat()}".encode()).hexdigest()[:24];created=utc_now();calibration=self.database.calibrated_probability(self.ENGINE,side,raw,self.MODEL_VERSION) if self.database else {"probability":raw,"status":"PRIOR_ONLY","sample_size":0,"score_bucket":int(raw//10)*10};confidence=round(float(calibration["probability"]),2);probability=confidence
-        context={"engine":self.ENGINE,"asset_class":"metal","model_version":self.MODEL_VERSION,"probability_source":calibration["status"],"probability_sample_size":calibration["sample_size"],"probability_score_bucket":calibration["score_bucket"]}
-        return TradeProposal(pid,snapshot.symbol,"metal",side,entry,entry-stop_distance if side=="BUY" else entry+stop_distance,entry+target_distance if side=="BUY" else entry-target_distance,0.0,"METALS",raw,{"timeframes":scores[side],"features":features[side][0],"adaptive_adjustment":adj},created,created+timedelta(seconds=20),context,confidence,probability,tuple(features[side][1]),stop_distance)
-
-    def record_outcome(self, trade_id, symbol, result_r, pnl, metrics=None):
-        if self.database:
-            self.database.record_engine_outcome(
-                self.ENGINE, trade_id, symbol, result_r, pnl, metrics=metrics or {}
-            )
+            _blocked = {int(x) for x in _bh.split(",") if x.strip().isdigit()}
+            _hr = getattr(snapshot, "captured_at", None)
+            if _hr is not None and _hr.hour in _blocked:
+                return {"valid": False, "side": "NO_TRADE", "engine": ENGINE,
+                        "strategy_name": STRATEGY, "setup_type": STRATEGY,
+                        "rejection_reason": f"BLOCKED_HOUR_{_hr.hour}"}
+        except Exception:
+            pass
+    regime=classify_market(snapshot.frames)
+    h4=_context(snapshot.frames.get("H4"));m15=_context(snapshot.frames.get("M15"))
+    regime_h4=((regime.get("timeframes") or {}).get("H4") or {}).get("direction")
+    if regime_h4 in {"BUY", "SELL"}:
+        h4={**h4,"raw_direction":h4["direction"],"direction":regime_h4,"direction_source":"H4_REGIME"}
+    # DIRECTION = H4(5-bar) AND H1(8-bar) must agree. Backtested 2026-08-17
+    # on the LIVE_STRUCTURE_BREAK path (the only path that runs when M5 data
+    # is fresh) over 69 days: 52.0% win, +0.244 R/trade, +736R, positive in
+    # all 4 chronological folds. Alternatives on the same test:
+    #   no filter      41.2% win, -0.025 R/trade, -131R   (not robust)
+    #   220-bar frame  43.9% win, +0.044 R/trade, +160R   (not robust) <- old bug
+    #   H4 alone       49.0% win, +0.170 R/trade, +655R
+    #   H1 alone       48.7% win, +0.162 R/trade, +609R
+    # Fail-CLOSED: if the two disagree, setup_direction stays None and no
+    # trade is taken. The old code let None permit BOTH sides.
+    _h4d=_recent_direction(snapshot.frames.get("H4"),int(float(_os.getenv("MT5_H4_TREND_LOOKBACK","3"))))
+    _h1d=_recent_direction(snapshot.frames.get("H1"),int(float(_os.getenv("MT5_H1_TREND_LOOKBACK","5"))))
+    # MT5_DIRECTION_MODE: h4h1 (default) | h4 | h1 | none
+    #   h4h1  44 trades/day  +0.244 R/trade  +736R   most profitable
+    #   h4    56 trades/day  +0.170 R/trade  +655R   more trades
+    #   h1    55 trades/day  +0.162 R/trade  +609R
+    #   none  75 trades/day  -0.025 R/trade  -131R   LOSES MONEY
+    _mode=str(_os.getenv("MT5_DIRECTION_MODE","h4h1")).strip().lower()
+    if _mode=="none":   setup_direction="ANY"   # explicit: no direction filter, both sides allowed
+    elif _mode=="h4":   setup_direction=_h4d
+    elif _mode=="h1":   setup_direction=_h1d
+    else:               setup_direction=_h4d if (_h4d is not None and _h4d==_h1d) else None
+    h4={**h4,"h4_recent":_h4d,"h1_recent":_h1d,"direction_source":"H4_H1_AGREEMENT"}
+    chart=_chart_setup(snapshot.frames.get("M5"),snapshot.tick,setup_direction)
+    memory=_memory(snapshot.frames.get("M5"),setup_direction or chart["side"]);m5=_candles(snapshot.frames.get("M5"))
+    frames={"H4":h4,"M15":m15,"M5":{**chart,"bar_time":m5[-1].timestamp.isoformat() if m5 else ""},"setup_direction":setup_direction or chart["side"]}
+    reason="" if chart["valid"] else ("M5_TRIGGER_DIRECTION_MISMATCH" if chart.get("trigger_source") == "SETUP_DIRECTION_MISMATCH" else "M5_LIVE_TRIGGER_WINDOW_CLOSED" if chart.get("trigger_source") == "LIVE_WINDOW_CLOSED" else "M5_CHART_SETUP_NOT_FOUND")
+    if reason:
+        return {"valid":False,"side":"NO_TRADE","engine":ENGINE,"strategy_name":STRATEGY,"setup_type":STRATEGY,"frames":frames,"chart_setup":chart,"memory":memory,"context":{"h4":frames["H4"],"m15":frames["M15"],"market_regime":regime},"decision_role":"CHART_SETUP_WITH_MEMORY","rejection_reason":reason,"setup_direction":setup_direction or chart["side"]}
+    side, atr = chart["side"], _atr(snapshot.frames.get("M5"))
+    entry = float(snapshot.tick.ask if side == "BUY" else snapshot.tick.bid)
+    setup_close = float(m5[-1].close) if m5 else entry
+    extension = max(0.0, entry - setup_close if side == "BUY" else setup_close - entry)
+    max_extension = atr * 0.20
+    live_trigger = chart.get("trigger_source") == "LIVE_TICK"
+    entry_timing = {
+        "setup_close": setup_close,
+        "live_entry": entry,
+        "extension": extension,
+        "max_extension": max_extension,
+        "extension_atr": extension / atr if atr > 0 else 0.0,
+        "status": "LIVE_TRIGGER" if live_trigger else ("PASS" if atr > 0 and extension <= max_extension else "TOO_EXTENDED"),
+    }
+    if entry_timing["status"] not in {"PASS", "LIVE_TRIGGER"}:
+        return {"valid": False, "side": "NO_TRADE", "engine": ENGINE, "strategy_name": STRATEGY, "setup_type": STRATEGY, "entry_model": "LIVE_M5_TICK_BREAK" if chart.get("trigger_source") == "LIVE_TICK" else "LIVE_CHART_IMMEDIATE", "frames": frames, "chart_setup": chart, "context": {"h4": frames["H4"], "m15": frames["M15"], "market_regime": regime}, "memory": memory, "entry": entry, "entry_timing": entry_timing, "decision_role": "CHART_SETUP_WITH_MEMORY", "rejection_reason": "ENTRY_TOO_EXTENDED_AFTER_M5_CLOSE"}
+    stop=min(x.low for x in m5[-6:])-atr*.1 if side=="BUY" else max(x.high for x in m5[-6:])+atr*.1
+    structural_distance=abs(entry-stop)
+    # ATR floor on the stop distance. Backtested 2026-08-17 over 69 days,
+    # 8/8 folds both ways: floor ON -> 78.9% win / +0.109 R/trade / +1047R;
+    # floor OFF -> 73.9% win / +0.180 R/trade / +1897R. Set to 0 for no
+    # floor (structural stop only); the distance>=atr*0.2 validity check
+    # below still rejects absurdly tight stops.
+    _floor=float(_os.getenv("MT5_METALS_STOP_ATR_FLOOR","0.0"))
+    distance=max(structural_distance, atr*_floor) if _floor>0 else structural_distance
+    # Same fix as indices.py: the stop must sit at the distance the target is
+    # measured from, or the advertised R:R is not the R:R actually traded.
+    stop = entry - distance if side == "BUY" else entry + distance
+    stop_ok = bool(atr > 0 and distance >= atr * .2 and isfinite(distance))
+    _tr=float(_os.getenv("MT5_METALS_TARGET_R","3.0"))
+    target = entry + distance * _tr if side == "BUY" else entry - distance * _tr
+    return {"valid": stop_ok, "side": side if stop_ok else "NO_TRADE", "engine": ENGINE, "strategy_name": STRATEGY, "setup_type": STRATEGY, "entry_model": "LIVE_M5_TICK_BREAK" if chart.get("trigger_source") == "LIVE_TICK" else "LIVE_CHART_IMMEDIATE", "frames": frames, "chart_setup": chart, "context": {"h4": frames["H4"], "m15": frames["M15"], "market_regime": regime}, "memory": memory, "entry": entry, "entry_timing": entry_timing, "stop_loss": stop, "take_profit": target, "stop_distance": distance, "atr": float(atr), "stop_valid": stop_ok, "minimum_rr": _tr, "decision_role": "CHART_SETUP_WITH_MEMORY", "reasons": [f"CHART_SETUP_{chart['type']}", f"CHART_DIRECTION_{side}", "LIVE_TICK_TRIGGER" if chart.get("trigger_source") == "LIVE_TICK" else "COMPLETED_CANDLE_TRIGGER", "MEMORY_RECOGNIZED" if memory.get("recognized") else "MEMORY_OBSERVATION_ONLY", "ENTRY_LOCATION_PASS", "STOP_DISTANCE_PASS" if stop_ok else "STOP_DISTANCE_INVALID"], "rejection_reason": "" if stop_ok else "STOP_DISTANCE_INVALID","setup_direction":setup_direction or side}

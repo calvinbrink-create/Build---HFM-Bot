@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="robots" content="noindex,nofollow">
+<title>CipherFX Quant Desk</title>
+<style>
+:root{
+  --bg:#05070a; --panel:#0b1016; --panel2:#0e141c; --line:#1b2733;
+  --ink:#d7e3ef; --dim:#6d8093; --dimmer:#435364;
+  --up:#39ff8b; --down:#ff4d5e; --amber:#ffb020; --cyan:#3ddbff; --violet:#9d7bff;
+  --mono:ui-monospace,SFMono-Regular,Menlo,Consolas,"Roboto Mono",monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;background:var(--bg);color:var(--ink);font-family:var(--mono);
+  -webkit-font-smoothing:antialiased}
+body{background-image:
+  radial-gradient(900px 500px at 12% -8%,rgba(61,219,255,.07),transparent 60%),
+  radial-gradient(800px 460px at 88% -4%,rgba(57,255,139,.06),transparent 60%);
+  background-attachment:fixed}
+a{color:inherit}
+
+/* ---------- login ---------- */
+#login{min-height:100dvh;display:grid;place-items:center;padding:24px}
+.card{width:min(420px,100%);background:linear-gradient(180deg,#0c121a,#080d13);
+  border:1px solid var(--line);border-radius:14px;padding:26px;
+  box-shadow:0 0 0 1px rgba(255,255,255,.02),0 24px 60px rgba(0,0,0,.6)}
+.brand{display:flex;align-items:center;gap:10px;margin-bottom:4px}
+.dot{width:9px;height:9px;border-radius:50%;background:var(--up);
+  box-shadow:0 0 12px var(--up);animation:pulse 2.4s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.brand h1{margin:0;font-size:15px;letter-spacing:.16em;text-transform:uppercase}
+.sub{color:var(--dim);font-size:11px;letter-spacing:.1em;margin:0 0 20px}
+label{display:block;font-size:10px;letter-spacing:.14em;color:var(--dim);
+  text-transform:uppercase;margin:14px 0 6px}
+input{width:100%;background:#060a0f;border:1px solid var(--line);color:var(--ink);
+  border-radius:8px;padding:11px 12px;font-family:var(--mono);font-size:13px;outline:none}
+input:focus{border-color:var(--cyan);box-shadow:0 0 0 3px rgba(61,219,255,.10)}
+button{width:100%;margin-top:20px;background:linear-gradient(180deg,#12324a,#0d2436);
+  border:1px solid #1d5878;color:#dff4ff;border-radius:8px;padding:12px;
+  font-family:var(--mono);font-size:12px;letter-spacing:.16em;text-transform:uppercase;
+  cursor:pointer}
+button:hover{border-color:var(--cyan)}
+button:disabled{opacity:.5;cursor:not-allowed}
+.err{margin-top:14px;color:var(--down);font-size:11.5px;min-height:16px;line-height:1.5}
+
+/* ---------- shell ---------- */
+#app{display:none}
+.top{position:sticky;top:0;z-index:20;display:flex;flex-wrap:wrap;gap:12px;
+  align-items:center;padding:9px 14px;background:rgba(5,8,12,.94);
+  border-bottom:1px solid var(--line);backdrop-filter:blur(8px)}
+.tag{font-size:9.5px;letter-spacing:.16em;color:var(--dimmer);text-transform:uppercase}
+.pill{font-size:9.5px;letter-spacing:.12em;padding:3px 8px;border-radius:999px;
+  border:1px solid var(--line);color:var(--dim);text-transform:uppercase;white-space:nowrap}
+.pill.ok{color:var(--up);border-color:rgba(57,255,139,.35)}
+.pill.bad{color:var(--down);border-color:rgba(255,77,94,.35)}
+.pill.warn{color:var(--amber);border-color:rgba(255,176,32,.35)}
+.spacer{flex:1}
+.ghost{width:auto;margin:0;padding:6px 12px;background:transparent;border:1px solid var(--line);
+  color:var(--dim);font-size:9.5px}
+
+.wrap{padding:14px;max-width:1720px;margin:0 auto}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(12,1fr)}
+.p{background:linear-gradient(180deg,var(--panel),var(--panel2));
+  border:1px solid var(--line);border-radius:12px;padding:13px 15px;min-width:0}
+.p h2{margin:0 0 12px;font-size:9.5px;letter-spacing:.18em;color:var(--dim);
+  text-transform:uppercase;display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.p h2 .mark{color:var(--cyan)}
+.c12{grid-column:span 12}.c8{grid-column:span 8}.c6{grid-column:span 6}
+.c4{grid-column:span 4}.c3{grid-column:span 3}.c5{grid-column:span 5}.c7{grid-column:span 7}
+@media(max-width:1080px){.c8,.c6,.c4,.c3,.c5,.c7{grid-column:span 12}}
+
+.big{font-size:clamp(26px,4.4vw,46px);font-weight:600;letter-spacing:-.01em;line-height:1.05}
+.kpis{display:grid;grid-template-columns:repeat(auto-fit,minmax(112px,1fr));gap:12px;margin-top:14px}
+.k .lab{font-size:9px;letter-spacing:.14em;color:var(--dimmer);text-transform:uppercase}
+.k .val{font-size:17px;margin-top:3px;font-variant-numeric:tabular-nums}
+.up{color:var(--up)}.down{color:var(--down)}.amb{color:var(--amber)}
+.cy{color:var(--cyan)}.vi{color:var(--violet)}.mut{color:var(--dim)}
+
+table{width:100%;border-collapse:collapse;font-size:11.5px;font-variant-numeric:tabular-nums}
+th{text-align:left;font-size:9px;letter-spacing:.13em;color:var(--dimmer);
+  text-transform:uppercase;font-weight:400;padding:0 8px 7px 0;white-space:nowrap}
+td{padding:5px 8px 5px 0;border-top:1px solid rgba(27,39,51,.6);white-space:nowrap}
+.scroll{overflow-x:auto}
+.bar{height:5px;border-radius:3px;background:#111a24;overflow:hidden;min-width:52px}
+.bar i{display:block;height:100%}
+.note{font-size:10.5px;color:var(--dim);line-height:1.65;margin-top:10px}
+.warnbox{margin-top:11px;padding:10px 12px;border-radius:8px;font-size:11px;line-height:1.6;
+  border:1px solid rgba(255,176,32,.28);background:rgba(255,176,32,.05);color:#f0d9ab}
+.warnbox b{color:var(--amber)}
+svg{display:block;width:100%;height:auto}
+.legend{display:flex;gap:14px;flex-wrap:wrap;font-size:9.5px;color:var(--dim);margin-top:9px}
+.legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;
+  vertical-align:middle}
+.foot{color:var(--dimmer);font-size:9.5px;text-align:center;padding:22px 12px 30px;line-height:1.8}
+.empty{color:var(--dimmer);font-size:11px;padding:10px 0}
+</style>
+</head>
+<body>
+
+<div id="login">
+  <form class="card" id="loginForm" autocomplete="on">
+    <div class="brand"><span class="dot"></span><h1>CipherFX Quant Desk</h1></div>
+    <p class="sub">Authorised access only</p>
+    <label for="email">Email</label>
+    <input id="email" type="email" autocomplete="username" required>
+    <label for="password">Password</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button type="submit" id="btn">Sign in</button>
+    <div class="err" id="err"></div>
+  </form>
+</div>
+
+<div id="app">
+  <div class="top">
+    <span class="dot"></span>
+    <span class="tag">CipherFX&nbsp;Quant&nbsp;Desk</span>
+    <span class="pill" id="pService">—</span>
+    <span class="pill" id="pFeed">—</span>
+    <span class="pill" id="pHeart">—</span>
+    <span class="pill" id="pMode">—</span>
+    <span class="spacer"></span>
+    <span class="tag" id="stamp"></span>
+    <button class="ghost" id="out" type="button">Sign out</button>
+  </div>
+
+  <div class="wrap">
+    <div class="grid">
+
+      <div class="p c5">
+        <h2><span class="mark">◆</span> Realised performance <span class="mut" id="perfSpan"></span></h2>
+        <div class="big" id="pnl">—</div>
+        <div class="mut" style="font-size:10.5px;margin-top:5px" id="pnlSub">closed trades only</div>
+        <div class="kpis">
+          <div class="k"><div class="lab">Trades</div><div class="val" id="kTrades">—</div></div>
+          <div class="k"><div class="lab">Win rate</div><div class="val" id="kWin">—</div></div>
+          <div class="k"><div class="lab">Expectancy</div><div class="val" id="kExp">—</div></div>
+          <div class="k"><div class="lab">Payoff</div><div class="val" id="kPay">—</div></div>
+          <div class="k"><div class="lab">Profit factor</div><div class="val" id="kPF">—</div></div>
+          <div class="k"><div class="lab">Max DD</div><div class="val" id="kDD">—</div></div>
+        </div>
+        <div id="verdict"></div>
+      </div>
+
+      <div class="p c7">
+        <h2><span class="mark">◆</span> Equity curve · cumulative R</h2>
+        <div id="curve"></div>
+        <div class="legend">
+          <span><i style="background:var(--up)"></i>in profit</span>
+          <span><i style="background:var(--down)"></i>in drawdown</span>
+          <span><i style="background:var(--dimmer)"></i>breakeven</span>
+        </div>
+      </div>
+
+      <div class="p c7">
+        <h2><span class="mark">◆</span> Open positions <span class="mut" id="posCount"></span></h2>
+        <div class="scroll"><table id="posT">
+          <thead><tr><th>Symbol</th><th>Side</th><th>R</th><th>P/L</th><th>MFE</th>
+          <th>MAE</th><th>Rank</th><th>Held</th><th>Session</th></tr></thead>
+          <tbody></tbody></table></div>
+        <div class="empty" id="posEmpty" style="display:none">No open positions.</div>
+      </div>
+
+      <div class="p c5">
+        <h2><span class="mark">◆</span> Market memory · regime lean</h2>
+        <div id="regime"></div>
+        <div class="kpis" style="grid-template-columns:repeat(4,1fr)">
+          <div class="k"><div class="lab">Bars</div><div class="val cy" id="rBars">—</div></div>
+          <div class="k"><div class="lab">States</div><div class="val" id="rStates">—</div></div>
+          <div class="k"><div class="lab">With lean</div><div class="val up" id="rLean">—</div></div>
+          <div class="k"><div class="lab">Tradeable</div><div class="val amb" id="rPct">—</div></div>
+        </div>
+        <div class="note" id="rNote"></div>
+      </div>
+
+      <div class="p c6">
+        <h2><span class="mark">◆</span> Performance by symbol</h2>
+        <div class="scroll"><table id="symT">
+          <thead><tr><th>Symbol</th><th>Trades</th><th>Win%</th><th>Expectancy</th>
+          <th>Total R</th><th>P/L</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="p c6">
+        <h2><span class="mark">◆</span> How trades ended</h2>
+        <div class="scroll"><table id="exitT">
+          <thead><tr><th>Exit reason</th><th>Trades</th><th>Win%</th><th>Expectancy</th>
+          <th>P/L</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="p c5">
+        <h2><span class="mark">◆</span> Execution quality</h2>
+        <div id="execBars"></div>
+        <div class="note" id="execNote"></div>
+      </div>
+
+      <div class="p c7">
+        <h2><span class="mark">◆</span> Recent broker instructions</h2>
+        <div class="scroll"><table id="recT">
+          <thead><tr><th>Time (UTC)</th><th>Symbol</th><th>Side</th><th>Status</th>
+          <th>Reason</th></tr></thead><tbody></tbody></table></div>
+      </div>
+
+      <div class="p c12">
+        <h2><span class="mark">◆</span> Market data feed · per symbol</h2>
+        <div class="scroll"><table id="tickT">
+          <thead><tr><th>Symbol</th><th>Status</th><th>Bid</th><th>Ask</th><th>Spread</th>
+          <th>Age</th><th>Source</th></tr></thead><tbody></tbody></table></div>
+        <div class="note" id="feedNote"></div>
+      </div>
+
+    </div>
+    <div class="foot">
+      CipherFX Quant Desk · every figure computed from the bot's own database ·
+      read-only, no order authority<br>
+      Trading engine, pyramid logic and risk settings are not modified by this interface.
+    </div>
+  </div>
+</div>
+
+<script>
+const API='/quant-api', LOGIN='/mt5-api/login', K='cfx_quant_token';
+const $=id=>document.getElementById(id);
+let token=localStorage.getItem(K)||'';
+
+const fmt=(n,d=2)=>n===null||n===undefined||Number.isNaN(n)?'—':
+  Number(n).toLocaleString('en-ZA',{minimumFractionDigits:d,maximumFractionDigits:d});
+const money=n=>n===null||n===undefined?'—':(n<0?'-':'')+'R'+fmt(Math.abs(n),2);
+const sgn=n=>n>0?'up':n<0?'down':'mut';
+const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const dur=s=>{if(s==null)return'—';s=Math.floor(s);const h=Math.floor(s/3600),m=Math.floor(s%3600/60);
+  return h?h+'h '+m+'m':m?m+'m':s+'s';};
+
+async function api(p){
+  const r=await fetch(API+p,{headers:{Authorization:'Bearer '+token}});
+  if(r.status===401||r.status===403){logout();throw new Error('unauthorised');}
+  if(!r.ok)throw new Error(p+' → HTTP '+r.status);
+  return r.json();
+}
+function logout(){localStorage.removeItem(K);token='';$('app').style.display='none';
+  $('login').style.display='grid';}
+
+$('loginForm').addEventListener('submit',async e=>{
+  e.preventDefault();
+  const b=$('btn');b.disabled=true;$('err').textContent='';
+  try{
+    const r=await fetch(LOGIN,{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({email:$('email').value.trim(),password:$('password').value})});
+    if(!r.ok){$('err').textContent=r.status===401?'Invalid email or password.':
+      'Sign-in failed (HTTP '+r.status+').';b.disabled=false;return;}
+    const d=await r.json();
+    if(!d.token){$('err').textContent='No session returned.';b.disabled=false;return;}
+    token=d.token;localStorage.setItem(K,token);start();
+  }catch(_){$('err').textContent='Cannot reach the server.';}
+  b.disabled=false;
+});
+$('out').addEventListener('click',logout);
+
+function sparkline(vals){
+  if(!vals||vals.length<2)return'<div class="empty">Not enough closed trades to plot.</div>';
+  const W=1000,H=210,pad=6;
+  const mn=Math.min(0,...vals),mx=Math.max(0,...vals),rng=(mx-mn)||1;
+  const x=i=>pad+i*(W-2*pad)/(vals.length-1);
+  const y=v=>pad+(mx-v)*(H-2*pad)/rng;
+  const zero=y(0);
+  let d='',area='';
+  vals.forEach((v,i)=>{d+=(i?'L':'M')+x(i).toFixed(1)+' '+y(v).toFixed(1)+' ';});
+  area='M'+x(0).toFixed(1)+' '+zero.toFixed(1)+' '+d.slice(1)+
+       'L'+x(vals.length-1).toFixed(1)+' '+zero.toFixed(1)+' Z';
+  const end=vals[vals.length-1], col=end>=0?'var(--up)':'var(--down)';
+  return `<svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="none" role="img"
+    aria-label="Cumulative R equity curve">
+    <defs><linearGradient id="g" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="${col}" stop-opacity=".28"/>
+      <stop offset="100%" stop-color="${col}" stop-opacity="0"/></linearGradient></defs>
+    <line x1="0" y1="${zero.toFixed(1)}" x2="${W}" y2="${zero.toFixed(1)}"
+      stroke="#435364" stroke-width="1" stroke-dasharray="4 5"/>
+    <path d="${area}" fill="url(#g)"/>
+    <path d="${d}" fill="none" stroke="${col}" stroke-width="2"
+      stroke-linejoin="round" stroke-linecap="round"/>
+    <circle cx="${x(vals.length-1).toFixed(1)}" cy="${y(end).toFixed(1)}" r="3.5" fill="${col}"/>
+  </svg>`;
+}
+
+function stackbar(items,total){
+  if(!total)return'';
+  return '<div class="bar" style="height:9px;display:flex">'+items.map(i=>
+    `<i style="width:${(100*i.v/total).toFixed(2)}%;background:${i.c}"></i>`).join('')+'</div>';
+}
+
+async function start(){
+  $('login').style.display='none';$('app').style.display='block';
+  try{await refresh();}catch(e){console.error(e);return;}
+  setInterval(()=>refresh().catch(e=>console.error(e)),20000);
+}
+
+async function refresh(){
+  const [ov,pos,br,rg,hl,ex]=await Promise.all([
+    api('/api/quant/overview'),api('/api/quant/positions'),api('/api/quant/breakdown'),
+    api('/api/quant/regime'),api('/api/quant/health'),api('/api/quant/execution')]);
+
+  $('stamp').textContent='updated '+new Date(ov.generated_at).toUTCString().slice(17,25)+' UTC';
+
+  // ---- status pills
+  const svc=ov.service||{};
+  $('pService').textContent=svc.state||'UNKNOWN';
+  $('pService').className='pill '+(svc.state==='CONNECTED'?'ok':'bad');
+  const fresh=hl.feed?.fresh_symbols??0, stale=(hl.feed?.stale_symbols||[]).length;
+  $('pFeed').textContent='feed '+fresh+' live / '+stale+' stale';
+  $('pFeed').className='pill '+(fresh>0?'ok':'warn');
+  $('pHeart').textContent='heartbeat '+(hl.heartbeat_fresh?'live':'stale');
+  $('pHeart').className='pill '+(hl.heartbeat_fresh?'ok':'bad');
+  $('pMode').textContent=(svc.execution_mode||'—')+' · '+(svc.mode||'—');
+
+  // ---- performance
+  const p=ov.performance||{};
+  $('pnl').innerHTML=`<span class="${sgn(ov.realized_pnl_total)}">${money(ov.realized_pnl_total)}</span>`;
+  $('pnlSub').textContent=`${p.trades||0} closed trades · ${p.trading_days||0} trading days · ${fmt(p.total_r,2)}R net`;
+  $('perfSpan').textContent=ov.trade_stamps?.length?
+    '· '+ov.trade_stamps[0].slice(0,10)+' → '+ov.trade_stamps[ov.trade_stamps.length-1].slice(0,10):'';
+  $('kTrades').textContent=p.trades??'—';
+  $('kWin').innerHTML=`<span class="${p.win_rate>=50?'up':'amb'}">${fmt(p.win_rate,1)}%</span>`;
+  $('kExp').innerHTML=`<span class="${sgn(p.expectancy_r)}">${fmt(p.expectancy_r,3)}R</span>`;
+  $('kPay').innerHTML=`<span class="${p.payoff>=1?'up':'down'}">${fmt(p.payoff,2)}</span>`;
+  $('kPF').innerHTML=`<span class="${p.profit_factor>=1?'up':'down'}">${fmt(p.profit_factor,2)}</span>`;
+  $('kDD').innerHTML=`<span class="down">${fmt(p.max_dd_r,1)}R</span>`;
+
+  // the one number that decides whether the edge is real
+  if(p.payoff!=null&&p.win_rate!=null){
+    const need=100/(1+p.payoff);
+    const ok=p.win_rate>need;
+    $('verdict').innerHTML=`<div class="warnbox">
+      Winners average <b>${fmt(p.avg_win_r,3)}R</b> against losers at <b>${fmt(p.avg_loss_r,3)}R</b>
+      — a payoff of <b>${fmt(p.payoff,2)}</b>. At that ratio this system needs a
+      <b>${fmt(need,1)}%</b> win rate simply to break even, and it is running
+      <b>${fmt(p.win_rate,1)}%</b>.
+      ${ok?'That clears the bar.':'That is below the bar, which is why expectancy is negative despite most trades winning.'}
+      </div>`;
+  }
+  $('curve').innerHTML=sparkline(p.equity_curve);
+
+  // ---- positions
+  const tb=$('posT').querySelector('tbody');tb.innerHTML='';
+  $('posCount').textContent=pos.count?'· '+pos.count+' live':'';
+  $('posEmpty').style.display=pos.count?'none':'block';
+  (pos.positions||[]).sort((a,b)=>(b.profit??0)-(a.profit??0)).forEach(x=>{
+    tb.insertAdjacentHTML('beforeend',`<tr>
+      <td>${esc(x.symbol)}</td>
+      <td class="${x.side==='BUY'?'up':'down'}">${esc(x.side)}</td>
+      <td class="${sgn(x.r_multiple)}">${fmt(x.r_multiple,3)}</td>
+      <td class="${sgn(x.profit)}">${money(x.profit)}</td>
+      <td class="mut">${fmt(x.mfe_r,2)}</td>
+      <td class="mut">${fmt(x.mae_r,2)}</td>
+      <td>${esc(x.rank)}</td>
+      <td class="mut">${dur(x.time_in_trade_seconds)}</td>
+      <td class="mut">${esc(x.session)}</td></tr>`);
+  });
+
+  // ---- regime
+  const tot=(rg.lean_up||0)+(rg.lean_down||0)+(rg.no_lean||0);
+  $('regime').innerHTML=stackbar([
+    {v:rg.lean_up,c:'var(--up)'},{v:rg.lean_down,c:'var(--down)'},{v:rg.no_lean,c:'#1b2733'}],tot)+
+    `<div class="legend">
+      <span><i style="background:var(--up)"></i>lean up ${rg.lean_up}</span>
+      <span><i style="background:var(--down)"></i>lean down ${rg.lean_down}</span>
+      <span><i style="background:#1b2733"></i>no lean ${rg.no_lean}</span></div>`;
+  $('rBars').textContent=(rg.built_from_bars/1e6).toFixed(2)+'M';
+  $('rStates').textContent=rg.total_states;
+  $('rLean').textContent=(rg.lean_up||0)+(rg.lean_down||0);
+  $('rPct').textContent=fmt(rg.tradeable_pct,1)+'%';
+  $('rNote').textContent=`Of ${rg.qualified_states} states with at least `+
+    `${rg.min_samples} historical samples, only ${(rg.lean_up||0)+(rg.lean_down||0)} carry a `+
+    `directional lean strong enough to trade. The engine abstains in the other `+
+    `${rg.no_lean} — that is the memory refusing to guess, not a fault.`;
+
+  // ---- by symbol
+  const st=$('symT').querySelector('tbody');st.innerHTML='';
+  (br.by_symbol||[]).slice().reverse().forEach(s=>{
+    st.insertAdjacentHTML('beforeend',`<tr>
+      <td>${esc(s.key)}</td><td>${s.trades}</td>
+      <td class="${s.win_rate>=50?'up':'amb'}">${fmt(s.win_rate,1)}%</td>
+      <td class="${sgn(s.expectancy_r)}">${fmt(s.expectancy_r,3)}R</td>
+      <td class="${sgn(s.total_r)}">${fmt(s.total_r,2)}</td>
+      <td class="${sgn(s.pnl)}">${money(s.pnl)}</td></tr>`);
+  });
+
+  // ---- exits
+  const et=$('exitT').querySelector('tbody');et.innerHTML='';
+  (br.by_exit_reason||[]).slice().reverse().forEach(s=>{
+    et.insertAdjacentHTML('beforeend',`<tr>
+      <td>${esc(s.key)}</td><td>${s.trades}</td>
+      <td class="${s.win_rate>=50?'up':'amb'}">${fmt(s.win_rate,1)}%</td>
+      <td class="${sgn(s.expectancy_r)}">${fmt(s.expectancy_r,3)}R</td>
+      <td class="${sgn(s.pnl)}">${money(s.pnl)}</td></tr>`);
+  });
+
+  // ---- execution
+  const sc=ex.status_counts||[],tt=sc.reduce((a,b)=>a+b.c,0);
+  const col={FILLED:'var(--up)',CLOSED:'var(--cyan)',EXECUTION_BLOCKED:'var(--amber)',
+             REJECTED:'var(--down)',DRY_RUN:'var(--violet)'};
+  $('execBars').innerHTML=sc.map(s=>`
+    <div style="margin-bottom:9px">
+      <div style="display:flex;justify-content:space-between;font-size:10.5px;margin-bottom:4px">
+        <span>${esc(s.status)}</span>
+        <span class="mut">${s.c} · ${tt?fmt(100*s.c/tt,1):'0'}%</span></div>
+      <div class="bar"><i style="width:${tt?(100*s.c/tt).toFixed(2):0}%;
+        background:${col[s.status]||'var(--dim)'}"></i></div></div>`).join('');
+  const blocked=sc.find(s=>s.status==='EXECUTION_BLOCKED')?.c||0;
+  $('execNote').textContent=blocked?
+    `${blocked} instruction(s) stopped by the bot's own guards before reaching the broker — `+
+    `these are refusals, not broker rejections.`:'';
+
+  // ---- recent
+  const rt=$('recT').querySelector('tbody');rt.innerHTML='';
+  (ex.recent||[]).slice(0,14).forEach(r=>{
+    const c=r.status==='FILLED'?'up':r.status==='REJECTED'?'down':
+            r.status==='EXECUTION_BLOCKED'?'amb':'mut';
+    rt.insertAdjacentHTML('beforeend',`<tr>
+      <td class="mut">${esc(String(r.submitted_at).slice(5,19).replace('T',' '))}</td>
+      <td>${esc(r.symbol)}</td>
+      <td class="${r.side==='BUY'?'up':'down'}">${esc(r.side)}</td>
+      <td class="${c}">${esc(r.status)}</td>
+      <td class="mut">${esc(r.reason).slice(0,46)}</td></tr>`);
+  });
+
+  // ---- feed
+  const ft=$('tickT').querySelector('tbody');ft.innerHTML='';
+  (hl.ticks||[]).forEach(t=>{
+    ft.insertAdjacentHTML('beforeend',`<tr>
+      <td>${esc(t.symbol)}</td>
+      <td class="${t.fresh?'up':'amb'}">${t.fresh?'LIVE':'STALE'}</td>
+      <td>${fmt(t.bid,2)}</td><td>${fmt(t.ask,2)}</td>
+      <td class="mut">${fmt(t.spread,2)}</td>
+      <td class="mut">${dur(t.age_seconds)}</td>
+      <td class="mut">${esc(t.source)}</td></tr>`);
+  });
+  $('feedNote').textContent=fresh===0&&(hl.ticks||[]).length?
+    'No live ticks. Expected when the market is closed — the engine will not trade on stale data.':'';
+}
+
+if(token)start().catch(()=>logout());
+</script>
+</body>
+</html>

@@ -1,0 +1,522 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+<title>JARVIS</title>
+<style>
+  :root { --cyan: #4fd8ff; --bg: #04060a; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; background: var(--bg); color: #cfe9f5;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; touch-action: manipulation;
+    -webkit-font-smoothing: antialiased; min-height: 100vh; }
+  .wrap { max-width: 900px; margin: 0 auto; padding: 14px 16px 40px; }
+  .topbar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 4px 2px 10px; }
+  .brand { letter-spacing: 4px; font-size: 15px; color: var(--cyan); font-weight: 700; }
+  .toggles { display: flex; gap: 8px; }
+  .btn { font: inherit; font-size: 11px; letter-spacing: 1px; background: transparent;
+    border: 1px solid #2b3b46; color: #6f8794; padding: 6px 10px; border-radius: 6px; cursor: pointer; }
+  .btn.on { border-color: var(--cyan); color: var(--cyan); }
+  .btn.stop { border-color: #ff6b6b; color: #ff6b6b; }
+  .orb-wrap { display: flex; flex-direction: column; align-items: center; padding: 6px 0 2px; }
+  #orb { width: 300px; height: 300px; max-width: 82vw; max-height: 82vw; display: block; }
+  #status { font-size: 15px; letter-spacing: 2px; color: var(--cyan); margin-top: 2px; min-height: 20px; text-align: center; }
+  #sub { font-size: 12px; opacity: 0.55; margin-top: 2px; text-align: center; min-height: 16px; }
+  #micStatus { font-size: 10px; opacity: 0.5; text-align: center; min-height: 13px; margin-top: 6px; }
+  .chat { margin-top: 14px; border: 1px solid #16232c; border-radius: 12px; background: rgba(10,18,24,0.5); }
+  .log { max-height: 42vh; overflow-y: auto; padding: 14px; display: flex; flex-direction: column; gap: 12px; }
+  .hint { opacity: 0.5; font-size: 12px; line-height: 1.5; }
+  .msg .role { font-size: 10px; letter-spacing: 1px; opacity: 0.5; margin-bottom: 2px; }
+  .msg .body { font-size: 14px; line-height: 1.45; white-space: pre-wrap; }
+  .msg.user .body { color: #cfe9f5; }
+  .msg.assistant .body { color: var(--cyan); }
+  .launcher { display: flex; flex-wrap: wrap; gap: 6px; padding: 0 14px 10px; }
+  .pill { font-size: 11px; border: 1px solid #223642; color: #7f9aa8; background: transparent;
+    padding: 6px 10px; border-radius: 20px; cursor: pointer; }
+  .inputrow { display: flex; gap: 8px; padding: 12px 14px; border-top: 1px solid #16232c; }
+  #chatInput { flex: 1; font: inherit; font-size: 14px; background: #0a141b; border: 1px solid #223642;
+    border-radius: 8px; padding: 10px; color: #e6f4fa; }
+  #chatSend { font: inherit; background: var(--cyan); color: #04141b; border: none; border-radius: 8px;
+    padding: 10px 16px; font-weight: 700; cursor: pointer; }
+  #chatSend:disabled { opacity: 0.4; }
+  .warn { display: none; margin: 10px 14px 0; padding: 10px; border: 1px solid #6b4a1f;
+    background: rgba(90,60,20,0.25); color: #e6c288; font-size: 12px; border-radius: 8px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="topbar">
+    <div class="brand">J.A.R.V.I.S</div>
+    <div class="toggles">
+      <button type="button" class="btn on" id="voiceToggle">VOICE: ON</button>
+      <button type="button" class="btn" id="micToggle">MIC: OFF</button>
+      <button type="button" class="btn stop" id="stopBtn">STOP</button>
+    </div>
+  </div>
+
+  <div class="orb-wrap">
+    <canvas id="orb" width="600" height="600"></canvas>
+    <div id="status">STANDING BY</div>
+    <div id="sub"></div>
+    <div id="micStatus"></div>
+  </div>
+
+  <div class="chat">
+    <div class="warn" id="chatConfigWarning"></div>
+    <div class="log" id="chatLog">
+      <div class="hint">Ask about performance, a symbol, why a filter fired, or anything else — Jarvis pulls real live bot data to answer, and speaks his replies.</div>
+    </div>
+    <div class="launcher" id="launcherRow">
+      <button class="pill" data-q="How many open positions right now and what's the floating P&L?">Open positions</button>
+      <button class="pill" data-q="What is today's realized profit and loss and win rate?">Today's P&L</button>
+      <button class="pill" data-q="What did the last daily audit find?">Daily audit</button>
+      <button class="pill" data-q="What symbols are in the active universe right now?">Symbol universe</button>
+    </div>
+    <div class="inputrow">
+      <input id="chatInput" type="text" placeholder="Ask Jarvis…" autocomplete="off" />
+      <button id="chatSend">Send</button>
+    </div>
+  </div>
+</div>
+
+<script>
+// ---- auth ---------------------------------------------------------------
+const JARVIS_TOKEN_KEY = "cipherfx_jarvis_token";
+function token() {
+  try {
+    return window.localStorage?.getItem(JARVIS_TOKEN_KEY)
+        || window.localStorage?.getItem("cipherfx_mt5_demo_token")
+        || window.localStorage?.getItem("cipherfx_mt5_token")
+        || window.localStorage?.getItem("cipherfx_mt5_demo_token")
+        || "";
+  } catch { return ""; }
+}
+function setToken(t) { try { window.localStorage?.setItem(JARVIS_TOKEN_KEY, t); } catch {} }
+const authHeaders = () => ({ Authorization: "Bearer " + token() });
+
+// Show the inline login overlay. Any 401/expired-session response routes
+// here so Jarvis can get its own fresh token without depending on whatever
+// the main app happened to store.
+function showLogin(message) {
+  let ov = document.getElementById("loginOverlay");
+  if (ov) { if (message) document.getElementById("loginMsg").textContent = message; return; }
+  ov = document.createElement("div");
+  ov.id = "loginOverlay";
+  ov.style.cssText = "position:fixed;inset:0;background:rgba(2,4,8,0.94);z-index:50;display:flex;align-items:center;justify-content:center;padding:24px;";
+  ov.innerHTML =
+    '<form id="loginForm" style="width:100%;max-width:340px;display:flex;flex-direction:column;gap:12px;">' +
+    '<div style="letter-spacing:4px;color:var(--cyan);font-size:16px;font-weight:700;text-align:center;">J.A.R.V.I.S</div>' +
+    '<div id="loginMsg" style="font-size:12px;opacity:0.6;text-align:center;min-height:16px;">Sign in to continue.</div>' +
+    '<input id="loginEmail" type="email" placeholder="Email" autocomplete="username" style="font:inherit;padding:12px;background:#0a141b;border:1px solid #223642;border-radius:8px;color:#e6f4fa;" />' +
+    '<input id="loginPass" type="password" placeholder="Password" autocomplete="current-password" style="font:inherit;padding:12px;background:#0a141b;border:1px solid #223642;border-radius:8px;color:#e6f4fa;" />' +
+    '<button type="submit" style="font:inherit;font-weight:700;padding:12px;background:var(--cyan);color:#04141b;border:none;border-radius:8px;cursor:pointer;">Sign in</button>' +
+    '</form>';
+  document.body.appendChild(ov);
+  if (message) document.getElementById("loginMsg").textContent = message;
+  document.getElementById("loginForm").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const email = document.getElementById("loginEmail").value.trim();
+    const pass = document.getElementById("loginPass").value;
+    const msg = document.getElementById("loginMsg");
+    msg.textContent = "Signing in…";
+    try {
+      const res = await fetch("/mt5-api/login", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password: pass }),
+      });
+      if (!res.ok) { msg.textContent = "Login failed — check email and password."; return; }
+      const data = await res.json();
+      if (!data.token) { msg.textContent = "No session returned. Try again."; return; }
+      setToken(data.token);
+      ov.remove();
+      chatHistory.length = 0;
+      chatLog.innerHTML = "";
+      chatConfigured = true;
+      loadHistoryOrGreet();
+    } catch { msg.textContent = "Connection error. Try again."; }
+  });
+}
+
+const statusEl = document.getElementById("status");
+const subEl = document.getElementById("sub");
+const micStatus = document.getElementById("micStatus");
+const chatLog = document.getElementById("chatLog");
+const chatInput = document.getElementById("chatInput");
+const chatSend = document.getElementById("chatSend");
+const voiceToggle = document.getElementById("voiceToggle");
+const micToggle = document.getElementById("micToggle");
+function setMicStatus(t) { micStatus.textContent = t; }
+
+// ---- particle-sphere orb ------------------------------------------------
+// A rotating cloud of glowing points on a sphere. It "breathes" softly at
+// rest and expands / churns while Jarvis is actually speaking. Reaction is
+// driven purely off the <audio> element's play/pause state and a time-based
+// pulse - deliberately NOT a Web Audio analyser, because routing the audio
+// element through a Web Audio graph previously muted playback entirely.
+const canvas = document.getElementById("orb");
+const ctx = canvas.getContext("2d");
+const DPR = Math.min(window.devicePixelRatio || 1, 2);
+function sizeCanvas() {
+  const css = canvas.getBoundingClientRect();
+  canvas.width = Math.max(1, Math.round(css.width * DPR));
+  canvas.height = Math.max(1, Math.round(css.height * DPR));
+}
+sizeCanvas();
+window.addEventListener("resize", sizeCanvas);
+
+const N = 1500;
+const pts = [];
+for (let i = 0; i < N; i++) {
+  // Fibonacci sphere for even point distribution.
+  const y = 1 - (i / (N - 1)) * 2;
+  const r = Math.sqrt(Math.max(0, 1 - y * y));
+  const theta = i * 2.399963229728653; // golden angle
+  pts.push({
+    x: Math.cos(theta) * r,
+    y: y,
+    z: Math.sin(theta) * r,
+    n: Math.random(), // per-point noise seed
+  });
+}
+
+let speaking = 0;      // 0..1 eased toward target
+function orbFrame(t) {
+  requestAnimationFrame(orbFrame);
+  const target = jarvisAudio.paused ? 0 : 1;
+  speaking += (target - speaking) * 0.08;
+
+  const w = canvas.width, h = canvas.height;
+  ctx.clearRect(0, 0, w, h);
+  const cx = w / 2, cy = h / 2;
+  const time = t * 0.001;
+  const baseR = Math.min(w, h) * 0.34;
+
+  // slow auto-rotation; a touch faster while speaking
+  const ay = time * (0.25 + speaking * 0.35);
+  const ax = Math.sin(time * 0.15) * 0.35;
+  const cosY = Math.cos(ay), sinY = Math.sin(ay);
+  const cosX = Math.cos(ax), sinX = Math.sin(ax);
+
+  // idle breathing pulse + speaking surge
+  const breathe = 1 + Math.sin(time * 1.6) * 0.015;
+  const surge = speaking * (0.12 + 0.10 * Math.sin(time * 9.0));
+
+  for (let i = 0; i < N; i++) {
+    const p = pts[i];
+    // per-point radial jitter that intensifies while speaking (the "churn")
+    const jitter = 1 + (Math.sin(time * (2 + p.n * 6) + p.n * 20)) * (0.02 + speaking * 0.09);
+    const rr = baseR * breathe * jitter * (1 + surge);
+
+    let x = p.x, y = p.y, z = p.z;
+    // rotate Y
+    let x1 = x * cosY - z * sinY;
+    let z1 = x * sinY + z * cosY;
+    // rotate X
+    let y1 = y * cosX - z1 * sinX;
+    let z2 = y * sinX + z1 * cosX;
+
+    const depth = (z2 + 1) / 2; // 0 back .. 1 front
+    const px = cx + x1 * rr;
+    const py = cy + y1 * rr;
+    const size = (0.6 + depth * 1.8) * DPR;
+    const alpha = 0.12 + depth * (0.55 + speaking * 0.35);
+
+    ctx.beginPath();
+    ctx.arc(px, py, size, 0, Math.PI * 2);
+    ctx.fillStyle = "rgba(79,216,255," + alpha.toFixed(3) + ")";
+    ctx.fill();
+  }
+
+  // soft core glow
+  const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, baseR * (1.15 + surge));
+  g.addColorStop(0, "rgba(79,216,255," + (0.10 + speaking * 0.10).toFixed(3) + ")");
+  g.addColorStop(1, "rgba(79,216,255,0)");
+  ctx.fillStyle = g;
+  ctx.fillRect(0, 0, w, h);
+}
+requestAnimationFrame(orbFrame);
+
+// ---- voice output (TTS) -------------------------------------------------
+const jarvisAudio = new Audio();
+const audioQueue = [];
+let queuePlaying = false;
+let voiceEnabled = (function () {
+  try { return window.localStorage?.getItem("jarvis_voice_enabled") !== "false"; } catch { return true; }
+})();
+function renderVoiceToggle() {
+  voiceToggle.textContent = "VOICE: " + (voiceEnabled ? "ON" : "OFF");
+  voiceToggle.className = "btn" + (voiceEnabled ? " on" : "");
+}
+renderVoiceToggle();
+voiceToggle.addEventListener("click", () => {
+  voiceEnabled = !voiceEnabled;
+  try { window.localStorage?.setItem("jarvis_voice_enabled", String(voiceEnabled)); } catch {}
+  renderVoiceToggle();
+  if (!voiceEnabled) { jarvisAudio.pause(); audioQueue.length = 0; queuePlaying = false; }
+});
+
+// iOS Safari unlock: the <audio> element must be played once as the direct
+// result of a real tap before async play() calls (replies, wake-word) work.
+let audioUnlocked = false;
+const SILENT_WAV = "data:audio/wav;base64,UklGRuwAAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YcgAAACAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgICAgA==";
+function unlockAudio() {
+  if (audioUnlocked) return;
+  audioUnlocked = true;
+  try {
+    const prev = jarvisAudio.src;
+    jarvisAudio.src = SILENT_WAV;
+    jarvisAudio.play().then(() => {
+      jarvisAudio.pause(); jarvisAudio.currentTime = 0;
+      if (prev) jarvisAudio.src = prev;
+    }).catch(() => { audioUnlocked = false; });
+  } catch { audioUnlocked = false; }
+}
+document.addEventListener("click", unlockAudio);
+document.addEventListener("touchend", unlockAudio);
+
+function drainQueue() {
+  if (queuePlaying || audioQueue.length === 0) return;
+  queuePlaying = true;
+  const url = audioQueue.shift();
+  jarvisAudio.src = url;
+  jarvisAudio.onended = () => { queuePlaying = false; drainQueue(); };
+  jarvisAudio.play().catch(() => { queuePlaying = false; audioQueue.unshift(url); });
+}
+document.addEventListener("click", drainQueue);
+
+async function speak(text) {
+  if (!voiceEnabled || !text) return;
+  try {
+    const res = await fetch("/mt5-api/jarvis/speak", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ text }),
+    });
+    if (!res.ok) return;
+    const blob = await res.blob();
+    audioQueue.push(URL.createObjectURL(blob));
+    drainQueue();
+  } catch {}
+}
+
+document.getElementById("stopBtn").addEventListener("click", () => {
+  jarvisAudio.pause(); jarvisAudio.currentTime = 0;
+  audioQueue.length = 0; queuePlaying = false;
+  awaitingQuery = false;
+  setMicStatus(micEnabled ? "Listening — say “Jarvis”…" : "");
+});
+
+// ---- chat ---------------------------------------------------------------
+let chatConfigured = true;
+const chatHistory = [];
+
+function appendMessage(role, text) {
+  const hint = chatLog.querySelector(".hint");
+  if (hint) hint.remove();
+  const div = document.createElement("div");
+  div.className = "msg " + role;
+  div.innerHTML = '<div class="role">' + (role === "user" ? "YOU" : "JARVIS") + '</div><div class="body"></div>';
+  div.querySelector(".body").textContent = text;
+  chatLog.appendChild(div);
+  chatLog.scrollTop = chatLog.scrollHeight;
+}
+
+async function sendMessage() {
+  const text = chatInput.value.trim();
+  if (!text || !chatConfigured) return;
+  chatInput.value = "";
+  chatSend.disabled = true;
+  appendMessage("user", text);
+  chatHistory.push({ role: "user", content: text });
+  statusEl.textContent = "THINKING…";
+  try {
+    const res = await fetch("/mt5-api/jarvis/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ messages: chatHistory }),
+    });
+    if (res.status === 503) {
+      const detail = (await res.json().catch(() => ({}))).detail || "Jarvis is not configured yet.";
+      chatConfigured = false;
+      const warn = document.getElementById("chatConfigWarning");
+      warn.style.display = "block";
+      warn.textContent = detail;
+      chatHistory.pop();
+      statusEl.textContent = "OFFLINE";
+      return;
+    }
+    if (res.status === 401) {
+      chatHistory.pop();
+      statusEl.textContent = "STANDING BY";
+      showLogin("Session expired — sign in to continue.");
+      return;
+    }
+    if (!res.ok) {
+      const detail = (await res.json().catch(() => ({}))).detail || ("HTTP " + res.status);
+      appendMessage("assistant", "Error: " + detail);
+      chatHistory.pop();
+      statusEl.textContent = "STANDING BY";
+      return;
+    }
+    const data = await res.json();
+    chatHistory.push({ role: "assistant", content: data.reply });
+    statusEl.textContent = "SPEAKING";
+    subEl.textContent = "";
+    speak(data.reply);
+    // status returns to standby when speech ends
+    const back = () => { statusEl.textContent = "STANDING BY"; jarvisAudio.removeEventListener("ended", back); };
+    jarvisAudio.addEventListener("ended", back);
+    // if voice is off, no audio - reset shortly
+    if (!voiceEnabled) setTimeout(() => { statusEl.textContent = "STANDING BY"; }, 400);
+  } catch {
+    appendMessage("assistant", "Connection error — could not reach Jarvis backend.");
+    chatHistory.pop();
+    statusEl.textContent = "STANDING BY";
+  } finally {
+    chatSend.disabled = false;
+  }
+}
+
+chatSend.addEventListener("click", sendMessage);
+chatInput.addEventListener("keydown", (e) => { if (e.key === "Enter") sendMessage(); });
+document.getElementById("launcherRow").addEventListener("click", (e) => {
+  const pill = e.target.closest(".pill");
+  if (!pill) return;
+  chatInput.value = pill.dataset.q;
+  sendMessage();
+});
+
+// ---- "Jarvis" wake word -------------------------------------------------
+const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+let recognition = null;
+let micEnabled = false;
+let awaitingQuery = false;
+let micSuspended = false;
+let settleTimer = null;
+let handledUntil = 0;
+let reqId = 0, restartPending = false;
+
+function renderMicToggle() {
+  micToggle.textContent = "MIC: " + (micEnabled ? "ON" : "OFF");
+  micToggle.className = "btn" + (micEnabled ? " on" : "");
+}
+function normalize(s) { return s.toLowerCase().replace(/[^a-z0-9' ]/g, "").trim(); }
+
+function commit(raw) {
+  if (Date.now() < handledUntil) return;
+  const t = raw.trim();
+  if (awaitingQuery) {
+    if (!t) return;
+    awaitingQuery = false; handledUntil = Date.now() + 3000;
+    setMicStatus("Heard: “" + t + "”");
+    chatInput.value = t; sendMessage();
+    return;
+  }
+  const m = normalize(raw).match(/\bjarvis\b[,.]?\s*(.*)/);
+  if (!m) return;
+  const rest = m[1].trim();
+  if (rest) {
+    handledUntil = Date.now() + 3000;
+    setMicStatus("Heard: “" + rest + "”");
+    chatInput.value = rest; sendMessage();
+  } else {
+    awaitingQuery = true;
+    setMicStatus("Listening for your question…");
+  }
+}
+function onText(raw, isFinal) {
+  if (Date.now() < handledUntil) return;
+  if (settleTimer) clearTimeout(settleTimer);
+  if (isFinal) commit(raw);
+  else settleTimer = setTimeout(() => commit(raw), 900);
+}
+function scheduleRestart(delay) {
+  if (!micEnabled || micSuspended || restartPending) return;
+  restartPending = true;
+  const my = reqId;
+  setTimeout(() => {
+    restartPending = false;
+    if (my !== reqId || !micEnabled || micSuspended) return;
+    try { recognition.start(); } catch {}
+  }, delay);
+}
+function startListening() {
+  if (!SR) return;
+  reqId++;
+  recognition = new SR();
+  recognition.continuous = true;
+  recognition.interimResults = true;
+  recognition.lang = "en-US";
+  recognition.onresult = (e) => {
+    const last = e.results[e.results.length - 1];
+    const tr = last[0].transcript;
+    if (!awaitingQuery) setMicStatus("Hearing: “" + tr + "”");
+    onText(tr, last.isFinal);
+  };
+  recognition.onerror = (e) => {
+    if (e.error !== "aborted" && e.error !== "no-speech") setMicStatus("Mic: " + e.error);
+    if (e.error === "not-allowed" || e.error === "service-not-allowed") { micEnabled = false; renderMicToggle(); }
+  };
+  recognition.onend = () => scheduleRestart(250);
+  try { recognition.start(); setMicStatus("Listening — say “Jarvis”…"); }
+  catch (err) { setMicStatus("Could not start mic: " + err.message); }
+}
+function stopListening() {
+  reqId++;
+  if (recognition) { try { recognition.stop(); } catch {} }
+  recognition = null; awaitingQuery = false; setMicStatus("");
+}
+micToggle.addEventListener("click", () => {
+  if (!SR) { setMicStatus("Speech recognition needs Chrome, Edge, or Safari (not Firefox)."); return; }
+  micEnabled = !micEnabled; renderMicToggle();
+  if (micEnabled) startListening(); else stopListening();
+});
+// never let Jarvis hear his own voice
+jarvisAudio.addEventListener("play", () => { micSuspended = true; if (recognition) { try { recognition.stop(); } catch {} } });
+jarvisAudio.addEventListener("ended", () => { micSuspended = false; scheduleRestart(150); });
+jarvisAudio.addEventListener("pause", () => {
+  if (jarvisAudio.currentTime === 0 || jarvisAudio.ended) return;
+  micSuspended = false; scheduleRestart(150);
+});
+
+// ---- greeting / history on load ----------------------------------------
+async function greet() {
+  try {
+    const res = await fetch("/mt5-api/jarvis/chat", {
+      method: "POST",
+      headers: { "Content-Type": "application/json", ...authHeaders() },
+      body: JSON.stringify({ messages: [{ role: "user", content: "I just opened your interface. Greet me briefly, in character." }] }),
+    });
+    if (!res.ok) return;
+    const data = await res.json();
+    chatHistory.push({ role: "assistant", content: data.reply });
+    speak(data.reply);
+  } catch {}
+}
+async function loadHistoryOrGreet() {
+  try {
+    const res = await fetch("/mt5-api/jarvis/history", { headers: authHeaders() });
+    if (res.status === 401) { showLogin("Sign in to talk to Jarvis."); return; }
+    if (res.ok) {
+      const data = await res.json();
+      const msgs = data.messages || [];
+      if (msgs.length) {
+        for (const m of msgs) {
+          chatHistory.push({ role: m.role, content: m.content });
+          if (m.role === "user") appendMessage("user", m.content);
+        }
+        return;
+      }
+    }
+  } catch {}
+  greet();
+}
+
+if (!token()) {
+  showLogin("Sign in to talk to Jarvis.");
+} else {
+  loadHistoryOrGreet();
+}
+</script>
+</body>
+</html>

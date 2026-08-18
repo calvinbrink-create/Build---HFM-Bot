@@ -1,0 +1,14 @@
+{
+  "EURUSD": {"hours": [1, 2, 3, 9, 16, 19, 21], "weekdays": [3, 4]},
+  "GBPUSD": {"hours": [0, 2, 8, 10, 20, 23], "weekdays": [4]},
+  "USDJPY": {"hours": [1], "weekdays": []},
+  "USDCAD": {"hours": [0, 12, 17, 21, 23], "weekdays": []},
+  "NAS100": {"hours": [0, 4, 16], "weekdays": []},
+  "SPX500": {"hours": [0, 3, 15, 19, 20], "weekdays": []},
+  "GER40": {"hours": [0, 5], "weekdays": []},
+  "UK100": {"hours": [0, 1, 2, 3, 4, 15, 19, 23], "weekdays": [0, 2, 3]},
+  "FRA40": {"hours": [0, 14], "weekdays": [0]},
+  "EU50": {"hours": [0, 22], "weekdays": []},
+  "JP225": {"hours": [0, 6, 14, 21], "weekdays": []},
+  "US30": {"hours": [0], "weekdays": []}
+}
