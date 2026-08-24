@@ -18,6 +18,7 @@ from cipherfx_clean.evidence_capture import (
     capture_c014_chart_history,
     capture_live_intelligence_requirement,
     capture_live_geometry_requirement,
+    capture_live_tick_intelligence_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -399,3 +400,61 @@ def test_live_geometry_capture_binds_specific_verifier_code_test_and_data(
     if requires_data:
         with ZipFile(captured["data_subjects"][0]) as archive:
             assert archive.namelist() == ["00_rates_XAUUSD_M5.csv"]
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments"),
+    (
+        ("C026", "verify_c026_tick_directions", "market_features.py", "test_item_041_tick_direction_engine.py", ("-k", "tick_direction")),
+        ("C027", "verify_c027_tick_imbalance", "market_features.py", "test_item_042_tick_imbalance_engine.py", ("-k", "tick_imbalance")),
+        ("C028", "verify_c028_tick_velocity", "market_features.py", "test_item_043_tick_velocity_engine.py", ("-k", "tick_velocity")),
+        ("C029", "verify_c029_tick_acceleration", "market_features.py", "test_item_044_tick_acceleration_engine.py", ("-k", "tick_acceleration")),
+        ("C030", "verify_c030_microstructure", "microstructure.py", "test_item_045_microstructure_engine.py", ("-k", "microstructure")),
+    ),
+)
+def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    verification_name,
+    code_name,
+    test_name,
+    test_arguments,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    source = tmp_path / "live_ticks.sqlite3"
+    source.write_text("live", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "_snapshot_sqlite_database",
+        lambda _source, destination: destination.write_text("snapshot", encoding="utf-8"),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda snapshot: {"requirement_id": requirement_id, "status": "PASS", "database": str(snapshot)},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_tick_intelligence_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        tick_database=source,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["test_arguments"] == test_arguments
+    snapshot = Path(captured["verification"]["database"])
+    assert snapshot.parent == tmp_path / "evidence"
+    assert snapshot.read_text(encoding="utf-8") == "snapshot"

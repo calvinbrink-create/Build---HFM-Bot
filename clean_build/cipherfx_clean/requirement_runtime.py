@@ -2001,7 +2001,7 @@ def verify_c026_tick_directions(database: Path) -> Mapping[str, object]:
             ).fetchall()
             ticks = tuple(RawTick(symbol, datetime.fromisoformat(row[0]), row[1], row[2]) for row in rows)
             events = classify_tick_directions(ticks)
-            frame = []
+            direction_samples = {}
             for event, current in zip(events, rows[1:]):
                 stored_direction, stored_change = current[3], current[4]
                 if stored_direction != event.direction or not isclose(stored_change, event.price_change, rel_tol=0.0, abs_tol=1e-9):
@@ -2010,7 +2010,8 @@ def verify_c026_tick_directions(database: Path) -> Mapping[str, object]:
                     raise ValueError(f"C026 invalid tick direction provenance for {symbol}")
                 directions.add(event.direction)
                 total += 1
-                frame.append(
+                direction_samples.setdefault(
+                    event.direction,
                     {
                         "event_id": event.event_id,
                         "timestamp": event.timestamp.isoformat(),
@@ -2023,9 +2024,13 @@ def verify_c026_tick_directions(database: Path) -> Mapping[str, object]:
                         "direction": event.direction,
                         "interarrival_seconds": event.interarrival_seconds,
                         "source": event.source,
-                    }
+                    },
                 )
-            output[symbol] = tuple(frame)
+            output[symbol] = {
+                "event_count": len(events),
+                "observed_directions": tuple(sorted({event.direction for event in events})),
+                "direction_samples": direction_samples,
+            }
         integrity = connection.execute("PRAGMA integrity_check").fetchone()[0]
     finally:
         connection.close()
@@ -2172,6 +2177,9 @@ def verify_c028_tick_velocity(database: Path) -> Mapping[str, object]:
     }
 
 
+_C029_MAX_TICKS_PER_SYMBOL = 256
+
+
 def verify_c029_tick_acceleration(database: Path) -> Mapping[str, object]:
     connection = sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True)
     try:
@@ -2185,7 +2193,9 @@ def verify_c029_tick_acceleration(database: Path) -> Mapping[str, object]:
                 "SELECT timestamp,bid,ask FROM raw_ticks WHERE symbol=? ORDER BY timestamp,bid,ask",
                 (symbol,),
             ).fetchall()
-            ticks = tuple(RawTick(symbol, datetime.fromisoformat(row[0]), row[1], row[2]) for row in rows)
+            source_tick_count = len(rows)
+            bounded_rows = rows[-_C029_MAX_TICKS_PER_SYMBOL:]
+            ticks = tuple(RawTick(symbol, datetime.fromisoformat(row[0]), row[1], row[2]) for row in bounded_rows)
             result = tick_acceleration_observation(ticks)
             if result.acceleration_sample_size < 18:
                 raise ValueError(f"C029 insufficient acceleration observations for {symbol}")
@@ -2203,6 +2213,8 @@ def verify_c029_tick_acceleration(database: Path) -> Mapping[str, object]:
             rolling_total += len(rolling)
             total += result.acceleration_sample_size
             output[symbol] = {
+                "source_tick_count": source_tick_count,
+                "evidence_tick_count": len(ticks),
                 "velocity_sample_size": result.velocity_sample_size,
                 "acceleration_sample_size": result.acceleration_sample_size,
                 "latest_velocity": result.latest_velocity,

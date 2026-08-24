@@ -42,6 +42,11 @@ from .requirement_runtime import (
     verify_c023_hfm_fair_value_gaps,
     verify_c024_hfm_fvg_lifecycle,
     verify_c025_hfm_displacement,
+    verify_c026_tick_directions,
+    verify_c027_tick_imbalance,
+    verify_c028_tick_velocity,
+    verify_c029_tick_acceleration,
+    verify_c030_microstructure,
 )
 
 
@@ -132,6 +137,39 @@ _LIVE_GEOMETRY_CAPTURE_TARGETS = {
         "clean_build/tests/test_item_040_displacement_engine.py",
         ("-k", "displacement"),
         False,
+    ),
+}
+
+_LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS = {
+    "C026": (
+        "verify_c026_tick_directions",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_041_tick_direction_engine.py",
+        ("-k", "tick_direction"),
+    ),
+    "C027": (
+        "verify_c027_tick_imbalance",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_042_tick_imbalance_engine.py",
+        ("-k", "tick_imbalance"),
+    ),
+    "C028": (
+        "verify_c028_tick_velocity",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_043_tick_velocity_engine.py",
+        ("-k", "tick_velocity"),
+    ),
+    "C029": (
+        "verify_c029_tick_acceleration",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_044_tick_acceleration_engine.py",
+        ("-k", "tick_acceleration"),
+    ),
+    "C030": (
+        "verify_c030_microstructure",
+        "clean_build/cipherfx_clean/intelligence/microstructure.py",
+        "clean_build/tests/test_item_045_microstructure_engine.py",
+        ("-k", "microstructure"),
     ),
 }
 
@@ -508,6 +546,41 @@ def capture_live_geometry_requirement(
     )
 
 
+def capture_live_tick_intelligence_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    tick_database: Path,
+    output_directory: Path,
+    python_executable: Path,
+) -> EvidenceBundle:
+    """Capture tick-intelligence evidence from an immutable receiver snapshot."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments = _LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live tick intelligence requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    source_database = tick_database.resolve()
+    output = output_directory.resolve()
+    _require_inside(source_database, root, "tick database")
+    _require_inside(output, root, "evidence output")
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = output / f"{requirement_id.lower()}_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(source_database, snapshot)
+    verification = globals()[verifier_name](snapshot)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -668,6 +741,7 @@ def main() -> int:
             "C006", "C008", "C009", "C011", "C012", "C013", "C014",
             "C015", "C016", "C017", "C018", "C019", "C020",
             "C021", "C022", "C023", "C024", "C025",
+            "C026", "C027", "C028", "C029", "C030",
         ),
         default="C006",
     )
@@ -736,6 +810,16 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
             database=args.database,
+        )
+    elif args.requirement in _LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS:
+        if args.tick_database is None:
+            parser.error("--tick-database is required for C026-C030")
+        bundle = capture_live_tick_intelligence_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
         )
     elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:

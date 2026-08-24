@@ -10,6 +10,7 @@ from cipherfx_clean.requirement_runtime import (
     C008_TICK_WINDOW,
     _c008_recent_ticks,
     verify_c006_raw_tick_library,
+    verify_c026_tick_directions,
     verify_c007_tick_quality,
     verify_c008_snapshot,
     verify_c009_market_state,
@@ -106,6 +107,51 @@ def test_c006_runtime_verifier_proves_complete_raw_tick_storage(tmp_path):
     assert result["symbols"] == ("XAUUSD",)
     assert result["incomplete_rows"] == 0
     assert result["inconsistent_rows"] == 0
+
+
+def test_c026_runtime_verifier_retains_one_provenance_sample_for_each_direction(tmp_path):
+    path = tmp_path / "ticks.sqlite3"
+    store = EvidenceStore(path)
+    start = datetime(2026, 8, 24, 6, tzinfo=UTC)
+    store.write_ticks(
+        (
+            RawTick("XAUUSD", start, 100.0, 100.2),
+            RawTick("XAUUSD", start + timedelta(seconds=1), 100.1, 100.3),
+            RawTick("XAUUSD", start + timedelta(seconds=2), 100.0, 100.2),
+            RawTick("XAUUSD", start + timedelta(seconds=3), 100.0, 100.2),
+        )
+    )
+    store.close()
+
+    result = verify_c026_tick_directions(path)
+
+    frame = result["symbols"]["XAUUSD"]
+    assert frame["event_count"] == 3
+    assert set(frame["direction_samples"]) == {"UP", "DOWN", "UNCHANGED"}
+    assert all(item["event_id"] for item in frame["direction_samples"].values())
+
+
+def test_c029_runtime_verifier_bounds_historical_windows_without_losing_provenance(tmp_path, monkeypatch):
+    import cipherfx_clean.requirement_runtime as runtime
+
+    monkeypatch.setattr(runtime, "_C029_MAX_TICKS_PER_SYMBOL", 24)
+    path = tmp_path / "ticks.sqlite3"
+    store = EvidenceStore(path)
+    start = datetime(2026, 8, 24, 6, tzinfo=UTC)
+    for symbol in ("XAUUSD", "UK100", "USA100", "USA500", "USA30"):
+        ticks = []
+        mid = 100.0
+        for index in range(30):
+            mid += 0.1 if index != 26 else 10.0
+            ticks.append(RawTick(symbol, start + timedelta(seconds=index), mid - 0.1, mid + 0.1))
+        store.write_ticks(ticks)
+    store.close()
+
+    result = runtime.verify_c029_tick_acceleration(path)
+
+    assert result["status"] == "PASS"
+    assert all(frame["source_tick_count"] == 30 for frame in result["symbols"].values())
+    assert all(frame["evidence_tick_count"] == 24 for frame in result["symbols"].values())
 
 
 def test_c006_runtime_verifier_rejects_legacy_incomplete_tick_rows(tmp_path):
