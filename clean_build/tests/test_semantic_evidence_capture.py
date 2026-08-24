@@ -17,6 +17,7 @@ from cipherfx_clean.evidence_capture import (
     capture_c013_chart_annotations,
     capture_c014_chart_history,
     capture_live_intelligence_requirement,
+    capture_live_geometry_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -339,3 +340,62 @@ def test_live_intelligence_capture_binds_specific_verifier_code_and_test(
     assert captured["code_subject"].name == code_name
     assert captured["test_file"].name == test_name
     assert captured["test_arguments"] == test_arguments
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments", "requires_data"),
+    (
+        ("C021", "verify_c021_hfm_liquidity_sweeps", "market_features.py", "test_item_036_liquidity_sweep_detector.py", (), True),
+        ("C022", "verify_c022_hfm_liquidity_failure_library", "liquidity_failures.py", "test_item_037_liquidity_failure_library.py", (), False),
+        ("C023", "verify_c023_hfm_fair_value_gaps", "market_features.py", "test_item_038_fvg_engine.py", ("-k", "fvg"), False),
+        ("C024", "verify_c024_hfm_fvg_lifecycle", "market_features.py", "test_item_039_fvg_lifecycle.py", ("-k", "fvg"), False),
+        ("C025", "verify_c025_hfm_displacement", "market_features.py", "test_item_040_displacement_engine.py", ("-k", "displacement"), False),
+    ),
+)
+def test_live_geometry_capture_binds_specific_verifier_code_test_and_data(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    verification_name,
+    code_name,
+    test_name,
+    test_arguments,
+    requires_data,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    input_snapshot = tmp_path / "inputs"
+    input_snapshot.mkdir()
+    (input_snapshot / "rates_XAUUSD_M5.csv").write_text("time,open\n", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: input_snapshot)
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **kwargs: {"requirement_id": requirement_id, "status": "PASS", "arguments": kwargs},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_geometry_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "USA100"),
+        database=tmp_path / "c022.sqlite3",
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["test_arguments"] == test_arguments
+    assert bool(captured["data_subjects"]) is requires_data
+    if requires_data:
+        with ZipFile(captured["data_subjects"][0]) as archive:
+            assert archive.namelist() == ["00_rates_XAUUSD_M5.csv"]

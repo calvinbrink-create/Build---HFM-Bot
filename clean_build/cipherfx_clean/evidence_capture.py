@@ -15,6 +15,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+from shutil import copyfile
 import sqlite3
 import subprocess
 import sys
@@ -36,6 +37,11 @@ from .requirement_runtime import (
     verify_c018_hfm_demand_zones,
     verify_c019_hfm_zone_quality,
     verify_c020_hfm_liquidity,
+    verify_c021_hfm_liquidity_sweeps,
+    verify_c022_hfm_liquidity_failure_library,
+    verify_c023_hfm_fair_value_gaps,
+    verify_c024_hfm_fvg_lifecycle,
+    verify_c025_hfm_displacement,
 )
 
 
@@ -90,6 +96,46 @@ _LIVE_INTELLIGENCE_CAPTURE_TARGETS = {
         ("-k", "liquidity_engine"),
     ),
 }
+
+_LIVE_GEOMETRY_CAPTURE_TARGETS = {
+    "C021": (
+        "verify_c021_hfm_liquidity_sweeps",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_036_liquidity_sweep_detector.py",
+        (),
+        True,
+    ),
+    "C022": (
+        "verify_c022_hfm_liquidity_failure_library",
+        "clean_build/cipherfx_clean/liquidity_failures.py",
+        "clean_build/tests/test_item_037_liquidity_failure_library.py",
+        (),
+        False,
+    ),
+    "C023": (
+        "verify_c023_hfm_fair_value_gaps",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_038_fvg_engine.py",
+        ("-k", "fvg"),
+        False,
+    ),
+    "C024": (
+        "verify_c024_hfm_fvg_lifecycle",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_039_fvg_lifecycle.py",
+        ("-k", "fvg"),
+        False,
+    ),
+    "C025": (
+        "verify_c025_hfm_displacement",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_040_displacement_engine.py",
+        ("-k", "displacement"),
+        False,
+    ),
+}
+
+_HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
 
 
 def write_evidence_bundle(
@@ -408,6 +454,60 @@ def capture_live_intelligence_requirement(
     )
 
 
+def capture_live_geometry_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+    database: Path | None = None,
+) -> EvidenceBundle:
+    """Capture live geometry evidence without letting moving source files drift."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments, snapshot_inputs = _LIVE_GEOMETRY_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live geometry requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    source_root = bridge_root.resolve()
+    data_subjects: tuple[Path, ...] = ()
+    if snapshot_inputs:
+        input_snapshot = _snapshot_hfm_inputs(
+            destination=output,
+            requirement_id=requirement_id,
+            bridge_root=source_root,
+            symbols=symbols,
+        )
+        source_root = input_snapshot
+        data_subjects = (_bundle_data_subject(output, requirement_id, tuple(sorted(input_snapshot.iterdir()))),)
+    verifier = globals()[verifier_name]
+    arguments: dict[str, object] = {
+        "bridge_root": source_root,
+        "symbols": tuple(symbols),
+    }
+    if requirement_id == "C022":
+        if database is None:
+            raise ValueError("C022 requires an isolated evidence database")
+        isolated_database = database.resolve()
+        _require_inside(isolated_database, root, "liquidity-failure database")
+        arguments["database"] = isolated_database
+    verification = verifier(**arguments)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=data_subjects,
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -511,6 +611,34 @@ def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
         reader.close()
 
 
+def _snapshot_hfm_inputs(
+    *,
+    destination: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    symbols: Sequence[str],
+) -> Path:
+    """Copy the exact bar files used by a rolling HFM verifier before it runs."""
+
+    source_root = bridge_root.resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(source_root)
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot = destination / f"{requirement_id.lower()}_hfm_inputs_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    snapshot.mkdir()
+    sources = [source_root / "symbols.csv"]
+    sources.extend(
+        source_root / f"rates_{symbol}_{timeframe}.csv"
+        for symbol in symbols
+        for timeframe in _HFM_SNAPSHOT_TIMEFRAMES
+    )
+    for source in sources:
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        copyfile(source, snapshot / source.name)
+    return snapshot
+
+
 def _bundle_data_subject(destination: Path, requirement_id: str, paths: Sequence[Path]) -> Path:
     """Create one immutable data subject when a requirement has several artifacts."""
 
@@ -539,6 +667,7 @@ def main() -> int:
         choices=(
             "C006", "C008", "C009", "C011", "C012", "C013", "C014",
             "C015", "C016", "C017", "C018", "C019", "C020",
+            "C021", "C022", "C023", "C024", "C025",
         ),
         default="C006",
     )
@@ -593,6 +722,20 @@ def main() -> int:
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_GEOMETRY_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C021-C025")
+        if args.requirement == "C022" and args.database is None:
+            parser.error("--database is required for C022")
+        bundle = capture_live_geometry_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+            database=args.database,
         )
     elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:
