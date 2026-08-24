@@ -511,6 +511,14 @@ def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
         ("C058", "verify_c058_breakout_engine", "breakout_engine.py", "test_item_072_breakout_engine.py", ("-k", "breakout"), False),
         ("C059", "verify_c059_breakout_quality_model", "breakout_quality_engine.py", "test_item_073_breakout_quality_engine.py", ("-k", "breakout"), False),
         ("C060", "verify_c060_failed_breakout_library", "failed_breakout.py", "test_item_074_failed_breakout_library.py", ("-k", "failed_breakout"), False),
+        ("C061", "verify_c061_reversal_engine", "reversal_engine.py", "test_item_075_reversal_engine.py", ("-k", "reversal"), False),
+        ("C062", "verify_c062_continuation_engine", "continuation_engine.py", "test_item_076_continuation_engine.py", ("-k", "continuation"), False),
+        ("C063", "verify_c063_cross_asset_data_library", "cross_asset.py", "test_item_077_cross_asset.py", ("-k", "cross_asset"), False),
+        ("C064", "verify_c064_correlation_engine", "cross_asset.py", "test_item_077_cross_asset.py", ("-k", "correlation"), False),
+        ("C065", "verify_c065_correlation_breakdown_detector", "cross_asset.py", "test_item_077_cross_asset.py", ("-k", "breakdown"), False),
+        ("C066", "verify_c066_market_regime_engine", "market_regime_engine.py", "test_item_078_market_regime.py", ("-k", "market_regime"), False),
+        ("C067", "verify_c067_regime_probability_engine", "regime_probability_engine.py", "test_item_079_regime_probability.py", ("-k", "regime_probability"), False),
+        ("C068", "verify_c068_strategy_router", "router.py", "test_item_080_strategy_router.py", ("-k", "strategy_router"), False),
     ),
 )
 def test_live_analytics_capture_binds_specific_verifier_code_test_and_required_data(
