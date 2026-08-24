@@ -153,6 +153,7 @@ from .validation import validate_against_active_edges, validate_decision
 
 
 C008_TIMEFRAMES = ("1s", "5s", "15s", "M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1")
+C008_TICK_WINDOW = timedelta(minutes=5)
 
 
 def verify_c007_tick_quality(
@@ -329,26 +330,22 @@ def verify_c008_hfm_candle_builder(
     try:
         results = []
         for symbol in symbols:
-            tick_rows = connection.execute(
-                "SELECT timestamp,bid,ask FROM raw_ticks WHERE symbol=? ORDER BY timestamp,bid,ask",
-                (symbol,),
-            ).fetchall()
-            ticks = tuple(
-                RawTick(symbol, datetime.fromisoformat(timestamp), bid, ask)
-                for timestamp, bid, ask in tick_rows
-            )
+            ticks = _c008_recent_ticks(connection, symbol, observed_at)
             dataset = adapter.dataset(
                 symbol,
                 observed_at=observed_at,
                 include_latest_tick=False,
                 derive_m3_history=True,
-                history_mode="combined",
+                history_mode="rolling",
             )
             snapshot = snapshot_from_dataset(
                 with_tick_window(dataset, ticks),
                 observed_at=observed_at,
             )
-            results.append(verify_c008_snapshot(snapshot))
+            result = dict(verify_c008_snapshot(snapshot))
+            result["tick_window_seconds"] = int(C008_TICK_WINDOW.total_seconds())
+            result["tick_count"] = len(ticks)
+            results.append(result)
     finally:
         connection.close()
     return {
@@ -361,6 +358,31 @@ def verify_c008_hfm_candle_builder(
         "required_timeframes": C008_TIMEFRAMES,
         "symbols": tuple(results),
     }
+
+
+def _c008_recent_ticks(
+    connection: sqlite3.Connection,
+    symbol: str,
+    observed_at: datetime,
+) -> tuple[RawTick, ...]:
+    """Load only the tick window required to derive the live micro frames."""
+
+    start_at = observed_at - C008_TICK_WINDOW
+    tick_rows = connection.execute(
+        """
+        SELECT timestamp,bid,ask FROM raw_ticks
+        WHERE symbol=? AND timestamp>=? AND timestamp<=?
+        ORDER BY timestamp,bid,ask
+        """,
+        (symbol, start_at.isoformat(), observed_at.isoformat()),
+    ).fetchall()
+    ticks = tuple(
+        RawTick(symbol, datetime.fromisoformat(timestamp), bid, ask)
+        for timestamp, bid, ask in tick_rows
+    )
+    if not ticks:
+        raise ValueError(f"C008 requires fresh persisted ticks for {symbol}")
+    return ticks
 
 
 def verify_c009_market_state(state: MarketState) -> Mapping[str, object]:

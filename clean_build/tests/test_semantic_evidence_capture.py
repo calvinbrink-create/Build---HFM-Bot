@@ -1,10 +1,15 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import subprocess
 
 import pytest
 
 from cipherfx_clean.compliance import EvidenceKind, RequirementStatus, certify_evidence_manifest
-from cipherfx_clean.evidence_capture import EvidenceSubject, write_evidence_bundle
+from cipherfx_clean.evidence_capture import (
+    EvidenceSubject,
+    capture_verified_requirement,
+    write_evidence_bundle,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -64,3 +69,35 @@ def test_requirement_bundle_rejects_duplicate_evidence_kinds(tmp_path):
             ),
             output_directory=tmp_path / "evidence",
         )
+
+
+def test_verified_capture_records_test_and_runtime_receipts(tmp_path, monkeypatch):
+    code = tmp_path / "code.py"
+    test = tmp_path / "test_example.py"
+    data = tmp_path / "ticks.sqlite3"
+    code.write_text("pass\n", encoding="utf-8")
+    test.write_text("pass\n", encoding="utf-8")
+    data.write_text("tick evidence\n", encoding="utf-8")
+
+    monkeypatch.setattr(
+        "cipherfx_clean.evidence_capture._run_pytest",
+        lambda *args: subprocess.CompletedProcess(("python", "-m", "pytest"), 0, "1 passed", ""),
+    )
+    bundle = capture_verified_requirement(
+        workspace_root=tmp_path,
+        requirement_id="C006",
+        verification={"requirement_id": "C006", "status": "PASS"},
+        code_subject=code,
+        test_file=test,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        data_subjects=(data,),
+    )
+    ledger = certify_evidence_manifest(
+        spec_directory=SPECS,
+        manifest_path=bundle.manifest,
+        workspace_root=tmp_path,
+    )
+
+    assert ledger.result("C006").status is RequirementStatus.PASS
+    assert len(list((tmp_path / "evidence").glob("c006_*_test_receipt.json"))) == 1

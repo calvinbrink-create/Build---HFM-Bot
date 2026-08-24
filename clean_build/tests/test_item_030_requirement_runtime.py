@@ -7,6 +7,8 @@ from cipherfx_clean.contracts import RawTick
 from cipherfx_clean.contracts import Candle, MarketSnapshot, TradeDecision
 from cipherfx_clean.requirement_runtime import (
     C008_TIMEFRAMES,
+    C008_TICK_WINDOW,
+    _c008_recent_ticks,
     verify_c006_raw_tick_library,
     verify_c007_tick_quality,
     verify_c008_snapshot,
@@ -152,6 +154,20 @@ def test_c008_snapshot_verifier_requires_all_eleven_completed_resolutions():
 def test_c008_snapshot_verifier_rejects_any_missing_required_resolution():
     with pytest.raises(ValueError, match="missing completed timeframe M3"):
         verify_c008_snapshot(_c008_snapshot(missing=("M3",)))
+
+
+def test_c008_tick_window_is_bounded_to_current_microstructure(tmp_path):
+    store = EvidenceStore(tmp_path / "ticks.sqlite3")
+    observed = datetime(2026, 8, 24, 6, tzinfo=UTC)
+    store.write_ticks((
+        RawTick("XAUUSD", observed - C008_TICK_WINDOW - timedelta(seconds=1), 100.0, 100.2),
+        RawTick("XAUUSD", observed - timedelta(seconds=2), 100.1, 100.3),
+    ))
+    ticks = _c008_recent_ticks(store._conn, "XAUUSD", observed)
+    store.close()
+
+    assert len(ticks) == 1
+    assert ticks[0].timestamp == observed - timedelta(seconds=2)
 
 
 def test_c009_market_state_is_exact_tick_to_d1_completed_context():

@@ -20,7 +20,10 @@ import sys
 from typing import Mapping, Sequence
 
 from .compliance import EvidenceKind
-from .requirement_runtime import verify_c006_raw_tick_library
+from .requirement_runtime import (
+    verify_c006_raw_tick_library,
+    verify_c008_hfm_candle_builder,
+)
 
 
 @dataclass(frozen=True)
@@ -112,22 +115,83 @@ def capture_c006_live_ticks(
     verification = verify_c006_raw_tick_library(database)
     if verification.get("status") != "PASS":
         raise ValueError("C006 raw tick verification did not pass")
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C006",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/tick_ingest.py",
+        test_file=root / "clean_build/tests/test_item_006_websocket_tick_ingest.py",
+        data_subjects=(database,),
+        output_directory=output,
+        python_executable=python_executable,
+    )
+
+
+def capture_c008_market_snapshot(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    tick_database: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture real C008 proof for native and tick-derived candle frames."""
+
+    root = workspace_root.resolve()
+    verification = verify_c008_hfm_candle_builder(
+        bridge_root=bridge_root.resolve(),
+        tick_database=tick_database.resolve(),
+        symbols=tuple(symbols),
+        observed_at=datetime.now(timezone.utc),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C008",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c008"),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
+def capture_verified_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    verification: Mapping[str, object],
+    code_subject: Path,
+    test_file: Path,
+    output_directory: Path,
+    python_executable: Path,
+    data_subjects: Sequence[Path] = (),
+    test_arguments: Sequence[str] = (),
+) -> EvidenceBundle:
+    """Capture checked code, test, runtime, and optional data evidence."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    _require_inside(output, root, "evidence output")
+    if verification.get("requirement_id") != requirement_id or verification.get("status") != "PASS":
+        raise ValueError(f"{requirement_id} verification did not produce a passing receipt")
     observed_at = datetime.now(timezone.utc)
+    stamp = observed_at.strftime("%Y%m%dT%H%M%S%fZ")
     output.mkdir(parents=True, exist_ok=True)
-    runtime_receipt = output / "c006_live_tick_runtime_receipt.json"
+    runtime_receipt = output / f"{requirement_id.lower()}_{stamp}_runtime_receipt.json"
     _write_json(runtime_receipt, {
         "schema_version": 1,
-        "requirement_id": "C006",
+        "requirement_id": requirement_id,
         "status": "PASS",
         "observed_at": observed_at.isoformat(),
         "verification": verification,
     })
-    test_receipt = output / "c006_live_tick_test_receipt.json"
-    test_file = root / "clean_build/tests/test_item_006_websocket_tick_ingest.py"
-    completed = _run_pytest(python_executable, root, test_file)
+    completed = _run_pytest(python_executable, root, test_file, test_arguments)
+    test_receipt = output / f"{requirement_id.lower()}_{stamp}_test_receipt.json"
     _write_json(test_receipt, {
         "schema_version": 1,
-        "requirement_id": "C006",
+        "requirement_id": requirement_id,
         "status": "PASS" if completed.returncode == 0 else "FAIL",
         "observed_at": observed_at.isoformat(),
         "command": tuple(completed.args),
@@ -136,26 +200,32 @@ def capture_c006_live_ticks(
         "stderr": completed.stderr,
     })
     if completed.returncode != 0:
-        raise RuntimeError("C006 tick-ingress test failed; evidence was not captured")
+        raise RuntimeError(f"{requirement_id} test failed; evidence was not captured")
+    subjects = [
+        EvidenceSubject(EvidenceKind.CODE, code_subject),
+        EvidenceSubject(EvidenceKind.TEST, test_receipt),
+        EvidenceSubject(EvidenceKind.RUNTIME, runtime_receipt),
+    ]
+    subjects.extend(EvidenceSubject(EvidenceKind.DATA, path) for path in data_subjects)
     return write_evidence_bundle(
         workspace_root=root,
-        requirement_id="C006",
-        subjects=(
-            EvidenceSubject(EvidenceKind.CODE, root / "clean_build/cipherfx_clean/tick_ingest.py"),
-            EvidenceSubject(EvidenceKind.TEST, test_receipt),
-            EvidenceSubject(EvidenceKind.RUNTIME, runtime_receipt),
-            EvidenceSubject(EvidenceKind.DATA, database),
-        ),
+        requirement_id=requirement_id,
+        subjects=tuple(subjects),
         output_directory=output,
         observed_at=observed_at,
     )
 
 
-def _run_pytest(python_executable: Path, workspace_root: Path, test_file: Path) -> subprocess.CompletedProcess[str]:
+def _run_pytest(
+    python_executable: Path,
+    workspace_root: Path,
+    test_file: Path,
+    test_arguments: Sequence[str] = (),
+) -> subprocess.CompletedProcess[str]:
     environment = dict(os.environ)
     environment["PYTHONPATH"] = str(workspace_root / "clean_build")
     return subprocess.run(
-        (str(python_executable), "-m", "pytest", "-q", str(test_file)),
+        (str(python_executable), "-m", "pytest", "-q", str(test_file), *test_arguments),
         cwd=workspace_root,
         env=environment,
         text=True,
@@ -182,16 +252,30 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace-root", type=Path, required=True)
+    parser.add_argument("--requirement", choices=("C006", "C008"), default="C006")
+    parser.add_argument("--bridge-root", type=Path)
     parser.add_argument("--tick-database", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--python-executable", type=Path, default=Path(sys.executable))
     args = parser.parse_args()
-    bundle = capture_c006_live_ticks(
-        workspace_root=args.workspace_root,
-        tick_database=args.tick_database,
-        output_directory=args.output_directory,
-        python_executable=args.python_executable,
-    )
+    if args.requirement == "C006":
+        bundle = capture_c006_live_ticks(
+            workspace_root=args.workspace_root,
+            tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+        )
+    else:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C008")
+        bundle = capture_c008_market_snapshot(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+        )
     print(json.dumps({
         "envelope": str(bundle.envelope),
         "manifest": str(bundle.manifest),
