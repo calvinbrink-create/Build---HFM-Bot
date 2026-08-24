@@ -20,6 +20,7 @@ from cipherfx_clean.evidence_capture import (
     capture_live_geometry_requirement,
     capture_live_tick_intelligence_requirement,
     capture_live_analytics_requirement,
+    capture_live_broker_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -53,6 +54,29 @@ def test_requirement_bundle_is_accepted_only_with_requirement_specific_claims(tm
 
     assert ledger.result("C006").status is RequirementStatus.PASS
     assert ledger.complete is False
+
+
+def test_broker_requirement_bundle_requires_exact_broker_evidence(tmp_path):
+    subjects = []
+    for kind in (EvidenceKind.CODE, EvidenceKind.TEST, EvidenceKind.RUNTIME, EvidenceKind.BROKER):
+        path = tmp_path / f"{kind.value.lower()}.txt"
+        path.write_text(kind.value, encoding="utf-8")
+        subjects.append(EvidenceSubject(kind, path))
+
+    bundle = write_evidence_bundle(
+        workspace_root=tmp_path,
+        requirement_id="C032",
+        subjects=tuple(subjects),
+        output_directory=tmp_path / "evidence",
+        observed_at=datetime(2026, 8, 24, tzinfo=timezone.utc),
+    )
+    ledger = certify_evidence_manifest(
+        spec_directory=SPECS,
+        manifest_path=bundle.manifest,
+        workspace_root=tmp_path,
+    )
+
+    assert ledger.result("C032").status is RequirementStatus.PASS
 
 
 def test_requirement_bundle_rejects_subject_outside_workspace(tmp_path):
@@ -543,3 +567,57 @@ def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path
     )
 
     assert sorted(path.name for path in snapshot.iterdir()) == sorted(path.name for path in source.iterdir())
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments"),
+    (
+        ("C032", "verify_c032_slippage_intelligence", "slippage.py", "test_item_047_slippage_intelligence.py", ("-k", "slippage")),
+        ("C033", "verify_c033_latency_intelligence", "latency.py", "test_item_048_latency_intelligence.py", ("-k", "latency")),
+    ),
+)
+def test_live_broker_capture_binds_exact_hfm_exports_as_broker_evidence(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    verification_name,
+    code_name,
+    test_name,
+    test_arguments,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    for name in ("history_orders.csv", "deals.csv"):
+        (exports / name).write_text(name, encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_broker_exports", lambda **_kwargs: exports)
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **kwargs: {"requirement_id": requirement_id, "status": "PASS", "database": str(kwargs["database"])},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_broker_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        database=tmp_path / "measurements.sqlite3",
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["test_arguments"] == test_arguments
+    with ZipFile(captured["broker_subjects"][0]) as archive:
+        assert archive.namelist() == ["00_deals.csv", "01_history_orders.csv"]

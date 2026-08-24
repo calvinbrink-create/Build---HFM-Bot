@@ -54,6 +54,8 @@ from .requirement_runtime import (
     verify_c038_volatility_of_volatility,
     verify_c039_compression_detector,
     verify_c040_expansion_detector,
+    verify_c032_slippage_intelligence,
+    verify_c033_latency_intelligence,
 )
 
 
@@ -229,6 +231,21 @@ _LIVE_ANALYTICS_CAPTURE_TARGETS = {
         "clean_build/tests/test_item_055_expansion_detector.py",
         ("-k", "expansion"),
         None,
+    ),
+}
+
+_LIVE_BROKER_CAPTURE_TARGETS = {
+    "C032": (
+        "verify_c032_slippage_intelligence",
+        "clean_build/cipherfx_clean/slippage.py",
+        "clean_build/tests/test_item_047_slippage_intelligence.py",
+        ("-k", "slippage"),
+    ),
+    "C033": (
+        "verify_c033_latency_intelligence",
+        "clean_build/cipherfx_clean/intelligence/latency.py",
+        "clean_build/tests/test_item_048_latency_intelligence.py",
+        ("-k", "latency"),
     ),
 }
 
@@ -687,6 +704,51 @@ def capture_live_analytics_requirement(
     )
 
 
+def capture_live_broker_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    database: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture read-only, exact HFM order/deal evidence for broker measurements."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments = _LIVE_BROKER_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live broker requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    _require_inside(output, root, "evidence output")
+    isolated_database = database.resolve()
+    _require_inside(isolated_database, root, "broker-evidence database")
+    broker_snapshot = _snapshot_broker_exports(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+    )
+    broker_bundle = _bundle_data_subject(output, requirement_id, tuple(sorted(broker_snapshot.iterdir())))
+    verification = globals()[verifier_name](
+        bridge_root=broker_snapshot,
+        database=isolated_database,
+        symbols=tuple(symbols),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        broker_subjects=(broker_bundle,),
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -697,6 +759,7 @@ def capture_verified_requirement(
     output_directory: Path,
     python_executable: Path,
     data_subjects: Sequence[Path] = (),
+    broker_subjects: Sequence[Path] = (),
     test_arguments: Sequence[str] = (),
 ) -> EvidenceBundle:
     """Capture checked code, test, runtime, and optional data evidence."""
@@ -737,6 +800,7 @@ def capture_verified_requirement(
         EvidenceSubject(EvidenceKind.RUNTIME, runtime_receipt),
     ]
     subjects.extend(EvidenceSubject(EvidenceKind.DATA, path) for path in data_subjects)
+    subjects.extend(EvidenceSubject(EvidenceKind.BROKER, path) for path in broker_subjects)
     return write_evidence_bundle(
         workspace_root=root,
         requirement_id=requirement_id,
@@ -830,6 +894,28 @@ def _snapshot_hfm_inputs(
     return snapshot
 
 
+def _snapshot_broker_exports(
+    *,
+    destination: Path,
+    requirement_id: str,
+    bridge_root: Path,
+) -> Path:
+    """Freeze the exact historical HFM order and deal exports used as broker proof."""
+
+    source_root = bridge_root.resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(source_root)
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot = destination / f"{requirement_id.lower()}_broker_exports_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    snapshot.mkdir()
+    for name in ("history_orders.csv", "deals.csv"):
+        source = source_root / name
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        copyfile(source, snapshot / name)
+    return snapshot
+
+
 def _bundle_data_subject(destination: Path, requirement_id: str, paths: Sequence[Path]) -> Path:
     """Create one immutable data subject when a requirement has several artifacts."""
 
@@ -861,6 +947,7 @@ def main() -> int:
             "C021", "C022", "C023", "C024", "C025",
             "C026", "C027", "C028", "C029", "C030",
             "C031", "C034", "C035", "C037", "C038", "C039", "C040",
+            "C032", "C033",
         ),
         default="C006",
     )
@@ -947,6 +1034,18 @@ def main() -> int:
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_BROKER_CAPTURE_TARGETS:
+        if args.bridge_root is None or args.database is None:
+            parser.error("--bridge-root and --database are required for C032-C033")
+        bundle = capture_live_broker_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            database=args.database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
