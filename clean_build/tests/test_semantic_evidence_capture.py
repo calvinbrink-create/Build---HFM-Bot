@@ -7,9 +7,15 @@ import pytest
 from cipherfx_clean.compliance import EvidenceKind, RequirementStatus, certify_evidence_manifest
 from cipherfx_clean.evidence_capture import (
     EvidenceSubject,
+    EvidenceBundle,
+    capture_c006_live_ticks,
+    capture_c008_market_snapshot,
+    capture_c009_market_state,
     capture_verified_requirement,
     write_evidence_bundle,
 )
+from cipherfx_clean.contracts import RawTick
+from cipherfx_clean.store import EvidenceStore
 
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -101,3 +107,80 @@ def test_verified_capture_records_test_and_runtime_receipts(tmp_path, monkeypatc
 
     assert ledger.result("C006").status is RequirementStatus.PASS
     assert len(list((tmp_path / "evidence").glob("c006_*_test_receipt.json"))) == 1
+
+
+def test_live_tick_capture_freezes_an_immutable_sqlite_subject(tmp_path, monkeypatch):
+    source = tmp_path / "live_ticks.sqlite3"
+    code_subject = tmp_path / "clean_build" / "cipherfx_clean" / "tick_ingest.py"
+    test_subject = tmp_path / "clean_build" / "tests" / "test_item_006_websocket_tick_ingest.py"
+    code_subject.parent.mkdir(parents=True)
+    test_subject.parent.mkdir(parents=True)
+    code_subject.write_text("tick_ingest = True\n", encoding="utf-8")
+    test_subject.write_text("def test_tick_ingest(): pass\n", encoding="utf-8")
+    store = EvidenceStore(source)
+    store.write_tick(RawTick("XAUUSD", datetime(2026, 8, 24, tzinfo=timezone.utc), 100.0, 100.2))
+    store.close()
+    monkeypatch.setattr(
+        "cipherfx_clean.evidence_capture._run_pytest",
+        lambda *args: subprocess.CompletedProcess(("python", "-m", "pytest"), 0, "1 passed", ""),
+    )
+
+    bundle = capture_c006_live_ticks(
+        workspace_root=tmp_path,
+        tick_database=source,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+    )
+    snapshots = tuple((tmp_path / "evidence").glob("c006_ticks_*.sqlite3"))
+    assert len(snapshots) == 1
+
+    store = EvidenceStore(source)
+    store.write_tick(RawTick("XAUUSD", datetime(2026, 8, 24, 0, 0, 1, tzinfo=timezone.utc), 100.1, 100.3))
+    store.close()
+    ledger = certify_evidence_manifest(
+        spec_directory=SPECS,
+        manifest_path=bundle.manifest,
+        workspace_root=tmp_path,
+    )
+    assert ledger.result("C006").status is RequirementStatus.PASS
+
+
+@pytest.mark.parametrize(
+    ("capture", "verification_name", "requirement_id", "test_filter"),
+    (
+        (capture_c008_market_snapshot, "verify_c008_hfm_candle_builder", "C008", "c008"),
+        (capture_c009_market_state, "verify_c009_hfm_market_states", "C009", "c009"),
+    ),
+)
+def test_live_snapshot_capture_returns_the_requirement_specific_bundle(
+    tmp_path, monkeypatch, capture, verification_name, requirement_id, test_filter,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    tick_database = tmp_path / "ticks.sqlite3"
+    tick_database.write_text("placeholder", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **_kwargs: {"requirement_id": requirement_id, "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        tick_database=tick_database,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD",),
+    )
+
+    assert result is expected
+    assert captured["requirement_id"] == requirement_id
+    assert captured["test_arguments"] == ("-k", test_filter)

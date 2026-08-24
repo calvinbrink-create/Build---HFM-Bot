@@ -15,6 +15,7 @@ from hashlib import sha256
 import json
 import os
 from pathlib import Path
+import sqlite3
 import subprocess
 import sys
 from typing import Mapping, Sequence
@@ -113,7 +114,10 @@ def capture_c006_live_ticks(
     output = output_directory.resolve()
     _require_inside(database, root, "tick database")
     _require_inside(output, root, "evidence output")
-    verification = verify_c006_raw_tick_library(database)
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = output / f"c006_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(database, snapshot)
+    verification = verify_c006_raw_tick_library(snapshot)
     if verification.get("status") != "PASS":
         raise ValueError("C006 raw tick verification did not pass")
     return capture_verified_requirement(
@@ -122,7 +126,7 @@ def capture_c006_live_ticks(
         verification=verification,
         code_subject=root / "clean_build/cipherfx_clean/tick_ingest.py",
         test_file=root / "clean_build/tests/test_item_006_websocket_tick_ingest.py",
-        data_subjects=(database,),
+        data_subjects=(snapshot,),
         output_directory=output,
         python_executable=python_executable,
     )
@@ -145,6 +149,16 @@ def capture_c008_market_snapshot(
         tick_database=tick_database.resolve(),
         symbols=tuple(symbols),
         observed_at=datetime.now(timezone.utc),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C008",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c008"),
+        output_directory=output_directory,
+        python_executable=python_executable,
     )
 
 
@@ -173,16 +187,6 @@ def capture_c009_market_state(
         code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
         test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
         test_arguments=("-k", "c009"),
-        output_directory=output_directory,
-        python_executable=python_executable,
-    )
-    return capture_verified_requirement(
-        workspace_root=root,
-        requirement_id="C008",
-        verification=verification,
-        code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
-        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
-        test_arguments=("-k", "c008"),
         output_directory=output_directory,
         python_executable=python_executable,
     )
@@ -274,6 +278,21 @@ def _require_inside(path: Path, root: Path, label: str) -> None:
 
 def _file_digest(path: Path) -> str:
     return f"sha256:{sha256(path.read_bytes()).hexdigest()}"
+
+
+def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
+    """Freeze a coherent SQLite evidence subject while the live writer continues."""
+
+    if destination.exists():
+        raise FileExistsError(destination)
+    reader = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+    writer = sqlite3.connect(destination)
+    try:
+        reader.backup(writer)
+        writer.commit()
+    finally:
+        writer.close()
+        reader.close()
 
 
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
