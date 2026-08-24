@@ -11,6 +11,9 @@ from cipherfx_clean.evidence_capture import (
     capture_c006_live_ticks,
     capture_c008_market_snapshot,
     capture_c009_market_state,
+    capture_c011_live_chart,
+    capture_c012_chart_pack,
+    capture_c013_chart_annotations,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -180,6 +183,49 @@ def test_live_snapshot_capture_returns_the_requirement_specific_bundle(
         python_executable=Path("/python"),
         symbols=("XAUUSD",),
     )
+
+    assert result is expected
+    assert captured["requirement_id"] == requirement_id
+    assert captured["test_arguments"] == ("-k", test_filter)
+
+
+@pytest.mark.parametrize(
+    ("capture", "verification_name", "requirement_id", "test_filter", "needs_timeframe"),
+    (
+        (capture_c011_live_chart, "verify_c011_hfm_live_chart", "C011", "c011", True),
+        (capture_c012_chart_pack, "verify_c012_hfm_chart_pack", "C012", "c012", False),
+        (capture_c013_chart_annotations, "verify_c013_hfm_annotations", "C013", "c013", True),
+    ),
+)
+def test_live_chart_capture_returns_requirement_specific_bundle(
+    tmp_path, monkeypatch, capture, verification_name, requirement_id, test_filter, needs_timeframe,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **_kwargs: {"requirement_id": requirement_id, "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+    arguments = {
+        "workspace_root": tmp_path,
+        "bridge_root": tmp_path,
+        "output_directory": tmp_path / "evidence",
+        "chart_directory": tmp_path / "charts",
+        "python_executable": Path("/python"),
+        "symbol": "XAUUSD",
+    }
+    if needs_timeframe:
+        arguments["timeframe"] = "M5"
+
+    result = capture(**arguments)
 
     assert result is expected
     assert captured["requirement_id"] == requirement_id

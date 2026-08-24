@@ -25,6 +25,9 @@ from .requirement_runtime import (
     verify_c006_raw_tick_library,
     verify_c008_hfm_candle_builder,
     verify_c009_hfm_market_states,
+    verify_c011_hfm_live_chart,
+    verify_c012_hfm_chart_pack,
+    verify_c013_hfm_annotations,
 )
 
 
@@ -192,6 +195,97 @@ def capture_c009_market_state(
     )
 
 
+def capture_c011_live_chart(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    chart_directory: Path,
+    python_executable: Path,
+    symbol: str,
+    timeframe: str,
+) -> EvidenceBundle:
+    """Capture a current completed-bar chart without involving broker execution."""
+
+    root = workspace_root.resolve()
+    verification = verify_c011_hfm_live_chart(
+        bridge_root=bridge_root.resolve(),
+        symbol=symbol,
+        timeframe=timeframe,
+        chart_directory=chart_directory.resolve(),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C011",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/intelligence/renderer.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c011"),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
+def capture_c012_chart_pack(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    chart_directory: Path,
+    python_executable: Path,
+    symbol: str,
+) -> EvidenceBundle:
+    """Capture a linked multi-timeframe chart pack from one observation."""
+
+    root = workspace_root.resolve()
+    verification = verify_c012_hfm_chart_pack(
+        bridge_root=bridge_root.resolve(),
+        symbol=symbol,
+        chart_directory=chart_directory.resolve(),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C012",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/intelligence/chart.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c012"),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
+def capture_c013_chart_annotations(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    chart_directory: Path,
+    python_executable: Path,
+    symbol: str,
+    timeframe: str,
+) -> EvidenceBundle:
+    """Capture annotation rendering evidence; the verifier never sends an order."""
+
+    root = workspace_root.resolve()
+    verification = verify_c013_hfm_annotations(
+        bridge_root=bridge_root.resolve(),
+        symbol=symbol,
+        timeframe=timeframe,
+        chart_directory=chart_directory.resolve(),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C013",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/intelligence/chart.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c013"),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -302,13 +396,22 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace-root", type=Path, required=True)
-    parser.add_argument("--requirement", choices=("C006", "C008", "C009"), default="C006")
+    parser.add_argument(
+        "--requirement",
+        choices=("C006", "C008", "C009", "C011", "C012", "C013"),
+        default="C006",
+    )
     parser.add_argument("--bridge-root", type=Path)
-    parser.add_argument("--tick-database", type=Path, required=True)
+    parser.add_argument("--tick-database", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
+    parser.add_argument("--chart-directory", type=Path)
+    parser.add_argument("--symbol", default="XAUUSD")
+    parser.add_argument("--timeframe", default="M5")
     parser.add_argument("--python-executable", type=Path, default=Path(sys.executable))
     args = parser.parse_args()
     if args.requirement == "C006":
+        if args.tick_database is None:
+            parser.error("--tick-database is required for C006")
         bundle = capture_c006_live_ticks(
             workspace_root=args.workspace_root,
             tick_database=args.tick_database,
@@ -316,8 +419,8 @@ def main() -> int:
             python_executable=args.python_executable,
         )
     elif args.requirement == "C008":
-        if args.bridge_root is None:
-            parser.error("--bridge-root is required for C008")
+        if args.bridge_root is None or args.tick_database is None:
+            parser.error("--bridge-root and --tick-database are required for C008")
         bundle = capture_c008_market_snapshot(
             workspace_root=args.workspace_root,
             bridge_root=args.bridge_root,
@@ -326,9 +429,9 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
         )
-    else:
-        if args.bridge_root is None:
-            parser.error("--bridge-root is required for C009")
+    elif args.requirement == "C009":
+        if args.bridge_root is None or args.tick_database is None:
+            parser.error("--bridge-root and --tick-database are required for C009")
         bundle = capture_c009_market_state(
             workspace_root=args.workspace_root,
             bridge_root=args.bridge_root,
@@ -337,6 +440,29 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
         )
+    else:
+        if args.bridge_root is None or args.chart_directory is None:
+            parser.error("--bridge-root and --chart-directory are required for C011-C013")
+        chart_arguments = {
+            "workspace_root": args.workspace_root,
+            "bridge_root": args.bridge_root,
+            "output_directory": args.output_directory,
+            "chart_directory": args.chart_directory,
+            "python_executable": args.python_executable,
+            "symbol": args.symbol,
+        }
+        if args.requirement == "C011":
+            bundle = capture_c011_live_chart(
+                **chart_arguments,
+                timeframe=args.timeframe,
+            )
+        elif args.requirement == "C012":
+            bundle = capture_c012_chart_pack(**chart_arguments)
+        else:
+            bundle = capture_c013_chart_annotations(
+                **chart_arguments,
+                timeframe=args.timeframe,
+            )
     print(json.dumps({
         "envelope": str(bundle.envelope),
         "manifest": str(bundle.manifest),
