@@ -15,9 +15,11 @@ from pathlib import Path
 from typing import Mapping
 
 from .candidate_universe import CandidateUniverse, build_candidate_universe
+from .hfm_data import HfmCsvMarketDataAdapter
 from .hfm_audit import build_report
 from .historical_memory import HistoricalState
 from .populate_memory import populate
+from .research_coverage import HistoricalCoveragePolicy, assess_history_coverage
 from .release import EdgeCertification, build_release_bundle, verify_release_bundle
 from .research_pipeline import ResearchPolicy, run_research, sweep_specs
 from .snapshot import RESEARCH_TIMEFRAMES
@@ -50,6 +52,7 @@ class PipelineReport:
     pipeline_id: str
     status: str
     reasons: tuple[str, ...]
+    history_coverage: str
     source_audit: str
     population: str
     candidate_universes: str
@@ -73,6 +76,43 @@ def run_pipeline(configuration: PipelineConfiguration) -> PipelineReport:
 
     config_path = evidence / "pipeline_configuration.json"
     _write_json(config_path, asdict(configuration))
+    coverage_policy = HistoricalCoveragePolicy(
+        required_timeframes=configuration.timeframes,
+        minimum_bars={frame: (24 if frame == "MN1" else 100) for frame in configuration.timeframes},
+        required_state_windows=max(
+            100,
+            configuration.research_policy.train_size
+            + configuration.research_policy.test_size
+            + configuration.research_policy.holdout_size,
+        ),
+        lookback_bars=configuration.lookback_bars,
+        stride_m1_bars=configuration.stride_m1_bars,
+        required_fidelity=configuration.research_policy.required_fidelity,
+    )
+    coverage_path = evidence / "research_history_coverage.json"
+    coverage = assess_history_coverage(
+        HfmCsvMarketDataAdapter(source_root),
+        configuration.symbols,
+        observed_at=observed_at,
+        policy=coverage_policy,
+    )
+    _write_json(coverage_path, coverage.as_dict())
+    if coverage.status != "READY":
+        report = PipelineReport(
+            _digest((asdict(configuration), coverage.as_dict())),
+            "BLOCKED",
+            ("RESEARCH_PREFLIGHT_BLOCKED", coverage.status, *coverage.reasons),
+            str(coverage_path.relative_to(repository_root)),
+            "NOT_RUN",
+            "NOT_RUN",
+            "NOT_RUN",
+            "NOT_RUN",
+            "NOT_RUN",
+            f"NOT_RUN_{coverage.status}",
+            ("NO_RELEASE_BUNDLE",),
+        )
+        _write_json(evidence / "pipeline_report.json", asdict(report))
+        return report
     audit_path = evidence / "hfm_dataset_audit_pipeline.json"
     _write_json(audit_path, build_report(source_root, configuration.symbols, observed_at))
     population_path = evidence / "historical_population_pipeline.json"
@@ -170,6 +210,7 @@ def run_pipeline(configuration: PipelineConfiguration) -> PipelineReport:
             pipeline_id,
             "BLOCKED" if reasons else "PASS",
             tuple(reasons),
+            str(coverage_path.relative_to(repository_root)),
             str(audit_path.relative_to(repository_root)),
             str(population_path.relative_to(repository_root)),
             str(universe_path.relative_to(repository_root)),
