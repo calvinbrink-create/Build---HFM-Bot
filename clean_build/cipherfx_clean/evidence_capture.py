@@ -67,6 +67,14 @@ from .requirement_runtime import (
     verify_c048_opening_range_breakout_model,
     verify_c049_false_opening_range_breakout_model,
     verify_c050_session_vwap_engine,
+    verify_c052_vwap_reclaim_rejection_model,
+    verify_c053_tick_volume_engine,
+    verify_c055_trend_engine,
+    verify_c056_trend_persistence_probability,
+    verify_c057_mean_reversion_engine,
+    verify_c058_breakout_engine,
+    verify_c059_breakout_quality_model,
+    verify_c060_failed_breakout_library,
 )
 
 
@@ -306,6 +314,55 @@ _LIVE_ANALYTICS_CAPTURE_TARGETS = {
         ("-k", "vwap"),
         None,
     ),
+    "C052": (
+        "verify_c052_vwap_reclaim_rejection_model",
+        "clean_build/cipherfx_clean/intelligence/vwap_reclaim_rejection.py",
+        "clean_build/tests/test_item_066_vwap_reclaim_rejection.py",
+        ("-k", "reclaim"),
+        "session",
+    ),
+    "C055": (
+        "verify_c055_trend_engine",
+        "clean_build/cipherfx_clean/intelligence/trend_engine.py",
+        "clean_build/tests/test_item_069_trend_engine.py",
+        ("-k", "trend"),
+        None,
+    ),
+    "C056": (
+        "verify_c056_trend_persistence_probability",
+        "clean_build/cipherfx_clean/intelligence/trend_persistence.py",
+        "clean_build/tests/test_item_070_trend_persistence.py",
+        ("-k", "persistence"),
+        "trend",
+    ),
+    "C057": (
+        "verify_c057_mean_reversion_engine",
+        "clean_build/cipherfx_clean/intelligence/mean_reversion_engine.py",
+        "clean_build/tests/test_item_071_mean_reversion_engine.py",
+        ("-k", "mean_reversion"),
+        None,
+    ),
+    "C058": (
+        "verify_c058_breakout_engine",
+        "clean_build/cipherfx_clean/intelligence/breakout_engine.py",
+        "clean_build/tests/test_item_072_breakout_engine.py",
+        ("-k", "breakout"),
+        None,
+    ),
+    "C059": (
+        "verify_c059_breakout_quality_model",
+        "clean_build/cipherfx_clean/intelligence/breakout_quality_engine.py",
+        "clean_build/tests/test_item_073_breakout_quality_engine.py",
+        ("-k", "breakout"),
+        None,
+    ),
+    "C060": (
+        "verify_c060_failed_breakout_library",
+        "clean_build/cipherfx_clean/intelligence/failed_breakout.py",
+        "clean_build/tests/test_item_074_failed_breakout_library.py",
+        ("-k", "failed_breakout"),
+        None,
+    ),
 }
 
 _LIVE_BROKER_CAPTURE_TARGETS = {
@@ -329,6 +386,15 @@ _LIVE_SESSION_BROKER_CAPTURE_TARGETS = {
         "clean_build/cipherfx_clean/intelligence/session.py",
         "clean_build/tests/test_item_056_session_engine.py",
         (),
+    ),
+}
+
+_LIVE_ACTIVITY_BROKER_CAPTURE_TARGETS = {
+    "C053": (
+        "verify_c053_tick_volume_engine",
+        "clean_build/cipherfx_clean/intelligence/tick_volume.py",
+        "clean_build/tests/test_item_067_tick_volume.py",
+        ("-k", "tick_volume"),
     ),
 }
 
@@ -799,15 +865,20 @@ def capture_live_analytics_requirement(
     source_root = bridge_root.resolve()
     data_subjects: tuple[Path, ...] = ()
     if snapshot_kind is not None:
-        timeframes = ("M1",) if snapshot_kind in {"spread", "session"} else _HFM_RESEARCH_TIMEFRAMES
+        if snapshot_kind in {"spread", "session"}:
+            timeframes = ("M1",)
+        elif snapshot_kind == "trend":
+            timeframes = ("M1", "M5", "M15", "H1", "H4", "D1")
+        else:
+            timeframes = _HFM_RESEARCH_TIMEFRAMES
         snapshot = _snapshot_hfm_inputs(
             destination=output,
             requirement_id=requirement_id,
             bridge_root=source_root,
             symbols=symbols,
             timeframes=timeframes,
-            include_combined_m1=snapshot_kind in {"spread", "session"},
-            include_ticks=snapshot_kind in {"spread", "session"},
+            include_combined_m1=snapshot_kind in {"spread", "session", "trend"},
+            include_ticks=snapshot_kind in {"spread", "session", "trend"},
         )
         source_root = snapshot
         data_subjects = (_bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),)
@@ -896,6 +967,48 @@ def capture_live_session_broker_requirement(
     )
     broker_bundle = _bundle_data_subject(output, requirement_id, tuple(sorted(tick_snapshot.iterdir())))
     verification = globals()[verifier_name](bridge_root=tick_snapshot, symbols=tuple(symbols))
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        broker_subjects=(broker_bundle,),
+        test_arguments=test_arguments,
+    )
+
+
+def capture_live_activity_broker_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture HFM broker activity exports required by tick-volume evidence."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments = _LIVE_ACTIVITY_BROKER_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live activity broker requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    _require_inside(output, root, "evidence output")
+    source_snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    broker_bundle = _bundle_data_subject(output, requirement_id, tuple(sorted(source_snapshot.iterdir())))
+    verification = globals()[verifier_name](bridge_root=source_snapshot, symbols=tuple(symbols))
     return capture_verified_requirement(
         workspace_root=root,
         requirement_id=requirement_id,
@@ -1165,6 +1278,7 @@ def main() -> int:
             "C031", "C034", "C035", "C037", "C038", "C039", "C040",
             "C032", "C033", "C041",
             "C042", "C043", "C044", "C045", "C046", "C047", "C048", "C049", "C050",
+            "C052", "C053", "C055", "C056", "C057", "C058", "C059", "C060",
         ),
         default="C006",
     )
@@ -1281,6 +1395,17 @@ def main() -> int:
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C041")
         bundle = capture_live_session_broker_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_ACTIVITY_BROKER_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C053")
+        bundle = capture_live_activity_broker_requirement(
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,

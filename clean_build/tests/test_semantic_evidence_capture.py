@@ -504,6 +504,13 @@ def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
         ("C048", "verify_c048_opening_range_breakout_model", "opening_range_breakouts.py", "test_item_062_opening_range_breakouts.py", ("-k", "breakout"), False),
         ("C049", "verify_c049_false_opening_range_breakout_model", "false_opening_range_breakouts.py", "test_item_063_false_opening_range_breakouts.py", ("-k", "breakout"), False),
         ("C050", "verify_c050_session_vwap_engine", "session_vwap.py", "test_item_064_session_vwap.py", ("-k", "vwap"), False),
+        ("C052", "verify_c052_vwap_reclaim_rejection_model", "vwap_reclaim_rejection.py", "test_item_066_vwap_reclaim_rejection.py", ("-k", "reclaim"), True),
+        ("C055", "verify_c055_trend_engine", "trend_engine.py", "test_item_069_trend_engine.py", ("-k", "trend"), False),
+        ("C056", "verify_c056_trend_persistence_probability", "trend_persistence.py", "test_item_070_trend_persistence.py", ("-k", "persistence"), True),
+        ("C057", "verify_c057_mean_reversion_engine", "mean_reversion_engine.py", "test_item_071_mean_reversion_engine.py", ("-k", "mean_reversion"), False),
+        ("C058", "verify_c058_breakout_engine", "breakout_engine.py", "test_item_072_breakout_engine.py", ("-k", "breakout"), False),
+        ("C059", "verify_c059_breakout_quality_model", "breakout_quality_engine.py", "test_item_073_breakout_quality_engine.py", ("-k", "breakout"), False),
+        ("C060", "verify_c060_failed_breakout_library", "failed_breakout.py", "test_item_074_failed_breakout_library.py", ("-k", "failed_breakout"), False),
     ),
 )
 def test_live_analytics_capture_binds_specific_verifier_code_test_and_required_data(
@@ -692,6 +699,49 @@ def test_broker_tick_export_snapshot_contains_only_requested_exports(tmp_path):
     )
 
     assert [path.name for path in snapshot.iterdir()] == ["tick_XAUUSD.txt"]
+
+
+def test_live_activity_broker_capture_binds_exact_hfm_activity_exports(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    for name in ("symbols.csv", "rates_XAUUSD_M1.csv", "deephistory_XAUUSD_M1.csv", "tick_XAUUSD.txt"):
+        (exports / name).write_text(name, encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: exports)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c053_tick_volume_engine",
+        lambda **kwargs: {"requirement_id": "C053", "status": "PASS", "bridge_root": str(kwargs["bridge_root"])},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_module.capture_live_activity_broker_requirement(
+        workspace_root=tmp_path,
+        requirement_id="C053",
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD",),
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == "tick_volume.py"
+    assert captured["test_file"].name == "test_item_067_tick_volume.py"
+    assert captured["test_arguments"] == ("-k", "tick_volume")
+    with ZipFile(captured["broker_subjects"][0]) as archive:
+        assert archive.namelist() == [
+            "00_deephistory_XAUUSD_M1.csv",
+            "01_rates_XAUUSD_M1.csv",
+            "02_symbols.csv",
+            "03_tick_XAUUSD.txt",
+        ]
 
 
 def test_c007_capture_binds_persisted_fresh_and_stale_tick_evidence(tmp_path, monkeypatch):
