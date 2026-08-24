@@ -56,6 +56,15 @@ from .requirement_runtime import (
     verify_c040_expansion_detector,
     verify_c032_slippage_intelligence,
     verify_c033_latency_intelligence,
+    verify_c042_session_profile_library,
+    verify_c043_asia_range_engine,
+    verify_c044_london_sweep_model,
+    verify_c045_ny_continuation_model,
+    verify_c046_ny_reversal_model,
+    verify_c047_opening_range_engine,
+    verify_c048_opening_range_breakout_model,
+    verify_c049_false_opening_range_breakout_model,
+    verify_c050_session_vwap_engine,
 )
 
 
@@ -230,6 +239,69 @@ _LIVE_ANALYTICS_CAPTURE_TARGETS = {
         "clean_build/cipherfx_clean/intelligence/volatility_dynamics.py",
         "clean_build/tests/test_item_055_expansion_detector.py",
         ("-k", "expansion"),
+        None,
+    ),
+    "C042": (
+        "verify_c042_session_profile_library",
+        "clean_build/cipherfx_clean/intelligence/session_profiles.py",
+        "clean_build/tests/test_item_057_session_profiles.py",
+        ("-k", "session"),
+        "session",
+    ),
+    "C043": (
+        "verify_c043_asia_range_engine",
+        "clean_build/cipherfx_clean/intelligence/session_profiles.py",
+        "clean_build/tests/test_item_058_asia_ranges.py",
+        ("-k", "asia"),
+        None,
+    ),
+    "C044": (
+        "verify_c044_london_sweep_model",
+        "clean_build/cipherfx_clean/intelligence/london_sweeps.py",
+        "clean_build/tests/test_item_059_london_sweeps.py",
+        ("-k", "london"),
+        None,
+    ),
+    "C045": (
+        "verify_c045_ny_continuation_model",
+        "clean_build/cipherfx_clean/intelligence/ny_transitions.py",
+        "clean_build/tests/test_item_060_ny_transitions.py",
+        (),
+        None,
+    ),
+    "C046": (
+        "verify_c046_ny_reversal_model",
+        "clean_build/cipherfx_clean/intelligence/ny_transitions.py",
+        "clean_build/tests/test_item_060_ny_transitions.py",
+        (),
+        None,
+    ),
+    "C047": (
+        "verify_c047_opening_range_engine",
+        "clean_build/cipherfx_clean/intelligence/opening_ranges.py",
+        "clean_build/tests/test_item_061_opening_ranges.py",
+        ("-k", "opening_range"),
+        None,
+    ),
+    "C048": (
+        "verify_c048_opening_range_breakout_model",
+        "clean_build/cipherfx_clean/intelligence/opening_range_breakouts.py",
+        "clean_build/tests/test_item_062_opening_range_breakouts.py",
+        ("-k", "breakout"),
+        None,
+    ),
+    "C049": (
+        "verify_c049_false_opening_range_breakout_model",
+        "clean_build/cipherfx_clean/intelligence/false_opening_range_breakouts.py",
+        "clean_build/tests/test_item_063_false_opening_range_breakouts.py",
+        ("-k", "breakout"),
+        None,
+    ),
+    "C050": (
+        "verify_c050_session_vwap_engine",
+        "clean_build/cipherfx_clean/intelligence/session_vwap.py",
+        "clean_build/tests/test_item_064_session_vwap.py",
+        ("-k", "vwap"),
         None,
     ),
 }
@@ -678,15 +750,15 @@ def capture_live_analytics_requirement(
     source_root = bridge_root.resolve()
     data_subjects: tuple[Path, ...] = ()
     if snapshot_kind is not None:
-        timeframes = ("M1",) if snapshot_kind == "spread" else _HFM_RESEARCH_TIMEFRAMES
+        timeframes = ("M1",) if snapshot_kind in {"spread", "session"} else _HFM_RESEARCH_TIMEFRAMES
         snapshot = _snapshot_hfm_inputs(
             destination=output,
             requirement_id=requirement_id,
             bridge_root=source_root,
             symbols=symbols,
             timeframes=timeframes,
-            include_combined_m1=snapshot_kind == "spread",
-            include_ticks=snapshot_kind == "spread",
+            include_combined_m1=snapshot_kind in {"spread", "session"},
+            include_ticks=snapshot_kind in {"spread", "session"},
         )
         source_root = snapshot
         data_subjects = (_bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),)
@@ -948,6 +1020,7 @@ def main() -> int:
             "C026", "C027", "C028", "C029", "C030",
             "C031", "C034", "C035", "C037", "C038", "C039", "C040",
             "C032", "C033",
+            "C042", "C043", "C044", "C045", "C046", "C047", "C048", "C049", "C050",
         ),
         default="C006",
     )

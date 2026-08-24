@@ -495,6 +495,15 @@ def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
         ("C038", "verify_c038_volatility_of_volatility", "volatility_dynamics.py", "test_item_053_volatility_of_volatility.py", ("-k", "volatility"), False),
         ("C039", "verify_c039_compression_detector", "volatility_dynamics.py", "test_item_054_compression_detector.py", ("-k", "compression"), True),
         ("C040", "verify_c040_expansion_detector", "volatility_dynamics.py", "test_item_055_expansion_detector.py", ("-k", "expansion"), False),
+        ("C042", "verify_c042_session_profile_library", "session_profiles.py", "test_item_057_session_profiles.py", ("-k", "session"), True),
+        ("C043", "verify_c043_asia_range_engine", "session_profiles.py", "test_item_058_asia_ranges.py", ("-k", "asia"), False),
+        ("C044", "verify_c044_london_sweep_model", "london_sweeps.py", "test_item_059_london_sweeps.py", ("-k", "london"), False),
+        ("C045", "verify_c045_ny_continuation_model", "ny_transitions.py", "test_item_060_ny_transitions.py", (), False),
+        ("C046", "verify_c046_ny_reversal_model", "ny_transitions.py", "test_item_060_ny_transitions.py", (), False),
+        ("C047", "verify_c047_opening_range_engine", "opening_ranges.py", "test_item_061_opening_ranges.py", ("-k", "opening_range"), False),
+        ("C048", "verify_c048_opening_range_breakout_model", "opening_range_breakouts.py", "test_item_062_opening_range_breakouts.py", ("-k", "breakout"), False),
+        ("C049", "verify_c049_false_opening_range_breakout_model", "false_opening_range_breakouts.py", "test_item_063_false_opening_range_breakouts.py", ("-k", "breakout"), False),
+        ("C050", "verify_c050_session_vwap_engine", "session_vwap.py", "test_item_064_session_vwap.py", ("-k", "vwap"), False),
     ),
 )
 def test_live_analytics_capture_binds_specific_verifier_code_test_and_required_data(
