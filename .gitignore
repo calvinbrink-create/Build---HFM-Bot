@@ -34,3 +34,13 @@
 *.key
 *.pem
 /audit_artifacts/
+
+# The clean build keeps code and reproducible specifications in Git. Runtime
+# evidence, local databases, charts, caches, and service status are generated
+# on the VPS and must never be committed as source.
+/clean_build/evidence/
+/clean_build/runtime/
+/clean_build/**/__pycache__/
+/clean_build/.pytest_cache/
+/clean_build/**/*.sqlite3
+/clean_build/**/*.sqlite3-*
