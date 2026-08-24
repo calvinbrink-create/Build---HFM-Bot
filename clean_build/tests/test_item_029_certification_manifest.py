@@ -20,18 +20,37 @@ SPECS = ROOT / "build_specs" / "2026-08-23"
 
 
 def _manifest(tmp_path, *, requirement_id="F02", kind=EvidenceKind.CODE):
-    artifact = tmp_path / "artifact.txt"
-    artifact.write_text("verified artifact\n", encoding="utf-8")
-    payload = {
+    subject = tmp_path / "subject.txt"
+    subject.write_text("verified subject\n", encoding="utf-8")
+    observed_at = datetime.now(timezone.utc).isoformat()
+    evidence_id = f"{requirement_id}:{kind.value}:1"
+    artifact = tmp_path / "artifact.json"
+    artifact.write_text(json.dumps({
         "schema_version": 1,
-        "evidence": [
-            {
-                "evidence_id": f"{requirement_id}:{kind.value}:1",
+        "evidence_claims": {
+            evidence_id: {
+                "evidence_id": evidence_id,
                 "requirement_id": requirement_id,
                 "kind": kind.value,
-                "location": artifact.name,
+                "result": "PASS",
+                "observed_at": observed_at,
+                "subject": {
+                    "path": subject.name,
+                    "digest": f"sha256:{sha256(subject.read_bytes()).hexdigest()}",
+                },
+            },
+        },
+    }), encoding="utf-8")
+    payload = {
+        "schema_version": 2,
+        "evidence": [
+            {
+                "evidence_id": evidence_id,
+                "requirement_id": requirement_id,
+                "kind": kind.value,
+                "location": f"{artifact.name}#{evidence_id}",
                 "digest": f"sha256:{sha256(artifact.read_bytes()).hexdigest()}",
-                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "observed_at": observed_at,
                 "result": "PASS",
             }
         ],
@@ -61,7 +80,7 @@ def test_tampered_artifact_is_rejected(tmp_path):
 def test_evidence_location_cannot_escape_workspace(tmp_path):
     manifest, _ = _manifest(tmp_path)
     payload = json.loads(manifest.read_text())
-    payload["evidence"][0]["location"] = "../outside.txt"
+    payload["evidence"][0]["location"] = "../outside.json#F02:CODE:1"
     manifest.write_text(json.dumps(payload))
 
     with pytest.raises(ValueError, match="escapes workspace"):
@@ -102,6 +121,41 @@ def test_duplicate_evidence_identity_is_rejected(tmp_path):
     manifest.write_text(json.dumps(payload))
 
     with pytest.raises(ValueError, match="duplicate evidence id"):
+        load_verified_evidence_manifest(manifest, workspace_root=tmp_path)
+
+
+def test_v1_manifest_without_requirement_specific_claims_is_rejected(tmp_path):
+    manifest, _ = _manifest(tmp_path)
+    payload = json.loads(manifest.read_text())
+    payload["schema_version"] = 1
+    manifest.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="schema_version must be 2"):
+        load_verified_evidence_manifest(manifest, workspace_root=tmp_path)
+
+
+def test_claim_cannot_be_relabelled_as_a_different_evidence_kind(tmp_path):
+    manifest, _ = _manifest(tmp_path, kind=EvidenceKind.CODE)
+    payload = json.loads(manifest.read_text())
+    payload["evidence"][0]["kind"] = EvidenceKind.BROKER.value
+    payload["evidence"][0]["evidence_id"] = "F02:BROKER:1"
+    payload["evidence"][0]["location"] = "artifact.json#F02:BROKER:1"
+    manifest.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="evidence claim is missing"):
+        load_verified_evidence_manifest(manifest, workspace_root=tmp_path)
+
+
+def test_tampered_subject_is_rejected_even_when_envelope_hash_matches(tmp_path):
+    manifest, _ = _manifest(tmp_path)
+    subject = tmp_path / "subject.txt"
+    subject.write_text("changed subject\n", encoding="utf-8")
+    payload = json.loads(manifest.read_text())
+    artifact = tmp_path / "artifact.json"
+    payload["evidence"][0]["digest"] = f"sha256:{sha256(artifact.read_bytes()).hexdigest()}"
+    manifest.write_text(json.dumps(payload))
+
+    with pytest.raises(ValueError, match="subject digest mismatch"):
         load_verified_evidence_manifest(manifest, workspace_root=tmp_path)
 
 

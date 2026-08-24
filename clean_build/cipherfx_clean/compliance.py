@@ -306,17 +306,19 @@ def load_verified_evidence_manifest(
     *,
     workspace_root: Path,
 ) -> tuple[EvidenceRecord, ...]:
-    """Load evidence only after validating identity and artifact content.
+    """Load content-addressed, requirement-specific evidence claims.
 
-    A manifest is not evidence by itself.  Every row must point at an existing
-    file under ``workspace_root`` and must carry that file's current SHA-256.
-    A ``#fragment`` suffix may identify a record inside an artifact, but the
-    digest always covers the complete immutable artifact.
+    The manifest is an index, not proof.  Each row must point to a JSON
+    evidence envelope whose named claim repeats the requirement, evidence
+    kind, result, and observation time.  The claim must also identify a
+    content-addressed subject under the workspace.  This prevents a generic
+    test trace or a source file from being relabelled as runtime, data, broker,
+    or shadow proof merely by changing a manifest row.
     """
 
     raw = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if not isinstance(raw, Mapping) or raw.get("schema_version") != 1:
-        raise ValueError("evidence manifest schema_version must be 1")
+    if not isinstance(raw, Mapping) or raw.get("schema_version") != 2:
+        raise ValueError("evidence manifest schema_version must be 2")
     values = raw.get("evidence")
     if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
         raise ValueError("evidence manifest requires an evidence array")
@@ -331,7 +333,15 @@ def load_verified_evidence_manifest(
         if record.evidence_id in observed_ids:
             raise ValueError(f"duplicate evidence id: {record.evidence_id}")
         observed_ids.add(record.evidence_id)
-        artifact_name = record.location.split("#", 1)[0]
+        artifact_name, separator, claim_id = record.location.partition("#")
+        if not separator or not claim_id:
+            raise ValueError(
+                "evidence location must select its immutable claim with #<evidence_id>"
+            )
+        if claim_id != record.evidence_id:
+            raise ValueError(
+                f"evidence location claim does not match record identity: {record.evidence_id}"
+            )
         artifact = (root / artifact_name).resolve()
         try:
             artifact.relative_to(root)
@@ -345,8 +355,66 @@ def load_verified_evidence_manifest(
                 f"evidence digest mismatch for {record.evidence_id}: "
                 f"expected {expected}, observed {record.digest}"
             )
+        _validate_evidence_claim(record, artifact, root)
         records.append(record)
     return tuple(records)
+
+
+def _validate_evidence_claim(
+    record: EvidenceRecord,
+    artifact: Path,
+    workspace_root: Path,
+) -> None:
+    """Verify the artifact itself makes the exact claim in the manifest."""
+
+    try:
+        payload = json.loads(artifact.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ValueError(
+            f"evidence artifact must be a JSON evidence envelope: {record.location}"
+        ) from exc
+    if not isinstance(payload, Mapping) or payload.get("schema_version") != 1:
+        raise ValueError(f"evidence envelope schema_version must be 1: {record.location}")
+    claims = payload.get("evidence_claims")
+    if not isinstance(claims, Mapping):
+        raise ValueError(f"evidence envelope has no evidence_claims: {record.location}")
+    claim = claims.get(record.evidence_id)
+    if not isinstance(claim, Mapping):
+        raise ValueError(f"evidence claim is missing: {record.evidence_id}")
+    expected_fields = {
+        "evidence_id": record.evidence_id,
+        "requirement_id": record.requirement_id,
+        "kind": record.kind.value,
+        "result": record.result,
+        "observed_at": record.observed_at,
+    }
+    for field, expected in expected_fields.items():
+        if claim.get(field) != expected:
+            raise ValueError(
+                f"evidence claim {field} mismatch for {record.evidence_id}: "
+                f"expected {expected!r}, observed {claim.get(field)!r}"
+            )
+
+    subject = claim.get("subject")
+    if not isinstance(subject, Mapping):
+        raise ValueError(f"evidence claim has no content-addressed subject: {record.evidence_id}")
+    subject_path_text = subject.get("path")
+    subject_digest = subject.get("digest")
+    if not isinstance(subject_path_text, str) or not isinstance(subject_digest, str):
+        raise ValueError(f"evidence claim subject is incomplete: {record.evidence_id}")
+    subject_path = (workspace_root / subject_path_text).resolve()
+    try:
+        subject_path.relative_to(workspace_root)
+    except ValueError as exc:
+        raise ValueError(f"evidence subject escapes workspace: {record.evidence_id}") from exc
+    if not subject_path.is_file():
+        raise ValueError(f"evidence subject does not exist: {record.evidence_id}")
+    expected_subject_digest = f"sha256:{sha256(subject_path.read_bytes()).hexdigest()}"
+    if subject_digest != expected_subject_digest:
+        raise ValueError(
+            f"evidence subject digest mismatch for {record.evidence_id}: "
+            f"expected {expected_subject_digest}, observed {subject_digest}"
+        )
 
 
 def certify_evidence_manifest(
