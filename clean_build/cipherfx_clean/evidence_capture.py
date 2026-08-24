@@ -30,6 +30,12 @@ from .requirement_runtime import (
     verify_c012_hfm_chart_pack,
     verify_c013_hfm_annotations,
     verify_c014_hfm_chart_history,
+    verify_c015_hfm_price_structure,
+    verify_c016_hfm_swing_hierarchy,
+    verify_c017_hfm_supply_zones,
+    verify_c018_hfm_demand_zones,
+    verify_c019_hfm_zone_quality,
+    verify_c020_hfm_liquidity,
 )
 
 
@@ -44,6 +50,46 @@ class EvidenceBundle:
     envelope: Path
     manifest: Path
     evidence_ids: tuple[str, ...]
+
+
+_LIVE_INTELLIGENCE_CAPTURE_TARGETS = {
+    "C015": (
+        "verify_c015_hfm_price_structure",
+        "clean_build/cipherfx_clean/intelligence/structure.py",
+        "clean_build/tests/test_item_030_requirement_runtime.py",
+        ("-k", "c015"),
+    ),
+    "C016": (
+        "verify_c016_hfm_swing_hierarchy",
+        "clean_build/cipherfx_clean/intelligence/structure.py",
+        "clean_build/tests/test_item_030_requirement_runtime.py",
+        ("-k", "c016"),
+    ),
+    "C017": (
+        "verify_c017_hfm_supply_zones",
+        "clean_build/cipherfx_clean/intelligence/zones.py",
+        "clean_build/tests/test_item_032_supply_zones.py",
+        ("-k", "c017"),
+    ),
+    "C018": (
+        "verify_c018_hfm_demand_zones",
+        "clean_build/cipherfx_clean/intelligence/zones.py",
+        "clean_build/tests/test_item_033_demand_zones.py",
+        ("-k", "c018"),
+    ),
+    "C019": (
+        "verify_c019_hfm_zone_quality",
+        "clean_build/cipherfx_clean/intelligence/advanced.py",
+        "clean_build/tests/test_item_034_zone_quality.py",
+        ("-k", "c019"),
+    ),
+    "C020": (
+        "verify_c020_hfm_liquidity",
+        "clean_build/cipherfx_clean/intelligence/liquidity.py",
+        "clean_build/tests/test_item_035_liquidity_engine.py",
+        ("-k", "liquidity_engine"),
+    ),
+}
 
 
 def write_evidence_bundle(
@@ -329,6 +375,39 @@ def capture_c014_chart_history(
     )
 
 
+def capture_live_intelligence_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture a live HFM-backed market-intelligence verification receipt."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments = _LIVE_INTELLIGENCE_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live intelligence requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    verifier = globals()[verifier_name]
+    verification = verifier(
+        bridge_root=bridge_root.resolve(),
+        symbols=tuple(symbols),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output_directory,
+        python_executable=python_executable,
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -457,7 +536,10 @@ def main() -> int:
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument(
         "--requirement",
-        choices=("C006", "C008", "C009", "C011", "C012", "C013", "C014"),
+        choices=(
+            "C006", "C008", "C009", "C011", "C012", "C013", "C014",
+            "C015", "C016", "C017", "C018", "C019", "C020",
+        ),
         default="C006",
     )
     parser.add_argument("--bridge-root", type=Path)
@@ -466,6 +548,7 @@ def main() -> int:
     parser.add_argument("--chart-directory", type=Path)
     parser.add_argument("--database", type=Path)
     parser.add_argument("--symbol", default="XAUUSD")
+    parser.add_argument("--symbols", nargs="+", default=("XAUUSD", "UK100", "USA100", "USA500", "USA30"))
     parser.add_argument("--timeframe", default="M5")
     parser.add_argument("--python-executable", type=Path, default=Path(sys.executable))
     args = parser.parse_args()
@@ -499,6 +582,17 @@ def main() -> int:
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+        )
+    elif args.requirement in _LIVE_INTELLIGENCE_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C015-C020")
+        bundle = capture_live_intelligence_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
         )
     elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:

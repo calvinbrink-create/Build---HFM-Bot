@@ -16,6 +16,7 @@ from cipherfx_clean.evidence_capture import (
     capture_c012_chart_pack,
     capture_c013_chart_annotations,
     capture_c014_chart_history,
+    capture_live_intelligence_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -283,3 +284,58 @@ def test_live_chart_history_capture_binds_database_and_rendered_chart(tmp_path, 
     with ZipFile(data_subject) as archive:
         assert archive.namelist() == ["00_chart_history.sqlite3", "01_chart.svg"]
     assert captured["test_file"].name == "test_item_031_chart_history.py"
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments"),
+    (
+        ("C015", "verify_c015_hfm_price_structure", "structure.py", "test_item_030_requirement_runtime.py", ("-k", "c015")),
+        ("C016", "verify_c016_hfm_swing_hierarchy", "structure.py", "test_item_030_requirement_runtime.py", ("-k", "c016")),
+        ("C017", "verify_c017_hfm_supply_zones", "zones.py", "test_item_032_supply_zones.py", ("-k", "c017")),
+        ("C018", "verify_c018_hfm_demand_zones", "zones.py", "test_item_033_demand_zones.py", ("-k", "c018")),
+        ("C019", "verify_c019_hfm_zone_quality", "advanced.py", "test_item_034_zone_quality.py", ("-k", "c019")),
+        ("C020", "verify_c020_hfm_liquidity", "liquidity.py", "test_item_035_liquidity_engine.py", ("-k", "liquidity_engine")),
+    ),
+)
+def test_live_intelligence_capture_binds_specific_verifier_code_and_test(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    verification_name,
+    code_name,
+    test_name,
+    test_arguments,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **kwargs: {
+            "requirement_id": requirement_id,
+            "status": "PASS",
+            "symbols": {symbol: {} for symbol in kwargs["symbols"]},
+        },
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_intelligence_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "USA100"),
+    )
+
+    assert result is expected
+    assert captured["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["test_arguments"] == test_arguments
