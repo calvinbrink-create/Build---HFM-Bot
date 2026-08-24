@@ -19,6 +19,7 @@ import sqlite3
 import subprocess
 import sys
 from typing import Mapping, Sequence
+from zipfile import ZIP_DEFLATED, ZipFile
 
 from .compliance import EvidenceKind
 from .requirement_runtime import (
@@ -28,6 +29,7 @@ from .requirement_runtime import (
     verify_c011_hfm_live_chart,
     verify_c012_hfm_chart_pack,
     verify_c013_hfm_annotations,
+    verify_c014_hfm_chart_history,
 )
 
 
@@ -287,6 +289,46 @@ def capture_c013_chart_annotations(
     )
 
 
+def capture_c014_chart_history(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    database: Path,
+    output_directory: Path,
+    chart_directory: Path,
+    python_executable: Path,
+    symbol: str,
+    timeframe: str,
+) -> EvidenceBundle:
+    """Capture idempotent persistent-chart evidence in an isolated database."""
+
+    root = workspace_root.resolve()
+    database = database.resolve()
+    _require_inside(database, root, "chart-history database")
+    verification = verify_c014_hfm_chart_history(
+        bridge_root=bridge_root.resolve(),
+        database=database,
+        symbol=symbol,
+        timeframe=timeframe,
+        chart_directory=chart_directory.resolve(),
+    )
+    data_bundle = _bundle_data_subject(
+        output_directory.resolve(),
+        "C014",
+        (database, Path(str(verification["chart_path"]))),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C014",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/chart_history.py",
+        test_file=root / "clean_build/tests/test_item_031_chart_history.py",
+        data_subjects=(data_bundle,),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -390,6 +432,22 @@ def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
         reader.close()
 
 
+def _bundle_data_subject(destination: Path, requirement_id: str, paths: Sequence[Path]) -> Path:
+    """Create one immutable data subject when a requirement has several artifacts."""
+
+    if not paths:
+        raise ValueError("at least one data artifact is required")
+    destination.mkdir(parents=True, exist_ok=True)
+    bundle = destination / f"{requirement_id.lower()}_data_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.zip"
+    with ZipFile(bundle, "x", compression=ZIP_DEFLATED) as archive:
+        for index, path in enumerate(paths):
+            resolved = path.resolve()
+            if not resolved.is_file():
+                raise FileNotFoundError(resolved)
+            archive.write(resolved, arcname=f"{index:02d}_{resolved.name}")
+    return bundle
+
+
 def _write_json(path: Path, payload: Mapping[str, object]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -399,13 +457,14 @@ def main() -> int:
     parser.add_argument("--workspace-root", type=Path, required=True)
     parser.add_argument(
         "--requirement",
-        choices=("C006", "C008", "C009", "C011", "C012", "C013"),
+        choices=("C006", "C008", "C009", "C011", "C012", "C013", "C014"),
         default="C006",
     )
     parser.add_argument("--bridge-root", type=Path)
     parser.add_argument("--tick-database", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--chart-directory", type=Path)
+    parser.add_argument("--database", type=Path)
     parser.add_argument("--symbol", default="XAUUSD")
     parser.add_argument("--timeframe", default="M5")
     parser.add_argument("--python-executable", type=Path, default=Path(sys.executable))
@@ -441,7 +500,7 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
         )
-    else:
+    elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:
             parser.error("--bridge-root and --chart-directory are required for C011-C013")
         chart_arguments = {
@@ -464,6 +523,19 @@ def main() -> int:
                 **chart_arguments,
                 timeframe=args.timeframe,
             )
+    else:
+        if args.bridge_root is None or args.chart_directory is None or args.database is None:
+            parser.error("--bridge-root, --chart-directory, and --database are required for C014")
+        bundle = capture_c014_chart_history(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            database=args.database,
+            output_directory=args.output_directory,
+            chart_directory=args.chart_directory,
+            python_executable=args.python_executable,
+            symbol=args.symbol,
+            timeframe=args.timeframe,
+        )
     print(json.dumps({
         "envelope": str(bundle.envelope),
         "manifest": str(bundle.manifest),

@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
+from zipfile import ZipFile
 
 import pytest
 
@@ -14,6 +15,7 @@ from cipherfx_clean.evidence_capture import (
     capture_c011_live_chart,
     capture_c012_chart_pack,
     capture_c013_chart_annotations,
+    capture_c014_chart_history,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -241,3 +243,43 @@ def test_live_chart_capture_returns_requirement_specific_bundle(
     assert captured["test_arguments"] == ("-k", test_filter)
     if requirement_id == "C011":
         assert captured["data_subjects"] == (chart_path,)
+
+
+def test_live_chart_history_capture_binds_database_and_rendered_chart(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    database = tmp_path / "chart_history.sqlite3"
+    database.write_text("database", encoding="utf-8")
+    chart = tmp_path / "chart.svg"
+    chart.write_text("<svg></svg>", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c014_hfm_chart_history",
+        lambda **_kwargs: {"requirement_id": "C014", "status": "PASS", "chart_path": str(chart)},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_c014_chart_history(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        database=database,
+        output_directory=tmp_path / "evidence",
+        chart_directory=tmp_path / "charts",
+        python_executable=Path("/python"),
+        symbol="XAUUSD",
+        timeframe="M5",
+    )
+
+    assert result is expected
+    assert captured["requirement_id"] == "C014"
+    data_subject = captured["data_subjects"][0]
+    assert data_subject.name.startswith("c014_data_")
+    with ZipFile(data_subject) as archive:
+        assert archive.namelist() == ["00_chart_history.sqlite3", "01_chart.svg"]
+    assert captured["test_file"].name == "test_item_031_chart_history.py"
