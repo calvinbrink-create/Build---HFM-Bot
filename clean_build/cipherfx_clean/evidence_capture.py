@@ -87,6 +87,8 @@ from .requirement_runtime import (
     verify_c077_c078_pattern_outcomes,
     verify_c079_c084_historical_state_layer,
     verify_c085_c092_outcome_metrics,
+    verify_c093_c098_edge_research,
+    verify_c099_c105_outcome_libraries,
 )
 
 
@@ -497,6 +499,22 @@ _LIVE_OUTCOME_METRIC_CAPTURE_TARGETS = {
         "clean_build/tests/test_item_084_outcome_metrics.py",
     )
     for number in range(85, 93)
+}
+
+_LIVE_RESEARCH_CAPTURE_TARGETS = {
+    "C093": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/intelligence/edge_miner.py", "clean_build/tests/test_item_093_edge_research.py", False),
+    "C094": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/intelligence/edge_miner.py", "clean_build/tests/test_item_093_edge_research.py", False),
+    "C095": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/research_pipeline.py", "clean_build/tests/test_item_093_edge_research.py", True),
+    "C096": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/intelligence/hypothesis.py", "clean_build/tests/test_item_093_edge_research.py", False),
+    "C097": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/intelligence/research.py", "clean_build/tests/test_item_093_edge_research.py", False),
+    "C098": ("verify_c093_c098_edge_research", "clean_build/cipherfx_clean/intelligence/validation_full.py", "clean_build/tests/test_item_093_edge_research.py", False),
+    "C099": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/hypothesis.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+    "C100": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+    "C101": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+    "C102": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+    "C103": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+    "C104": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", True),
+    "C105": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -1190,6 +1208,52 @@ def capture_live_outcome_metric_requirement(
     )
 
 
+def capture_live_research_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture research results using an immutable completed-M1 HFM snapshot."""
+
+    try:
+        verifier_name, code_path, test_path, requires_data = _LIVE_RESEARCH_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported research requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    verification = globals()[verifier_name](
+        requirement_id=requirement_id,
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+    )
+    data_subjects: tuple[Path, ...] = ()
+    if requires_data:
+        data_subjects = (_bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=data_subjects,
+    )
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1577,6 +1641,7 @@ def main() -> int:
             "C069", "C070", "C071", "C072", "C073", "C074", "C075", "C076",
             "C077", "C078", "C079", "C080", "C081", "C082", "C083", "C084",
             "C085", "C086", "C087", "C088", "C089", "C090", "C091", "C092",
+            "C093", "C094", "C095", "C096", "C097", "C098", "C099", "C100", "C101", "C102", "C103", "C104", "C105",
         ),
         default="C006",
     )
@@ -1748,6 +1813,17 @@ def main() -> int:
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,
             tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_RESEARCH_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C093-C105")
+        bundle = capture_live_research_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),

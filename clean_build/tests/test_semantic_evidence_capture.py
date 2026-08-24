@@ -25,6 +25,7 @@ from cipherfx_clean.evidence_capture import (
     capture_pattern_outcome_requirement,
     capture_historical_state_requirement,
     capture_live_outcome_metric_requirement,
+    capture_live_research_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -742,6 +743,65 @@ def test_outcome_metric_capture_binds_frozen_hfm_and_tick_inputs(
     assert captured["verification"]["requirement_id"] == requirement_id
     assert captured["code_subject"].name == "outcome_metrics.py"
     assert captured["test_file"].name == "test_item_084_outcome_metrics.py"
+    assert bool(captured["data_subjects"]) is requires_data
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verifier_name", "code_name", "test_name", "requires_data"),
+    (
+        ("C093", "verify_c093_c098_edge_research", "edge_miner.py", "test_item_093_edge_research.py", False),
+        ("C094", "verify_c093_c098_edge_research", "edge_miner.py", "test_item_093_edge_research.py", False),
+        ("C095", "verify_c093_c098_edge_research", "research_pipeline.py", "test_item_093_edge_research.py", True),
+        ("C096", "verify_c093_c098_edge_research", "hypothesis.py", "test_item_093_edge_research.py", False),
+        ("C097", "verify_c093_c098_edge_research", "research.py", "test_item_093_edge_research.py", False),
+        ("C098", "verify_c093_c098_edge_research", "validation_full.py", "test_item_093_edge_research.py", False),
+        ("C099", "verify_c099_c105_outcome_libraries", "hypothesis.py", "test_item_099_outcome_libraries.py", False),
+        ("C100", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", False),
+        ("C101", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", False),
+        ("C102", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", False),
+        ("C103", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", False),
+        ("C104", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", True),
+        ("C105", "verify_c099_c105_outcome_libraries", "data_library.py", "test_item_099_outcome_libraries.py", False),
+    ),
+)
+def test_research_capture_binds_frozen_hfm_inputs_to_the_verified_module(
+    tmp_path, monkeypatch, requirement_id, verifier_name, code_name, test_name, requires_data
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    data_bundle = tmp_path / "data.zip"
+    data_bundle.write_text("frozen", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: data_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        verifier_name,
+        lambda **kwargs: {"requirement_id": kwargs["requirement_id"], "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_research_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
     assert bool(captured["data_subjects"]) is requires_data
 
 
