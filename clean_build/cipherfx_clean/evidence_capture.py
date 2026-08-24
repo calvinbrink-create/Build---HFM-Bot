@@ -221,6 +221,7 @@ def capture_c011_live_chart(
         code_subject=root / "clean_build/cipherfx_clean/intelligence/renderer.py",
         test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
         test_arguments=("-k", "c011"),
+        data_subjects=(Path(str(verification["chart"]["chart_path"])),),
         output_directory=output_directory,
         python_executable=python_executable,
     )

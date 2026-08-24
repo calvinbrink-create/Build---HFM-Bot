@@ -204,10 +204,19 @@ def test_live_chart_capture_returns_requirement_specific_bundle(
 
     expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
     captured = {}
+    chart_path = tmp_path / "live.svg"
+    chart_path.write_text("<svg></svg>", encoding="utf-8")
+
+    def verification(**_kwargs):
+        result = {"requirement_id": requirement_id, "status": "PASS"}
+        if requirement_id == "C011":
+            result["chart"] = {"chart_path": str(chart_path)}
+        return result
+
     monkeypatch.setattr(
         capture_module,
         verification_name,
-        lambda **_kwargs: {"requirement_id": requirement_id, "status": "PASS"},
+        verification,
     )
     monkeypatch.setattr(
         capture_module,
@@ -230,3 +239,5 @@ def test_live_chart_capture_returns_requirement_specific_bundle(
     assert result is expected
     assert captured["requirement_id"] == requirement_id
     assert captured["test_arguments"] == ("-k", test_filter)
+    if requirement_id == "C011":
+        assert captured["data_subjects"] == (chart_path,)
