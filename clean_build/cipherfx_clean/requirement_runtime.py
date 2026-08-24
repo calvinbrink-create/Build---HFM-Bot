@@ -436,34 +436,43 @@ def verify_c009_market_state(state: MarketState) -> Mapping[str, object]:
 def verify_c009_hfm_market_states(
     *,
     bridge_root: Path,
+    tick_database: Path,
     symbols: Sequence[str],
     observed_at: datetime,
 ) -> Mapping[str, object]:
     adapter = HfmCsvMarketDataAdapter(bridge_root)
-    results = []
-    for symbol in symbols:
-        symbol_observed_at = datetime.now(timezone.utc)
-        dataset = adapter.dataset(
-            symbol,
-            observed_at=symbol_observed_at,
-            timeframes=MARKET_STATE_TIMEFRAMES,
-            include_latest_tick=True,
-            derive_m3_history=False,
-            history_mode="combined",
-        )
-        snapshot = snapshot_from_dataset(
-            dataset,
-            observed_at=symbol_observed_at,
-            required_timeframes=MARKET_STATE_TIMEFRAMES,
-            include_micro=False,
-        )
-        results.append(verify_c009_market_state(market_state_from_snapshot(snapshot)))
+    connection = sqlite3.connect(f"file:{tick_database.resolve()}?mode=ro", uri=True)
+    try:
+        results = []
+        for symbol in symbols:
+            ticks = _c008_recent_ticks(connection, symbol, observed_at)
+            dataset = adapter.dataset(
+                symbol,
+                observed_at=observed_at,
+                timeframes=MARKET_STATE_TIMEFRAMES,
+                include_latest_tick=False,
+                derive_m3_history=False,
+                history_mode="rolling",
+            )
+            snapshot = snapshot_from_dataset(
+                with_tick_window(dataset, ticks),
+                observed_at=observed_at,
+                required_timeframes=MARKET_STATE_TIMEFRAMES,
+                include_micro=False,
+            )
+            result = dict(verify_c009_market_state(market_state_from_snapshot(snapshot)))
+            result["tick_count"] = len(ticks)
+            result["tick_source"] = "DIRECT_MT5_WEBSOCKET_STORE"
+            results.append(result)
+    finally:
+        connection.close()
     return {
         "schema_version": 1,
         "requirement_id": "C009",
         "status": "PASS",
         "observed_at": observed_at.isoformat(),
         "bridge_root": str(bridge_root),
+        "tick_database": str(tick_database),
         "required_context": ("Tick", *MARKET_STATE_TIMEFRAMES),
         "symbols": tuple(results),
     }
@@ -8912,17 +8921,17 @@ def main() -> int:
             )
         )
     elif args.requirement == "C009":
-        if args.bridge_root is None or not args.symbols:
-            raise ValueError("C009 requires --bridge-root and --symbols")
+        if args.bridge_root is None or args.database is None or not args.symbols:
+            raise ValueError("C009 requires --bridge-root, --database, and --symbols")
         result = dict(
             verify_c009_hfm_market_states(
                 bridge_root=args.bridge_root,
+                tick_database=args.database,
                 symbols=tuple(args.symbols),
                 observed_at=datetime.now(timezone.utc),
             )
         )
-        adapter = HfmCsvMarketDataAdapter(args.bridge_root)
-        source_path = adapter.tick_export_path(args.symbols[0])
+        source_path = args.database
         source = source_path.read_bytes()
     elif args.requirement == "C010":
         if args.bridge_root is None or args.database is None or not args.symbols:

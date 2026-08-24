@@ -23,6 +23,7 @@ from .compliance import EvidenceKind
 from .requirement_runtime import (
     verify_c006_raw_tick_library,
     verify_c008_hfm_candle_builder,
+    verify_c009_hfm_market_states,
 )
 
 
@@ -145,6 +146,36 @@ def capture_c008_market_snapshot(
         symbols=tuple(symbols),
         observed_at=datetime.now(timezone.utc),
     )
+
+
+def capture_c009_market_state(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    tick_database: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture real C009 state proof from the same direct tick source as live."""
+
+    root = workspace_root.resolve()
+    verification = verify_c009_hfm_market_states(
+        bridge_root=bridge_root.resolve(),
+        tick_database=tick_database.resolve(),
+        symbols=tuple(symbols),
+        observed_at=datetime.now(timezone.utc),
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C009",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        test_arguments=("-k", "c009"),
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
     return capture_verified_requirement(
         workspace_root=root,
         requirement_id="C008",
@@ -252,7 +283,7 @@ def _write_json(path: Path, payload: Mapping[str, object]) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--workspace-root", type=Path, required=True)
-    parser.add_argument("--requirement", choices=("C006", "C008"), default="C006")
+    parser.add_argument("--requirement", choices=("C006", "C008", "C009"), default="C006")
     parser.add_argument("--bridge-root", type=Path)
     parser.add_argument("--tick-database", type=Path, required=True)
     parser.add_argument("--output-directory", type=Path, required=True)
@@ -265,10 +296,21 @@ def main() -> int:
             output_directory=args.output_directory,
             python_executable=args.python_executable,
         )
-    else:
+    elif args.requirement == "C008":
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C008")
         bundle = capture_c008_market_snapshot(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+        )
+    else:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C009")
+        bundle = capture_c009_market_state(
             workspace_root=args.workspace_root,
             bridge_root=args.bridge_root,
             tick_database=args.tick_database,
