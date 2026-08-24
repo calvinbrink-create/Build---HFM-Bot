@@ -83,6 +83,9 @@ from .requirement_runtime import (
     verify_c066_market_regime_engine,
     verify_c067_regime_probability_engine,
     verify_c068_strategy_router,
+    verify_c069_c076_knowledge_library,
+    verify_c077_c078_pattern_outcomes,
+    verify_c079_c084_historical_state_layer,
 )
 
 
@@ -460,6 +463,31 @@ _LIVE_ACTIVITY_BROKER_CAPTURE_TARGETS = {
         "clean_build/tests/test_item_067_tick_volume.py",
         ("-k", "tick_volume"),
     ),
+}
+
+_LIVE_KNOWLEDGE_CAPTURE_TARGETS = {
+    "C069": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C070": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C071": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C072": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C073": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C074": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C075": ("clean_build/cipherfx_clean/intelligence/knowledge.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+    "C076": ("clean_build/cipherfx_clean/intelligence/strategies.py", "clean_build/tests/test_item_081_knowledge_libraries.py"),
+}
+
+_LIVE_PATTERN_OUTCOME_CAPTURE_TARGETS = {
+    "C077": ("clean_build/cipherfx_clean/intelligence/pattern_outcomes.py", "clean_build/tests/test_item_082_pattern_outcomes.py"),
+    "C078": ("clean_build/cipherfx_clean/intelligence/pattern_outcomes.py", "clean_build/tests/test_item_082_pattern_outcomes.py"),
+}
+
+_LIVE_HISTORICAL_STATE_CAPTURE_TARGETS = {
+    "C079": ("clean_build/cipherfx_clean/intelligence/fingerprint_engine.py", "clean_build/tests/test_item_083_fingerprint_history.py"),
+    "C080": ("clean_build/cipherfx_clean/intelligence/feature_store.py", "clean_build/tests/test_item_005_historical_memory.py"),
+    "C081": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_005_historical_memory.py"),
+    "C082": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_005_historical_memory.py"),
+    "C083": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_005_historical_memory.py"),
+    "C084": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_084_outcome_metrics.py"),
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -960,6 +988,141 @@ def capture_live_analytics_requirement(
     )
 
 
+def capture_knowledge_library_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    output_directory: Path,
+    python_executable: Path,
+) -> EvidenceBundle:
+    """Capture a runtime receipt for a structured research vocabulary check."""
+
+    try:
+        code_path, test_path = _LIVE_KNOWLEDGE_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported knowledge-library requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    verification = verify_c069_c076_knowledge_library(requirement_id)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output_directory,
+        python_executable=python_executable,
+    )
+
+
+def _capture_historical_hfm_inputs(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+    code_path: str,
+    test_path: str,
+    verifier: object,
+) -> EvidenceBundle:
+    """Freeze six completed HFM frames before a history-based runtime check."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1", "M5", "M15", "H1", "H4", "D1"),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    data_subject = _bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir())))
+    verification = verifier(snapshot)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=(data_subject,),
+    )
+
+
+def capture_pattern_outcome_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture one requirement-specific outcome receipt from frozen HFM inputs."""
+
+    try:
+        code_path, test_path = _LIVE_PATTERN_OUTCOME_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported pattern-outcome requirement: {requirement_id}") from exc
+
+    def verify(snapshot: Path) -> Mapping[str, object]:
+        receipt = dict(verify_c077_c078_pattern_outcomes(bridge_root=snapshot, symbols=tuple(symbols)))
+        receipt["requirement_id"] = requirement_id
+        return receipt
+
+    return _capture_historical_hfm_inputs(
+        workspace_root=workspace_root,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root,
+        output_directory=output_directory,
+        python_executable=python_executable,
+        symbols=symbols,
+        code_path=code_path,
+        test_path=test_path,
+        verifier=verify,
+    )
+
+
+def capture_historical_state_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture one history-state receipt from a frozen completed-candle snapshot."""
+
+    try:
+        code_path, test_path = _LIVE_HISTORICAL_STATE_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported historical-state requirement: {requirement_id}") from exc
+
+    def verify(snapshot: Path) -> Mapping[str, object]:
+        return verify_c079_c084_historical_state_layer(
+            requirement_id=requirement_id,
+            bridge_root=snapshot,
+            symbols=tuple(symbols),
+        )
+
+    return _capture_historical_hfm_inputs(
+        workspace_root=workspace_root,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root,
+        output_directory=output_directory,
+        python_executable=python_executable,
+        symbols=symbols,
+        code_path=code_path,
+        test_path=test_path,
+        verifier=verify,
+    )
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1344,6 +1507,8 @@ def main() -> int:
             "C042", "C043", "C044", "C045", "C046", "C047", "C048", "C049", "C050",
             "C052", "C053", "C055", "C056", "C057", "C058", "C059", "C060",
             "C061", "C062", "C063", "C064", "C065", "C066", "C067", "C068",
+            "C069", "C070", "C071", "C072", "C073", "C074", "C075", "C076",
+            "C077", "C078", "C079", "C080", "C081", "C082", "C083", "C084",
         ),
         default="C006",
     )
@@ -1471,6 +1636,35 @@ def main() -> int:
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C053")
         bundle = capture_live_activity_broker_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_KNOWLEDGE_CAPTURE_TARGETS:
+        bundle = capture_knowledge_library_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+        )
+    elif args.requirement in _LIVE_PATTERN_OUTCOME_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C077-C078")
+        bundle = capture_pattern_outcome_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_HISTORICAL_STATE_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C079-C084")
+        bundle = capture_historical_state_requirement(
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,

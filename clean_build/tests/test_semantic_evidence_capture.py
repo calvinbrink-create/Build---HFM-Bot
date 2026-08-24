@@ -21,6 +21,9 @@ from cipherfx_clean.evidence_capture import (
     capture_live_tick_intelligence_requirement,
     capture_live_analytics_requirement,
     capture_live_broker_requirement,
+    capture_knowledge_library_requirement,
+    capture_pattern_outcome_requirement,
+    capture_historical_state_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -564,6 +567,119 @@ def test_live_analytics_capture_binds_specific_verifier_code_test_and_required_d
     assert captured["test_file"].name == test_name
     assert captured["test_arguments"] == test_arguments
     assert bool(captured["data_subjects"]) is requires_data
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "code_name"),
+    (
+        ("C069", "knowledge.py"),
+        ("C070", "knowledge.py"),
+        ("C071", "knowledge.py"),
+        ("C072", "knowledge.py"),
+        ("C073", "knowledge.py"),
+        ("C074", "knowledge.py"),
+        ("C075", "knowledge.py"),
+        ("C076", "strategies.py"),
+    ),
+)
+def test_knowledge_capture_binds_runtime_verifier_to_the_correct_library(
+    tmp_path, monkeypatch, requirement_id, code_name
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c069_c076_knowledge_library",
+        lambda received: {"requirement_id": received, "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_knowledge_library_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == "test_item_081_knowledge_libraries.py"
+    assert not captured.get("data_subjects", ())
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "capture_name", "verifier_name", "verification_id", "code_name", "test_name"),
+    (
+        ("C077", "capture_pattern_outcome_requirement", "verify_c077_c078_pattern_outcomes", "C077-C078", "pattern_outcomes.py", "test_item_082_pattern_outcomes.py"),
+        ("C078", "capture_pattern_outcome_requirement", "verify_c077_c078_pattern_outcomes", "C077-C078", "pattern_outcomes.py", "test_item_082_pattern_outcomes.py"),
+        ("C079", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C079", "fingerprint_engine.py", "test_item_083_fingerprint_history.py"),
+        ("C080", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C080", "feature_store.py", "test_item_005_historical_memory.py"),
+        ("C081", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C081", "historical_memory.py", "test_item_005_historical_memory.py"),
+        ("C082", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C082", "historical_memory.py", "test_item_005_historical_memory.py"),
+        ("C083", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C083", "historical_memory.py", "test_item_005_historical_memory.py"),
+        ("C084", "capture_historical_state_requirement", "verify_c079_c084_historical_state_layer", "C084", "historical_memory.py", "test_item_084_outcome_metrics.py"),
+    ),
+)
+def test_history_capture_freezes_broker_frames_and_binds_requirement_evidence(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    capture_name,
+    verifier_name,
+    verification_id,
+    code_name,
+    test_name,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    data_bundle = tmp_path / "data.zip"
+    data_bundle.write_text("frozen", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: data_bundle)
+    if verifier_name == "verify_c077_c078_pattern_outcomes":
+        monkeypatch.setattr(
+            capture_module,
+            verifier_name,
+            lambda **_kwargs: {"requirement_id": verification_id, "status": "PASS"},
+        )
+    else:
+        monkeypatch.setattr(
+            capture_module,
+            verifier_name,
+            lambda **kwargs: {"requirement_id": kwargs["requirement_id"], "status": "PASS"},
+        )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = getattr(capture_module, capture_name)(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["data_subjects"] == (data_bundle,)
 
 
 def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):
