@@ -54,6 +54,7 @@ from .requirement_runtime import (
     verify_c038_volatility_of_volatility,
     verify_c039_compression_detector,
     verify_c040_expansion_detector,
+    verify_c041_session_engine,
     verify_c032_slippage_intelligence,
     verify_c033_latency_intelligence,
     verify_c042_session_profile_library,
@@ -318,6 +319,15 @@ _LIVE_BROKER_CAPTURE_TARGETS = {
         "clean_build/cipherfx_clean/intelligence/latency.py",
         "clean_build/tests/test_item_048_latency_intelligence.py",
         ("-k", "latency"),
+    ),
+}
+
+_LIVE_SESSION_BROKER_CAPTURE_TARGETS = {
+    "C041": (
+        "verify_c041_session_engine",
+        "clean_build/cipherfx_clean/intelligence/session.py",
+        "clean_build/tests/test_item_056_session_engine.py",
+        (),
     ),
 }
 
@@ -821,6 +831,45 @@ def capture_live_broker_requirement(
     )
 
 
+def capture_live_session_broker_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture exact HFM tick-time exports for broker-clock session evidence."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments = _LIVE_SESSION_BROKER_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live session broker requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    _require_inside(output, root, "evidence output")
+    tick_snapshot = _snapshot_broker_tick_exports(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+    )
+    broker_bundle = _bundle_data_subject(output, requirement_id, tuple(sorted(tick_snapshot.iterdir())))
+    verification = globals()[verifier_name](bridge_root=tick_snapshot, symbols=tuple(symbols))
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        broker_subjects=(broker_bundle,),
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -988,6 +1037,29 @@ def _snapshot_broker_exports(
     return snapshot
 
 
+def _snapshot_broker_tick_exports(
+    *,
+    destination: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    symbols: Sequence[str],
+) -> Path:
+    """Freeze the exact HFM tick exports that carry broker and UTC clocks."""
+
+    source_root = bridge_root.resolve()
+    if not source_root.is_dir():
+        raise FileNotFoundError(source_root)
+    destination.mkdir(parents=True, exist_ok=True)
+    snapshot = destination / f"{requirement_id.lower()}_broker_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
+    snapshot.mkdir()
+    for symbol in symbols:
+        source = source_root / f"tick_{symbol}.txt"
+        if not source.is_file():
+            raise FileNotFoundError(source)
+        copyfile(source, snapshot / source.name)
+    return snapshot
+
+
 def _bundle_data_subject(destination: Path, requirement_id: str, paths: Sequence[Path]) -> Path:
     """Create one immutable data subject when a requirement has several artifacts."""
 
@@ -1019,7 +1091,7 @@ def main() -> int:
             "C021", "C022", "C023", "C024", "C025",
             "C026", "C027", "C028", "C029", "C030",
             "C031", "C034", "C035", "C037", "C038", "C039", "C040",
-            "C032", "C033",
+            "C032", "C033", "C041",
             "C042", "C043", "C044", "C045", "C046", "C047", "C048", "C049", "C050",
         ),
         default="C006",
@@ -1119,6 +1191,17 @@ def main() -> int:
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,
             database=args.database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_SESSION_BROKER_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C041")
+        bundle = capture_live_session_broker_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),

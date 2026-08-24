@@ -630,3 +630,65 @@ def test_live_broker_capture_binds_exact_hfm_exports_as_broker_evidence(
     assert captured["test_arguments"] == test_arguments
     with ZipFile(captured["broker_subjects"][0]) as archive:
         assert archive.namelist() == ["00_deals.csv", "01_history_orders.csv"]
+
+
+def test_live_session_broker_capture_binds_exact_hfm_tick_exports_as_broker_evidence(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    exports = tmp_path / "exports"
+    exports.mkdir()
+    for symbol in ("XAUUSD", "UK100", "USA100", "USA500", "USA30"):
+        (exports / f"tick_{symbol}.txt").write_text(symbol, encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_broker_tick_exports", lambda **_kwargs: exports)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c041_session_engine",
+        lambda **kwargs: {"requirement_id": "C041", "status": "PASS", "bridge_root": str(kwargs["bridge_root"])},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_module.capture_live_session_broker_requirement(
+        workspace_root=tmp_path,
+        requirement_id="C041",
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == "session.py"
+    assert captured["test_file"].name == "test_item_056_session_engine.py"
+    assert captured["test_arguments"] == ()
+    with ZipFile(captured["broker_subjects"][0]) as archive:
+        assert archive.namelist() == [
+            "00_tick_UK100.txt",
+            "01_tick_USA100.txt",
+            "02_tick_USA30.txt",
+            "03_tick_USA500.txt",
+            "04_tick_XAUUSD.txt",
+        ]
+
+
+def test_broker_tick_export_snapshot_contains_only_requested_exports(tmp_path):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "tick_XAUUSD.txt").write_text("tick", encoding="utf-8")
+    (source / "rates_XAUUSD_M1.csv").write_text("bar", encoding="utf-8")
+
+    snapshot = capture_module._snapshot_broker_tick_exports(
+        destination=tmp_path / "evidence",
+        requirement_id="C041",
+        bridge_root=source,
+        symbols=("XAUUSD",),
+    )
+
+    assert [path.name for path in snapshot.iterdir()] == ["tick_XAUUSD.txt"]
