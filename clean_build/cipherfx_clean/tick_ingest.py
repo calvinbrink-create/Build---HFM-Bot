@@ -87,6 +87,7 @@ class WebSocketTickIngress:
         self._stop: asyncio.Event | None = None
         self._server = None
         self._writer_task: asyncio.Task[None] | None = None
+        self._client_writers: set[asyncio.StreamWriter] = set()
         self._started_at = ""
         self._connected_clients = 0
         self._received_events = 0
@@ -137,14 +138,21 @@ class WebSocketTickIngress:
                 self._port,
                 limit=65536,
             )
-            async with self._server as server:
-                sockets = tuple(server.sockets or ())
-                if not sockets:
-                    raise RuntimeError("WebSocket server did not bind a socket")
-                self._port = int(sockets[0].getsockname()[1])
-                self._write_status()
-                await self._stop.wait()
+            sockets = tuple(self._server.sockets or ())
+            if not sockets:
+                raise RuntimeError("WebSocket server did not bind a socket")
+            self._port = int(sockets[0].getsockname()[1])
+            self._write_status()
+            await self._stop.wait()
         finally:
+            if self._server is not None:
+                self._server.close()
+            await self._close_clients()
+            if self._server is not None:
+                try:
+                    await asyncio.wait_for(self._server.wait_closed(), timeout=0.5)
+                except asyncio.TimeoutError:
+                    self._last_error = "WEBSOCKET_SERVER_CLOSE_TIMEOUT"
             await self._drain_writer()
             self._write_status()
             if self._store is not None:
@@ -162,6 +170,7 @@ class WebSocketTickIngress:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
+        self._client_writers.add(writer)
         try:
             await self._complete_websocket_handshake(reader, writer)
         except (asyncio.IncompleteReadError, TickEventError, ValueError) as exc:
@@ -169,7 +178,8 @@ class WebSocketTickIngress:
             self._last_error = f"WEBSOCKET_HANDSHAKE_REJECTED:{type(exc).__name__}:{exc}"
             self._write_status()
             writer.close()
-            await writer.wait_closed()
+            await _wait_for_writer_close(writer)
+            self._client_writers.discard(writer)
             return
         self._connected_clients += 1
         self._write_status()
@@ -211,10 +221,20 @@ class WebSocketTickIngress:
             self._connected_clients = max(0, self._connected_clients - 1)
             self._write_status()
             writer.close()
-            try:
-                await writer.wait_closed()
-            except ConnectionError:
-                pass
+            await _wait_for_writer_close(writer)
+            self._client_writers.discard(writer)
+
+    async def _close_clients(self) -> None:
+        """Close open bridge connections so a controlled restart cannot hang."""
+
+        writers = tuple(self._client_writers)
+        for writer in writers:
+            writer.close()
+        if writers:
+            await asyncio.gather(
+                *(_wait_for_writer_close(writer) for writer in writers),
+                return_exceptions=True,
+            )
 
     async def _complete_websocket_handshake(
         self,
@@ -331,6 +351,13 @@ class WebSocketTickIngress:
 
 def _utc_now() -> datetime:
     return datetime.now(timezone.utc)
+
+
+async def _wait_for_writer_close(writer: asyncio.StreamWriter) -> None:
+    try:
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.25)
+    except (asyncio.TimeoutError, ConnectionError):
+        pass
 
 
 def _json_mapping(message: str | bytes) -> Mapping[str, object]:

@@ -134,3 +134,35 @@ def test_tick_ingress_accepts_the_existing_mt5_bridge_handshake_shape(tmp_path):
         assert ingress.metrics().last_error is None
 
     asyncio.run(exercise())
+
+
+def test_tick_ingress_stops_promptly_with_an_active_bridge_connection(tmp_path):
+    async def exercise():
+        stop = asyncio.Event()
+        ingress = WebSocketTickIngress(
+            database=tmp_path / "shutdown.sqlite3",
+            symbols=("XAUUSD",),
+            port=0,
+            batch_wait_seconds=0.01,
+        )
+        task = asyncio.create_task(ingress.serve_forever(stop))
+        await _wait_for(lambda: ingress.port != 0)
+        reader, writer = await asyncio.open_connection("127.0.0.1", ingress.port)
+        request = (
+            "GET /mt5/ticks HTTP/1.1\r\n"
+            "Host: 127.0.0.1:8765\r\n"
+            "Upgrade: websocket\r\n"
+            "Connection: Upgrade\r\n"
+            "Sec-WebSocket-Key: Q2lwaGVyRlhUcmFkZVdTS2V5MTIzNA==\r\n"
+            "Sec-WebSocket-Version: 13\r\n\r\n"
+        )
+        writer.write(request.encode("ascii"))
+        await writer.drain()
+        assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 101")
+
+        stop.set()
+        await asyncio.wait_for(task, timeout=1.0)
+        writer.close()
+        await writer.wait_closed()
+
+    asyncio.run(exercise())
