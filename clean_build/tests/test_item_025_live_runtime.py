@@ -55,7 +55,7 @@ def _exports(root, observed):
     )
 
 
-def _collector(root, store):
+def _collector(root, store, *, tick_store=None):
     calendar = TradingCalendar(
         timezone_name="UTC",
         sessions=(SessionWindow("ALL", tuple(range(7)), time(0), time(0)),),
@@ -66,6 +66,8 @@ def _collector(root, store):
         calendars={"XAUUSD": calendar},
         memory=HistoricalAnalogueIndex(),
         symbols=("XAUUSD",),
+        tick_store=tick_store,
+        tick_source_path="TEST_WEBSOCKET_TICK_STORE" if tick_store is not None else None,
     )
 
 
@@ -96,10 +98,15 @@ def test_live_collector_skips_full_snapshot_until_trigger_bar_changes(tmp_path):
         def __init__(self, root):
             self._delegate = HfmCsvMarketDataAdapter(root)
             self.dataset_calls = 0
+            self.read_bars_calls = 0
 
         def dataset(self, *args, **kwargs):
             self.dataset_calls += 1
             return self._delegate.dataset(*args, **kwargs)
+
+        def read_bars(self, *args, **kwargs):
+            self.read_bars_calls += 1
+            return self._delegate.read_bars(*args, **kwargs)
 
         def __getattr__(self, name):
             return getattr(self._delegate, name)
@@ -121,11 +128,13 @@ def test_live_collector_skips_full_snapshot_until_trigger_bar_changes(tmp_path):
     )
 
     first = collector.poll_once(observed_at=observed)
+    read_bars_after_first = adapter.read_bars_calls
     second = collector.poll_once(observed_at=observed + timedelta(seconds=1))
 
     assert first.symbols[0].outcome_status == "NO_TRADE"
     assert second.symbols[0].evaluation_event_id is None
     assert adapter.dataset_calls == 1
+    assert adapter.read_bars_calls == read_bars_after_first
     store.close()
 
 
@@ -180,6 +189,8 @@ def test_clean_research_service_runs_only_the_read_only_collector():
     assert "--cycles 0" in source
     assert "--memory-database" in source
     assert "clean_analogue_memory_v1.sqlite3" in source
+    assert "--tick-database" in source
+    assert "live_tick_stream_v1.sqlite3" in source
     assert "--database /opt/cipherfx_mt5/clean_build/runtime/" in source
     assert "--maximum-tick-age-seconds 60" in source
     assert "order_send" not in source
@@ -223,6 +234,31 @@ def test_live_evaluation_uses_bounded_persisted_tick_window(tmp_path):
     assert report["metadata"]["microstructure_tick_count"] == 4
     assert report["metadata"]["cross_asset_context"]["available"] == 0.0
     store.close()
+
+
+def test_live_collector_uses_dedicated_websocket_tick_store_without_file_fallback(tmp_path):
+    observed = datetime(2026, 8, 24, 10, 2, tzinfo=UTC)
+    _exports(tmp_path, observed)
+    tick = tmp_path / "tick_XAUUSD.txt"
+    tick.write_text(
+        tick.read_text().replace(
+            f"time_utc={int(observed.timestamp())}",
+            f"time_utc={int(observed.timestamp()) - 60}",
+        )
+    )
+    research = EvidenceStore(tmp_path / "research.sqlite3")
+    stream = EvidenceStore(tmp_path / "stream.sqlite3")
+    stream.write_ticks((RawTick("XAUUSD", observed, 129.9, 130.0),))
+
+    result = _collector(tmp_path, research, tick_store=stream).poll_once(observed_at=observed)
+
+    assert result.symbols[0].tick_status == "VALID"
+    assert result.symbols[0].outcome_status == "NO_TRADE"
+    assert result.symbols[0].error is None
+    assert research._conn.execute("SELECT COUNT(*) FROM raw_ticks").fetchone()[0] == 0
+    assert stream._conn.execute("SELECT COUNT(*) FROM raw_ticks").fetchone()[0] == 1
+    stream.close()
+    research.close()
 
 
 def test_live_collector_bounds_repeated_pattern_context_only_in_persisted_evidence(tmp_path):

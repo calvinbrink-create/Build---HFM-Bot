@@ -29,7 +29,7 @@ from .intelligence.spread_intelligence import (
     build_spread_profile_book,
     historical_spread_samples,
 )
-from .observation import CsvTickObserver
+from .observation import CsvTickObserver, PersistedTickObserver
 from .runtime import CleanRuntime, RuntimeConfiguration
 from .scheduler import CompletionScheduler, EvaluationEvent
 from .shadow_runtime import PersistentShadowRunner
@@ -39,6 +39,17 @@ from .store import EvidenceStore
 
 DEFAULT_SYMBOLS = ("XAUUSD", "UK100", "USA100", "USA500", "USA30")
 DEFAULT_PERSISTED_CONTEXT_RECORD_LIMIT = 64
+_FIXED_TRIGGER_DURATIONS = {
+    "M1": timedelta(minutes=1),
+    "M3": timedelta(minutes=3),
+    "M5": timedelta(minutes=5),
+    "M15": timedelta(minutes=15),
+    "M30": timedelta(minutes=30),
+    "H1": timedelta(hours=1),
+    "H4": timedelta(hours=4),
+    "D1": timedelta(days=1),
+    "W1": timedelta(days=7),
+}
 
 
 @dataclass(frozen=True)
@@ -99,6 +110,8 @@ class LiveResearchCollector:
         persisted_context_record_limit: int | None = DEFAULT_PERSISTED_CONTEXT_RECORD_LIMIT,
         cache_retention: timedelta | None = timedelta(hours=2),
         maintenance_interval: timedelta = timedelta(minutes=1),
+        tick_store: EvidenceStore | None = None,
+        tick_source_path: str | None = None,
     ):
         if not symbols or not trigger_timeframes:
             raise ValueError("symbols and trigger timeframes are required")
@@ -120,12 +133,22 @@ class LiveResearchCollector:
         self._cache_retention = cache_retention
         self._maintenance_interval = maintenance_interval
         self._last_maintenance_at: datetime | None = None
-        self._observer = CsvTickObserver(
-            adapter=adapter,
-            store=store,
-            calendars=calendars,
-            maximum_age=maximum_tick_age,
-        )
+        self._tick_store = tick_store or store
+        if tick_store is None:
+            self._observer = CsvTickObserver(
+                adapter=adapter,
+                store=store,
+                calendars=calendars,
+                maximum_age=maximum_tick_age,
+            )
+        else:
+            self._observer = PersistedTickObserver(
+                tick_store=tick_store,
+                research_store=store,
+                calendars=calendars,
+                maximum_age=maximum_tick_age,
+                source_path=tick_source_path or "WEBSOCKET_TICK_STORE",
+            )
         self._shadow = PersistentShadowRunner(store)
         profile_book = spread_profiles or _historical_spread_profile_book(
             adapter,
@@ -149,19 +172,24 @@ class LiveResearchCollector:
         }
     def poll_once(self, *, observed_at: datetime | None = None) -> LiveCycleResult:
         observed = (observed_at or datetime.now(timezone.utc)).astimezone(timezone.utc)
-        correlation_frames = {
-            symbol: self._adapter.read_bars(
-                symbol,
-                "M5",
-                observed_at=observed,
-                history_mode="rolling",
-            )
-            for symbol in self._symbols
-        }
-        cross_asset = contexts_at(correlation_frames, observed_at=observed)
+        # Fresh ticks are observed every poll.  Completed-bar CSVs are only
+        # reparsed once the next configured trigger boundary can exist.
+        if any(self._trigger_window_due(symbol, observed) for symbol in self._symbols):
+            correlation_frames = {
+                symbol: self._adapter.read_bars(
+                    symbol,
+                    "M5",
+                    observed_at=observed,
+                    history_mode="rolling",
+                )
+                for symbol in self._symbols
+            }
+            cross_asset = contexts_at(correlation_frames, observed_at=observed)
+        else:
+            cross_asset = {}
         output: list[LiveSymbolResult] = []
         for symbol in self._symbols:
-            output.append(self._poll_symbol(symbol, observed, cross_asset[symbol]))
+            output.append(self._poll_symbol(symbol, observed, cross_asset.get(symbol, {})))
         self._maintain_live_cache(observed)
         return LiveCycleResult(observed.isoformat(), tuple(output))
 
@@ -196,7 +224,9 @@ class LiveResearchCollector:
                 None if tick_result.status == "MARKET_CLOSED" else f"MARKET_DATA_{tick_result.status}",
             )
         if tick_result.stored:
-            self._shadow.advance_tick(self._adapter.latest_tick(symbol))
+            latest_tick = self._tick_store.latest_tick(symbol)
+            if latest_tick is not None:
+                self._shadow.advance_tick(latest_tick)
 
         # The terminal can refresh a later symbol's tick export after the
         # cycle timestamp was captured.  Evaluate that symbol at the observed
@@ -226,7 +256,7 @@ class LiveResearchCollector:
         )
         dataset = with_tick_window(
             dataset,
-            self._store.load_ticks(
+            self._tick_store.load_ticks(
                 symbol,
                 start_at=evaluation_observed - timedelta(minutes=5),
                 end_at=evaluation_observed,
@@ -331,6 +361,8 @@ class LiveResearchCollector:
     ) -> bool:
         """Avoid rebuilding every frame until a configured trigger bar is new."""
 
+        if not self._trigger_window_due(symbol, observed_at):
+            return False
         checkpoints = self._store.scheduler_checkpoints()
         for timeframe in self._trigger_timeframes:
             rows = self._adapter.read_bars(
@@ -344,6 +376,21 @@ class LiveResearchCollector:
                 return True
             completed_at = rows[-1].end
             if completed_at > checkpoints.get((symbol, timeframe), datetime.min.replace(tzinfo=completed_at.tzinfo)):
+                return True
+        return False
+
+    def _trigger_window_due(self, symbol: str, observed_at: datetime) -> bool:
+        """Return true only when a fixed-duration trigger can have completed."""
+
+        checkpoints = self._store.scheduler_checkpoints()
+        for timeframe in self._trigger_timeframes:
+            duration = _FIXED_TRIGGER_DURATIONS.get(timeframe)
+            # Calendar frames retain their complete verification path because
+            # their next boundary is not a fixed timedelta.
+            if duration is None:
+                return True
+            completed_at = checkpoints.get((symbol, timeframe))
+            if completed_at is None or observed_at >= completed_at + duration:
                 return True
         return False
 
@@ -445,6 +492,10 @@ def main() -> int:
         "--memory-database",
         help="read-only historical-memory source; defaults to the live evidence database",
     )
+    parser.add_argument(
+        "--tick-database",
+        help="dedicated localhost WebSocket tick-ingress database; disables tick-file fallback",
+    )
     parser.add_argument("--output", required=True)
     parser.add_argument("--symbols", nargs="+", default=DEFAULT_SYMBOLS)
     parser.add_argument("--poll-seconds", type=float, default=1.0)
@@ -458,6 +509,7 @@ def main() -> int:
     adapter = HfmCsvMarketDataAdapter(args.root)
     store = EvidenceStore(args.database)
     memory_store = store
+    tick_store: EvidenceStore | None = None
     output = Path(args.output)
     output.parent.mkdir(parents=True, exist_ok=True)
     try:
@@ -467,6 +519,11 @@ def main() -> int:
                 raise FileNotFoundError(memory_path)
             if memory_path.resolve() != Path(args.database).resolve():
                 memory_store = EvidenceStore(memory_path)
+        if args.tick_database:
+            tick_path = Path(args.tick_database)
+            if tick_path.resolve() == Path(args.database).resolve():
+                raise ValueError("tick database must be separate from research evidence")
+            tick_store = EvidenceStore(tick_path)
         startup_at = datetime.now(timezone.utc)
         calendars = build_observed_calendars(
             adapter,
@@ -480,6 +537,8 @@ def main() -> int:
             memory=load_historical_memory(memory_store, symbols),
             symbols=symbols,
             maximum_tick_age=timedelta(seconds=args.maximum_tick_age_seconds),
+            tick_store=tick_store,
+            tick_source_path=(str(Path(args.tick_database).resolve()) if args.tick_database else None),
         )
         cycle = 0
         last = None
@@ -507,6 +566,8 @@ def main() -> int:
         healthy = {"VALID", "DUPLICATE", "MARKET_CLOSED"}
         return 0 if all(row.tick_status in healthy and row.error is None for row in last.symbols) else 2
     finally:
+        if tick_store is not None:
+            tick_store.close()
         if memory_store is not store:
             memory_store.close()
         store.close()

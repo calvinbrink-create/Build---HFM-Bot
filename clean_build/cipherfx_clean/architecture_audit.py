@@ -46,6 +46,7 @@ def module_inventory(
     package_root: Path,
     *,
     declared_entrypoints: Sequence[str] = (),
+    include_cli_entrypoints: bool = False,
 ) -> tuple[ModuleInventory, ...]:
     root = package_root.resolve()
     package = root.name
@@ -74,7 +75,14 @@ def module_inventory(
     discovered_entrypoints = {
         module for module, (_, tree) in parsed.items() if _has_cli_entrypoint(tree)
     }
-    entrypoints = set(declared_entrypoints) | discovered_entrypoints
+    # A module having a ``__main__`` block makes it runnable as a maintenance
+    # or research command, not part of the production runtime.  Production
+    # reachability must begin only from an explicitly declared service
+    # entrypoint; callers can opt into CLI inventory reachability when that is
+    # the question being audited.
+    entrypoints = set(declared_entrypoints)
+    if include_cli_entrypoints:
+        entrypoints.update(discovered_entrypoints)
     unknown = entrypoints - set(parsed)
     if unknown:
         raise ValueError(f"unknown declared entrypoints: {sorted(unknown)}")

@@ -1,0 +1,19 @@
+[Unit]
+Description=CipherFX clean read-only MT5 WebSocket tick ingress
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/cipherfx_mt5
+Environment=PYTHONPATH=/opt/cipherfx_mt5/clean_build
+Environment=PYTHONDONTWRITEBYTECODE=1
+ExecStart=/opt/cipherfx_mt5/.venv_mt5/bin/python -m cipherfx_clean.tick_ingest --database /opt/cipherfx_mt5/clean_build/runtime/live_tick_stream_v1.sqlite3 --status /opt/cipherfx_mt5/clean_build/runtime/live_tick_stream_status.json --symbols XAUUSD UK100 USA100 USA500 USA30 --host 127.0.0.1 --port 8765
+Restart=always
+RestartSec=5
+TimeoutStopSec=45
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

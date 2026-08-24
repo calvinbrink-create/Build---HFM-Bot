@@ -1,6 +1,7 @@
 [Unit]
 Description=CipherFX clean read-only market research collector
-After=network-online.target
+Requires=cipherfx-clean-tick-ingest.service
+After=network-online.target cipherfx-clean-tick-ingest.service
 Wants=network-online.target
 
 [Service]
@@ -9,7 +10,7 @@ User=root
 WorkingDirectory=/opt/cipherfx_mt5
 Environment=PYTHONPATH=/opt/cipherfx_mt5/clean_build
 Environment=PYTHONDONTWRITEBYTECODE=1
-ExecStart=/opt/cipherfx_mt5/.venv_mt5/bin/python -m cipherfx_clean.live_runtime --root "/root/.mt5_hfm/drive_c/Program Files/MetaTrader 5/MQL5/Files/cipherfx" --database /opt/cipherfx_mt5/clean_build/runtime/live_research_v4.sqlite3 --memory-database /opt/cipherfx_mt5/clean_build/evidence/clean_analogue_memory_v1.sqlite3 --output /opt/cipherfx_mt5/clean_build/runtime/live_research_status.json --symbols XAUUSD UK100 USA100 USA500 USA30 --poll-seconds 2 --cycles 0 --maximum-tick-age-seconds 60
+ExecStart=/opt/cipherfx_mt5/.venv_mt5/bin/python -m cipherfx_clean.live_runtime --root "/root/.mt5_hfm/drive_c/Program Files/MetaTrader 5/MQL5/Files/cipherfx" --database /opt/cipherfx_mt5/clean_build/runtime/live_research_v4.sqlite3 --memory-database /opt/cipherfx_mt5/clean_build/evidence/clean_analogue_memory_v1.sqlite3 --tick-database /opt/cipherfx_mt5/clean_build/runtime/live_tick_stream_v1.sqlite3 --output /opt/cipherfx_mt5/clean_build/runtime/live_research_status.json --symbols XAUUSD UK100 USA100 USA500 USA30 --poll-seconds 2 --cycles 0 --maximum-tick-age-seconds 60
 Restart=always
 RestartSec=10
 TimeoutStopSec=45

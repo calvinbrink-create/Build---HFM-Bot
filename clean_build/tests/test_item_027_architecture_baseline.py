@@ -52,6 +52,16 @@ def test_static_inventory_follows_real_internal_imports_and_exposes_disconnected
     assert not by_module["cipherfx_clean.management"].statically_reachable
     assert not by_module["cipherfx_clean.mt5_boundary"].statically_reachable
     assert by_module["cipherfx_clean.sharded_research"].has_cli_entrypoint
+    assert not by_module["cipherfx_clean.sharded_research"].statically_reachable
+
+
+def test_cli_tools_are_only_reachable_when_explicitly_requested():
+    rows = {
+        row.module: row
+        for row in module_inventory(PACKAGE, include_cli_entrypoints=True)
+    }
+
+    assert rows["cipherfx_clean.sharded_research"].statically_reachable
 
 
 def test_package_relative_imports_resolve_inside_the_actual_package():

@@ -161,6 +161,139 @@ class CsvTickObserver:
         )
 
 
+class PersistedTickObserver:
+    """Observe the dedicated MT5 WebSocket tick store without a file fallback.
+
+    The ingress service is the sole raw-quote writer.  This observer deliberately
+    writes only freshness-transition telemetry to the research store so reading
+    research cannot make a sampled copy of the tick stream look complete.
+    """
+
+    def __init__(
+        self,
+        *,
+        tick_store: EvidenceStore,
+        research_store: EvidenceStore,
+        calendars: Mapping[str, MarketCalendar],
+        maximum_age: timedelta = timedelta(seconds=5),
+        source_path: str,
+    ):
+        if maximum_age.total_seconds() <= 0:
+            raise ValueError("positive tick age is required")
+        if not source_path:
+            raise ValueError("WebSocket tick-store source path is required")
+        self._tick_store = tick_store
+        self._research_store = research_store
+        self._calendars = dict(calendars)
+        self._maximum_age = maximum_age
+        self._source_path = source_path
+        self._last_seen: dict[str, RawTick] = {}
+
+    def poll(self, symbol: str, *, observed_at: datetime) -> TickPollResult:
+        if symbol not in self._calendars:
+            raise KeyError(f"missing trading calendar for {symbol}")
+        tick = self._tick_store.latest_tick(symbol)
+        market = self._calendars[symbol].state(observed_at)
+        if tick is None:
+            return self._unavailable(
+                symbol,
+                observed_at=observed_at,
+                status="MARKET_CLOSED" if market.status == "CLOSED" else TickQuality.MISSING.value,
+                reason=market.reason if market.status == "CLOSED" else "WEBSOCKET_TICK_STREAM_EMPTY",
+            )
+
+        validation = validate_tick(
+            tick,
+            now=observed_at,
+            max_age=self._maximum_age,
+            previous=self._last_seen.get(symbol),
+        )
+        status = validation.quality.value
+        reason = validation.reason
+        newly_observed = validation.quality is TickQuality.VALID
+        if validation.quality is TickQuality.STALE and market.status == "CLOSED":
+            status = "MARKET_CLOSED"
+            reason = market.reason
+        elif newly_observed:
+            self._last_seen[symbol] = tick
+
+        feed_status = (
+            "FRESH"
+            if status in (TickQuality.VALID.value, TickQuality.DUPLICATE.value)
+            else "CLOSED"
+            if status == "MARKET_CLOSED"
+            else "STALE"
+        )
+        payload = {
+            "tick": asdict(tick),
+            "source_path": self._source_path,
+            "market_state": asdict(market),
+            "quality": validation.quality.value,
+            "quality_reason": validation.reason,
+            "poll_status": status,
+            "feed_status": feed_status,
+            "newly_observed": newly_observed,
+        }
+        event_id = _digest((symbol, observed_at.isoformat(), tick, feed_status, status, reason))
+        if self._research_store.latest_tick_quality_status(symbol) != feed_status:
+            self._research_store.write_tick_quality_event(
+                event_id,
+                symbol,
+                observed_at,
+                feed_status,
+                payload,
+            )
+        return TickPollResult(
+            event_id=event_id,
+            symbol=symbol,
+            observed_at=observed_at,
+            tick_at=tick.timestamp,
+            status=status,
+            reason=reason,
+            stored=newly_observed,
+            broker_utc_offset_seconds=0,
+            source_path=self._source_path,
+        )
+
+    def _unavailable(
+        self,
+        symbol: str,
+        *,
+        observed_at: datetime,
+        status: str,
+        reason: str,
+    ) -> TickPollResult:
+        feed_status = "CLOSED" if status == "MARKET_CLOSED" else "STALE"
+        payload = {
+            "quality": status,
+            "quality_reason": reason,
+            "source_path": self._source_path,
+            "stored": False,
+            "feed_status": feed_status,
+            "poll_status": status,
+        }
+        event_id = _digest((symbol, observed_at.isoformat(), status, reason, self._source_path))
+        if self._research_store.latest_tick_quality_status(symbol) != feed_status:
+            self._research_store.write_tick_quality_event(
+                event_id,
+                symbol,
+                observed_at,
+                feed_status,
+                payload,
+            )
+        return TickPollResult(
+            event_id=event_id,
+            symbol=symbol,
+            observed_at=observed_at,
+            tick_at=None,
+            status=status,
+            reason=reason,
+            stored=False,
+            broker_utc_offset_seconds=0,
+            source_path=self._source_path,
+        )
+
+
 def _digest(value: object) -> str:
     return sha256(json.dumps(value, default=str, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
 
