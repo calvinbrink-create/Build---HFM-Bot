@@ -24,6 +24,7 @@ from cipherfx_clean.evidence_capture import (
     capture_knowledge_library_requirement,
     capture_pattern_outcome_requirement,
     capture_historical_state_requirement,
+    capture_live_outcome_metric_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -680,6 +681,68 @@ def test_history_capture_freezes_broker_frames_and_binds_requirement_evidence(
     assert captured["code_subject"].name == code_name
     assert captured["test_file"].name == test_name
     assert captured["data_subjects"] == (data_bundle,)
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "requires_data"),
+    (
+        ("C085", True),
+        ("C086", False),
+        ("C087", False),
+        ("C088", False),
+        ("C089", False),
+        ("C090", True),
+        ("C091", False),
+        ("C092", False),
+    ),
+)
+def test_outcome_metric_capture_binds_frozen_hfm_and_tick_inputs(
+    tmp_path, monkeypatch, requirement_id, requires_data
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    tick_source = tmp_path / "ticks.sqlite3"
+    tick_source.write_text("source", encoding="utf-8")
+    data_bundle = tmp_path / "data.zip"
+    data_bundle.write_text("frozen", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    def snapshot_database(_source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("snapshot", encoding="utf-8")
+
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_sqlite_database", snapshot_database)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: data_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c085_c092_outcome_metrics",
+        lambda **kwargs: {"requirement_id": kwargs["requirement_id"], "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_outcome_metric_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        tick_database=tick_source,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == "outcome_metrics.py"
+    assert captured["test_file"].name == "test_item_084_outcome_metrics.py"
+    assert bool(captured["data_subjects"]) is requires_data
 
 
 def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):

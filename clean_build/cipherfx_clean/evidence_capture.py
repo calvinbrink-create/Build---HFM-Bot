@@ -86,6 +86,7 @@ from .requirement_runtime import (
     verify_c069_c076_knowledge_library,
     verify_c077_c078_pattern_outcomes,
     verify_c079_c084_historical_state_layer,
+    verify_c085_c092_outcome_metrics,
 )
 
 
@@ -488,6 +489,14 @@ _LIVE_HISTORICAL_STATE_CAPTURE_TARGETS = {
     "C082": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_005_historical_memory.py"),
     "C083": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_005_historical_memory.py"),
     "C084": ("clean_build/cipherfx_clean/historical_memory.py", "clean_build/tests/test_item_084_outcome_metrics.py"),
+}
+
+_LIVE_OUTCOME_METRIC_CAPTURE_TARGETS = {
+    f"C{number:03d}": (
+        "clean_build/cipherfx_clean/intelligence/outcome_metrics.py",
+        "clean_build/tests/test_item_084_outcome_metrics.py",
+    )
+    for number in range(85, 93)
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -1123,6 +1132,64 @@ def capture_historical_state_requirement(
     )
 
 
+def capture_live_outcome_metric_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    tick_database: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture outcome metrics using frozen HFM candles and raw-tick inputs."""
+
+    try:
+        code_path, test_path = _LIVE_OUTCOME_METRIC_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported outcome-metric requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    tick_source = tick_database.resolve()
+    _require_inside(tick_source, root, "outcome-metric tick database")
+    hfm_snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    tick_snapshot = output / f"{requirement_id.lower()}_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(tick_source, tick_snapshot)
+    verification = verify_c085_c092_outcome_metrics(
+        requirement_id=requirement_id,
+        bridge_root=hfm_snapshot,
+        tick_database=tick_snapshot,
+        symbols=tuple(symbols),
+    )
+    data_subjects: tuple[Path, ...] = ()
+    if requirement_id in {"C085", "C090"}:
+        data_subjects = (
+            _bundle_data_subject(
+                output,
+                requirement_id,
+                (*tuple(sorted(hfm_snapshot.iterdir())), tick_snapshot),
+            ),
+        )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=data_subjects,
+    )
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1509,6 +1576,7 @@ def main() -> int:
             "C061", "C062", "C063", "C064", "C065", "C066", "C067", "C068",
             "C069", "C070", "C071", "C072", "C073", "C074", "C075", "C076",
             "C077", "C078", "C079", "C080", "C081", "C082", "C083", "C084",
+            "C085", "C086", "C087", "C088", "C089", "C090", "C091", "C092",
         ),
         default="C006",
     )
@@ -1668,6 +1736,18 @@ def main() -> int:
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_OUTCOME_METRIC_CAPTURE_TARGETS:
+        if args.bridge_root is None or args.tick_database is None:
+            parser.error("--bridge-root and --tick-database are required for C085-C092")
+        bundle = capture_live_outcome_metric_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            tick_database=args.tick_database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
