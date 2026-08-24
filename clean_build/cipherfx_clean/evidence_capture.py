@@ -25,6 +25,7 @@ from zipfile import ZIP_DEFLATED, ZipFile
 from .compliance import EvidenceKind
 from .requirement_runtime import (
     verify_c006_raw_tick_library,
+    verify_c007_tick_quality,
     verify_c008_hfm_candle_builder,
     verify_c009_hfm_market_states,
     verify_c011_hfm_live_chart,
@@ -423,6 +424,44 @@ def capture_c006_live_ticks(
         data_subjects=(snapshot,),
         output_directory=output,
         python_executable=python_executable,
+    )
+
+
+def capture_c007_live_tick_quality(
+    *,
+    workspace_root: Path,
+    tick_database: Path,
+    output_directory: Path,
+    python_executable: Path,
+    maximum_age_seconds: float,
+) -> EvidenceBundle:
+    """Capture genuine persisted fresh and stale tick classifications."""
+
+    root = workspace_root.resolve()
+    database = tick_database.resolve()
+    output = output_directory.resolve()
+    _require_inside(database, root, "tick-quality database")
+    _require_inside(output, root, "evidence output")
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = output / f"c007_tick_quality_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(database, snapshot)
+    verification = dict(
+        verify_c007_tick_quality(
+            _c007_payload_from_quality_events(snapshot),
+            maximum_age_seconds=maximum_age_seconds,
+        )
+    )
+    verification["source_database"] = str(snapshot)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C007",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/observation.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        data_subjects=(snapshot,),
+        output_directory=output,
+        python_executable=python_executable,
+        test_arguments=("-k", "c007"),
     )
 
 
@@ -975,6 +1014,39 @@ def _snapshot_sqlite_database(source: Path, destination: Path) -> None:
         reader.close()
 
 
+def _c007_payload_from_quality_events(database: Path) -> Mapping[str, object]:
+    """Build the C007 verifier payload from immutable live-observation events."""
+
+    connection = sqlite3.connect(f"file:{database.resolve()}?mode=ro", uri=True)
+    try:
+        rows = connection.execute(
+            "SELECT symbol, observed_at, payload FROM tick_quality_events ORDER BY observed_at,event_id"
+        ).fetchall()
+    finally:
+        connection.close()
+    results = []
+    for symbol, observed_at, payload_text in rows:
+        payload = json.loads(str(payload_text))
+        status = str(payload.get("quality") or payload.get("poll_status") or "")
+        if status not in {"VALID", "STALE"}:
+            continue
+        tick = payload.get("tick")
+        tick_at = tick.get("timestamp") if isinstance(tick, Mapping) else None
+        results.append(
+            {
+                "symbol": str(symbol),
+                "status": status,
+                "reason": str(payload.get("quality_reason") or payload.get("reason") or "UNSPECIFIED"),
+                "observed_at": str(observed_at),
+                "tick_at": tick_at,
+                "source_path": payload.get("source_path"),
+            }
+        )
+    if not results:
+        raise ValueError("C007 requires persisted VALID or STALE tick observations")
+    return {"results": tuple(results)}
+
+
 def _snapshot_hfm_inputs(
     *,
     destination: Path,
@@ -1086,7 +1158,7 @@ def main() -> int:
     parser.add_argument(
         "--requirement",
         choices=(
-            "C006", "C008", "C009", "C011", "C012", "C013", "C014",
+            "C006", "C007", "C008", "C009", "C011", "C012", "C013", "C014",
             "C015", "C016", "C017", "C018", "C019", "C020",
             "C021", "C022", "C023", "C024", "C025",
             "C026", "C027", "C028", "C029", "C030",
@@ -1114,6 +1186,16 @@ def main() -> int:
             tick_database=args.tick_database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
+        )
+    elif args.requirement == "C007":
+        if args.tick_database is None:
+            parser.error("--tick-database is required for C007")
+        bundle = capture_c007_live_tick_quality(
+            workspace_root=args.workspace_root,
+            tick_database=args.tick_database,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            maximum_age_seconds=60.0,
         )
     elif args.requirement == "C008":
         if args.bridge_root is None or args.tick_database is None:

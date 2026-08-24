@@ -1,4 +1,4 @@
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 from zipfile import ZipFile
@@ -692,3 +692,96 @@ def test_broker_tick_export_snapshot_contains_only_requested_exports(tmp_path):
     )
 
     assert [path.name for path in snapshot.iterdir()] == ["tick_XAUUSD.txt"]
+
+
+def test_c007_capture_binds_persisted_fresh_and_stale_tick_evidence(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    source = tmp_path / "live.sqlite3"
+    source.write_text("live", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "_snapshot_sqlite_database",
+        lambda _source, destination: destination.write_text("snapshot", encoding="utf-8"),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "_c007_payload_from_quality_events",
+        lambda _snapshot: {"results": ("persisted",)},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c007_tick_quality",
+        lambda payload, **kwargs: {"requirement_id": "C007", "status": "PASS", "payload": payload, **kwargs},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_module.capture_c007_live_tick_quality(
+        workspace_root=tmp_path,
+        tick_database=source,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        maximum_age_seconds=60.0,
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == "observation.py"
+    assert captured["test_file"].name == "test_item_030_requirement_runtime.py"
+    assert captured["test_arguments"] == ("-k", "c007")
+    assert captured["verification"]["payload"] == {"results": ("persisted",)}
+    snapshot = captured["data_subjects"][0]
+    assert snapshot.read_text(encoding="utf-8") == "snapshot"
+
+
+def test_c007_payload_uses_persisted_tick_quality_events(tmp_path):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    database = tmp_path / "quality.sqlite3"
+    store = EvidenceStore(database)
+    now = datetime(2026, 8, 24, 20, 0, tzinfo=timezone.utc)
+    try:
+        for symbol, status, tick_at, reason in (
+            ("XAUUSD", "VALID", now - timedelta(seconds=1), "VALID_TICK"),
+            ("UK100", "STALE", now - timedelta(seconds=61), "OUTSIDE_FRESHNESS_WINDOW"),
+        ):
+            store.write_tick_quality_event(
+                f"{symbol}:{status}",
+                symbol,
+                now,
+                "FRESH" if status == "VALID" else "STALE",
+                {
+                    "quality": status,
+                    "quality_reason": reason,
+                    "tick": {"timestamp": tick_at.isoformat()},
+                    "source_path": f"/broker/tick_{symbol}.txt",
+                },
+            )
+    finally:
+        store.close()
+
+    payload = capture_module._c007_payload_from_quality_events(database)
+
+    assert payload["results"] == (
+        {
+            "symbol": "UK100",
+            "status": "STALE",
+            "reason": "OUTSIDE_FRESHNESS_WINDOW",
+            "observed_at": now.isoformat(),
+            "tick_at": (now - timedelta(seconds=61)).isoformat(),
+            "source_path": "/broker/tick_UK100.txt",
+        },
+        {
+            "symbol": "XAUUSD",
+            "status": "VALID",
+            "reason": "VALID_TICK",
+            "observed_at": now.isoformat(),
+            "tick_at": (now - timedelta(seconds=1)).isoformat(),
+            "source_path": "/broker/tick_XAUUSD.txt",
+        },
+    )
