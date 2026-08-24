@@ -47,6 +47,13 @@ from .requirement_runtime import (
     verify_c028_tick_velocity,
     verify_c029_tick_acceleration,
     verify_c030_microstructure,
+    verify_c031_spread_intelligence,
+    verify_c034_momentum_intelligence,
+    verify_c035_realized_volatility,
+    verify_c037_volatility_regime,
+    verify_c038_volatility_of_volatility,
+    verify_c039_compression_detector,
+    verify_c040_expansion_detector,
 )
 
 
@@ -173,7 +180,60 @@ _LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS = {
     ),
 }
 
+_LIVE_ANALYTICS_CAPTURE_TARGETS = {
+    "C031": (
+        "verify_c031_spread_intelligence",
+        "clean_build/cipherfx_clean/intelligence/spread_intelligence.py",
+        "clean_build/tests/test_item_046_spread_intelligence.py",
+        ("-k", "spread"),
+        "spread",
+    ),
+    "C034": (
+        "verify_c034_momentum_intelligence",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_049_momentum_intelligence.py",
+        ("-k", "momentum"),
+        None,
+    ),
+    "C035": (
+        "verify_c035_realized_volatility",
+        "clean_build/cipherfx_clean/intelligence/market_features.py",
+        "clean_build/tests/test_item_050_realized_volatility.py",
+        ("-k", "realized_volatility"),
+        None,
+    ),
+    "C037": (
+        "verify_c037_volatility_regime",
+        "clean_build/cipherfx_clean/intelligence/volatility_regime.py",
+        "clean_build/tests/test_item_052_volatility_regime.py",
+        ("-k", "volatility_regime"),
+        None,
+    ),
+    "C038": (
+        "verify_c038_volatility_of_volatility",
+        "clean_build/cipherfx_clean/intelligence/volatility_dynamics.py",
+        "clean_build/tests/test_item_053_volatility_of_volatility.py",
+        ("-k", "volatility"),
+        None,
+    ),
+    "C039": (
+        "verify_c039_compression_detector",
+        "clean_build/cipherfx_clean/intelligence/volatility_dynamics.py",
+        "clean_build/tests/test_item_054_compression_detector.py",
+        ("-k", "compression"),
+        "research",
+    ),
+    "C040": (
+        "verify_c040_expansion_detector",
+        "clean_build/cipherfx_clean/intelligence/volatility_dynamics.py",
+        "clean_build/tests/test_item_055_expansion_detector.py",
+        ("-k", "expansion"),
+        None,
+    ),
+}
+
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
+_HFM_RESEARCH_TIMEFRAMES = ("MN1", "W1", "D1", "H4", "H1", "M30", "M15", "M5", "M3", "M1")
 
 
 def write_evidence_bundle(
@@ -581,6 +641,52 @@ def capture_live_tick_intelligence_requirement(
     )
 
 
+def capture_live_analytics_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture live analytical evidence, freezing required HFM inputs first."""
+
+    try:
+        verifier_name, code_path, test_path, test_arguments, snapshot_kind = _LIVE_ANALYTICS_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported live analytics requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    source_root = bridge_root.resolve()
+    data_subjects: tuple[Path, ...] = ()
+    if snapshot_kind is not None:
+        timeframes = ("M1",) if snapshot_kind == "spread" else _HFM_RESEARCH_TIMEFRAMES
+        snapshot = _snapshot_hfm_inputs(
+            destination=output,
+            requirement_id=requirement_id,
+            bridge_root=source_root,
+            symbols=symbols,
+            timeframes=timeframes,
+            include_combined_m1=snapshot_kind == "spread",
+            include_ticks=snapshot_kind == "spread",
+        )
+        source_root = snapshot
+        data_subjects = (_bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),)
+    verification = globals()[verifier_name](bridge_root=source_root, symbols=tuple(symbols))
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=data_subjects,
+        test_arguments=test_arguments,
+    )
+
+
 def capture_verified_requirement(
     *,
     workspace_root: Path,
@@ -690,6 +796,9 @@ def _snapshot_hfm_inputs(
     requirement_id: str,
     bridge_root: Path,
     symbols: Sequence[str],
+    timeframes: Sequence[str] = _HFM_SNAPSHOT_TIMEFRAMES,
+    include_combined_m1: bool = False,
+    include_ticks: bool = False,
 ) -> Path:
     """Copy the exact bar files used by a rolling HFM verifier before it runs."""
 
@@ -700,11 +809,20 @@ def _snapshot_hfm_inputs(
     snapshot = destination / f"{requirement_id.lower()}_hfm_inputs_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}"
     snapshot.mkdir()
     sources = [source_root / "symbols.csv"]
-    sources.extend(
-        source_root / f"rates_{symbol}_{timeframe}.csv"
-        for symbol in symbols
-        for timeframe in _HFM_SNAPSHOT_TIMEFRAMES
-    )
+    for symbol in symbols:
+        for timeframe in timeframes:
+            sources.append(source_root / f"rates_{symbol}_{timeframe}.csv")
+            if include_combined_m1 and timeframe == "M1":
+                sources.extend(
+                    candidate
+                    for candidate in (
+                        source_root / f"deephistory_{symbol}_M1.csv",
+                        source_root / f"rates_{symbol}_M1_HISTORY.csv",
+                    )
+                    if candidate.is_file()
+                )
+        if include_ticks:
+            sources.append(source_root / f"tick_{symbol}.txt")
     for source in sources:
         if not source.is_file():
             raise FileNotFoundError(source)
@@ -742,6 +860,7 @@ def main() -> int:
             "C015", "C016", "C017", "C018", "C019", "C020",
             "C021", "C022", "C023", "C024", "C025",
             "C026", "C027", "C028", "C029", "C030",
+            "C031", "C034", "C035", "C037", "C038", "C039", "C040",
         ),
         default="C006",
     )
@@ -820,6 +939,17 @@ def main() -> int:
             tick_database=args.tick_database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
+        )
+    elif args.requirement in _LIVE_ANALYTICS_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C031, C034-C035, and C037-C040")
+        bundle = capture_live_analytics_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
         )
     elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:

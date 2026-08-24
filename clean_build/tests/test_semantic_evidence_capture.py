@@ -19,6 +19,7 @@ from cipherfx_clean.evidence_capture import (
     capture_live_intelligence_requirement,
     capture_live_geometry_requirement,
     capture_live_tick_intelligence_requirement,
+    capture_live_analytics_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -458,3 +459,87 @@ def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
     snapshot = Path(captured["verification"]["database"])
     assert snapshot.parent == tmp_path / "evidence"
     assert snapshot.read_text(encoding="utf-8") == "snapshot"
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments", "requires_data"),
+    (
+        ("C031", "verify_c031_spread_intelligence", "spread_intelligence.py", "test_item_046_spread_intelligence.py", ("-k", "spread"), True),
+        ("C034", "verify_c034_momentum_intelligence", "market_features.py", "test_item_049_momentum_intelligence.py", ("-k", "momentum"), False),
+        ("C035", "verify_c035_realized_volatility", "market_features.py", "test_item_050_realized_volatility.py", ("-k", "realized_volatility"), False),
+        ("C037", "verify_c037_volatility_regime", "volatility_regime.py", "test_item_052_volatility_regime.py", ("-k", "volatility_regime"), False),
+        ("C038", "verify_c038_volatility_of_volatility", "volatility_dynamics.py", "test_item_053_volatility_of_volatility.py", ("-k", "volatility"), False),
+        ("C039", "verify_c039_compression_detector", "volatility_dynamics.py", "test_item_054_compression_detector.py", ("-k", "compression"), True),
+        ("C040", "verify_c040_expansion_detector", "volatility_dynamics.py", "test_item_055_expansion_detector.py", ("-k", "expansion"), False),
+    ),
+)
+def test_live_analytics_capture_binds_specific_verifier_code_test_and_required_data(
+    tmp_path,
+    monkeypatch,
+    requirement_id,
+    verification_name,
+    code_name,
+    test_name,
+    test_arguments,
+    requires_data,
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    input_snapshot = tmp_path / "inputs"
+    input_snapshot.mkdir()
+    (input_snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: input_snapshot)
+    monkeypatch.setattr(
+        capture_module,
+        verification_name,
+        lambda **kwargs: {"requirement_id": requirement_id, "status": "PASS", "bridge_root": str(kwargs["bridge_root"])},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_analytics_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "USA100"),
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == code_name
+    assert captured["test_file"].name == test_name
+    assert captured["test_arguments"] == test_arguments
+    assert bool(captured["data_subjects"]) is requires_data
+
+
+def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    source = tmp_path / "source"
+    source.mkdir()
+    for name in (
+        "symbols.csv",
+        "rates_XAUUSD_M1.csv",
+        "deephistory_XAUUSD_M1.csv",
+        "rates_XAUUSD_M1_HISTORY.csv",
+        "tick_XAUUSD.txt",
+    ):
+        (source / name).write_text(name, encoding="utf-8")
+
+    snapshot = capture_module._snapshot_hfm_inputs(
+        destination=tmp_path / "evidence",
+        requirement_id="C031",
+        bridge_root=source,
+        symbols=("XAUUSD",),
+        timeframes=("M1",),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+
+    assert sorted(path.name for path in snapshot.iterdir()) == sorted(path.name for path in source.iterdir())
