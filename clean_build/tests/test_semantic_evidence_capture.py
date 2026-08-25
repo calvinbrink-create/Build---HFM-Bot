@@ -30,6 +30,8 @@ from cipherfx_clean.evidence_capture import (
     capture_live_context_validation_group,
     capture_live_replay_monitoring_registry_group,
     capture_live_scorecard_governance_contract_group,
+    capture_live_execution_feedback_group,
+    capture_live_similarity_audit_dashboard_group,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -993,6 +995,87 @@ def test_scorecard_capture_records_frozen_inputs_and_governance_shadow(tmp_path,
     assert all(row["verification"]["requirement_id"] == row["requirement_id"] for row in captured)
     assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C138", "C140"}
     assert {row["requirement_id"] for row in captured if row.get("shadow_subjects")} == {"C138"}
+
+
+def test_execution_feedback_capture_binds_broker_exports_without_live_order_calls(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    broker = tmp_path / "broker"
+    broker.mkdir()
+    for name in ("history_orders.csv", "deals.csv"):
+        (broker / name).write_text("id\n", encoding="utf-8")
+    frozen_bundle = tmp_path / "frozen.zip"
+    frozen_bundle.write_text("frozen", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_broker_exports", lambda **_kwargs: broker)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: frozen_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c145_c152_execution_feedback_and_replay",
+        lambda **_kwargs: {"requirement_id": "C145", "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_execution_feedback_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(145, 153)}
+    assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C150"}
+    assert {row["requirement_id"] for row in captured if row.get("broker_subjects")} == {"C146", "C147", "C148", "C149", "C150"}
+
+
+def test_similarity_capture_binds_audit_database_and_broker_exports(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    for symbol in ("XAUUSD", "UK100", "USA100", "USA500", "USA30"):
+        (tmp_path / f"rates_{symbol}_M1_HISTORY.csv").write_text("time,open,high,low,close\n", encoding="utf-8")
+    broker = tmp_path / "broker"
+    broker.mkdir()
+    for name in ("history_orders.csv", "deals.csv"):
+        (broker / name).write_text("id\n", encoding="utf-8")
+    frozen_bundle = tmp_path / "frozen.zip"
+    frozen_bundle.write_text("frozen", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_broker_exports", lambda **_kwargs: broker)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: frozen_bundle)
+
+    def verifier(**kwargs):
+        kwargs["audit_database"].write_text("audit", encoding="utf-8")
+        return {"requirement_id": "C153", "status": "PASS"}
+
+    monkeypatch.setattr(capture_module, "verify_c153_c160_similarity_audit_dashboard_and_flow", verifier)
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_similarity_audit_dashboard_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(153, 161)}
+    assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C153", "C154", "C157", "C160"}
+    assert {row["requirement_id"] for row in captured if row.get("broker_subjects")} == {"C157", "C160"}
 
 
 def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):

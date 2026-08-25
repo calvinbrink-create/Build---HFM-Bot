@@ -93,6 +93,8 @@ from .requirement_runtime import (
     verify_c121_c128_context_validation_and_shadow,
     verify_c129_c136_replay_monitoring_and_registry,
     verify_c137_c144_scorecard_governance_and_contracts,
+    verify_c145_c152_execution_feedback_and_replay,
+    verify_c153_c160_similarity_audit_dashboard_and_flow,
 )
 
 
@@ -563,6 +565,28 @@ _LIVE_SCORECARD_CAPTURE_TARGETS = {
     "C142": "clean_build/cipherfx_clean/intelligence/runtime_contracts.py",
     "C143": "clean_build/cipherfx_clean/intelligence/runtime_contracts.py",
     "C144": "clean_build/cipherfx_clean/validation.py",
+}
+
+_LIVE_EXECUTION_FEEDBACK_CAPTURE_TARGETS = {
+    "C145": "clean_build/cipherfx_clean/execution.py",
+    "C146": "clean_build/cipherfx_clean/execution.py",
+    "C147": "clean_build/cipherfx_clean/operations.py",
+    "C148": "clean_build/cipherfx_clean/execution.py",
+    "C149": "clean_build/cipherfx_clean/management.py",
+    "C150": "clean_build/cipherfx_clean/feedback.py",
+    "C151": "clean_build/cipherfx_clean/feedback.py",
+    "C152": "clean_build/cipherfx_clean/replay.py",
+}
+
+_LIVE_SIMILARITY_CAPTURE_TARGETS = {
+    "C153": "clean_build/cipherfx_clean/historical_memory.py",
+    "C154": "clean_build/cipherfx_clean/intelligence/outcome_metrics.py",
+    "C155": "clean_build/cipherfx_clean/validation.py",
+    "C156": "clean_build/cipherfx_clean/runtime_trace.py",
+    "C157": "clean_build/cipherfx_clean/store.py",
+    "C158": "clean_build/cipherfx_clean/dashboard.py",
+    "C159": "clean_build/cipherfx_clean/dashboard.py",
+    "C160": "clean_build/cipherfx_clean/runtime_trace.py",
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -1549,6 +1573,130 @@ def capture_live_scorecard_governance_contract_group(
     return bundles
 
 
+def capture_live_execution_feedback_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C145-C152 with read-only HFM and broker-export evidence.
+
+    The verifier's execution port is a test double.  Frozen HFM order/deal
+    exports establish the broker evidence without ever submitting a request.
+    """
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C145",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M5",),
+        include_combined_m1=False,
+        include_ticks=True,
+    )
+    broker_snapshot = _snapshot_broker_exports(
+        destination=output,
+        requirement_id="C146",
+        bridge_root=bridge_root.resolve(),
+    )
+    verification = verify_c145_c152_execution_feedback_and_replay(
+        requirement_id="C145",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+    )
+    broker_bundle = _bundle_data_subject(output, "C146", tuple(sorted(broker_snapshot.iterdir())))
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_EXECUTION_FEEDBACK_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        data_subjects: tuple[Path, ...] = ()
+        if requirement_id == "C150":
+            data_subjects = (
+                _bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),
+            )
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_145_execution_feedback.py",
+            output_directory=output,
+            python_executable=python_executable,
+            data_subjects=data_subjects,
+            broker_subjects=(broker_bundle,) if requirement_id in {"C146", "C147", "C148", "C149", "C150"} else (),
+        )
+    return bundles
+
+
+def capture_live_similarity_audit_dashboard_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C153-C160 from frozen HFM market history and audit records."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C153",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("H4", "H1", "M15", "M5", "M3", "M1"),
+        include_combined_m1=False,
+        include_ticks=True,
+    )
+    history_root = bridge_root.resolve()
+    for symbol in symbols:
+        history_source = history_root / f"rates_{symbol}_M1_HISTORY.csv"
+        if not history_source.is_file():
+            raise FileNotFoundError(history_source)
+        copyfile(history_source, snapshot / history_source.name)
+    broker_snapshot = _snapshot_broker_exports(
+        destination=output,
+        requirement_id="C157",
+        bridge_root=bridge_root.resolve(),
+    )
+    audit_database = output / f"c153_c160_audit_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    verification = verify_c153_c160_similarity_audit_dashboard_and_flow(
+        requirement_id="C153",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+        audit_database=audit_database,
+    )
+    broker_bundle = _bundle_data_subject(output, "C157", tuple(sorted(broker_snapshot.iterdir())))
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_SIMILARITY_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        data_subjects: tuple[Path, ...] = ()
+        if requirement_id in {"C153", "C154", "C157", "C160"}:
+            data_subjects = (
+                _bundle_data_subject(output, requirement_id, (*tuple(sorted(snapshot.iterdir())), audit_database)),
+            )
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_153_audit_dashboard.py",
+            output_directory=output,
+            python_executable=python_executable,
+            data_subjects=data_subjects,
+            broker_subjects=(broker_bundle,) if requirement_id in {"C157", "C160"} else (),
+        )
+    return bundles
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1943,6 +2091,8 @@ def main() -> int:
             "C121", "C122", "C123", "C124", "C125", "C126", "C127", "C128",
             "C129", "C130", "C131", "C132", "C133", "C134", "C135", "C136",
             "C137", "C138", "C139", "C140", "C141", "C142", "C143", "C144",
+            "C145", "C146", "C147", "C148", "C149", "C150", "C151", "C152",
+            "C153", "C154", "C155", "C156", "C157", "C158", "C159", "C160",
         ),
         default="C006",
     )
@@ -2166,6 +2316,28 @@ def main() -> int:
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C137-C144")
         bundles = capture_live_scorecard_governance_contract_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
+    elif args.requirement in _LIVE_EXECUTION_FEEDBACK_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C145-C152")
+        bundles = capture_live_execution_feedback_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
+    elif args.requirement in _LIVE_SIMILARITY_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C153-C160")
+        bundles = capture_live_similarity_audit_dashboard_group(
             workspace_root=args.workspace_root,
             bridge_root=args.bridge_root,
             output_directory=args.output_directory,

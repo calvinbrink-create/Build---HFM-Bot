@@ -8641,6 +8641,7 @@ def verify_c153_c160_similarity_audit_dashboard_and_flow(
     requirement_id: str,
     bridge_root: Path,
     symbols: Sequence[str],
+    audit_database: Path | None = None,
 ) -> Mapping[str, object]:
     """Verify memory retrieval, edge metrics, audit lineage and projections."""
 
@@ -8764,7 +8765,9 @@ def verify_c153_c160_similarity_audit_dashboard_and_flow(
 
     # C156/C157: persist the complete data-to-outcome lineage in a dedicated
     # evidence database, then verify the ordered runtime trace.
-    audit_db = Path(f"/opt/cipherfx_mt5/clean_build/evidence/c153_c160_audit_{requirement_id.lower()}.sqlite3")
+    audit_db = audit_database or Path(
+        "/opt/cipherfx_mt5/clean_build/evidence"
+    ) / f"c153_c160_audit_{requirement_id.lower()}_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
     store = EvidenceStore(audit_db)
     outcome = TradeOutcome(
         decision_id=decision.decision_id,
@@ -8784,7 +8787,9 @@ def verify_c153_c160_similarity_audit_dashboard_and_flow(
     for sequence, stage in enumerate(TRADE_STAGES, start=1):
         store.write_runtime_trace_event(RuntimeTraceEvent(trace_id, sequence, stage, at + timedelta(seconds=sequence), decision.decision_id, {"source_ids": decision.evidence}))
     trace_result = verify_completed_trace(store.runtime_trace(trace_id), execution_required=True)
-    dashboard = __import__("cipherfx_clean.dashboard", fromlist=["EvidenceDashboard"]).EvidenceDashboard(audit_db)
+    from .dashboard import EvidenceDashboard
+
+    dashboard = EvidenceDashboard(audit_db)
     dashboard_trade = dashboard.trade(decision.decision_id)
     dashboard_overview = dashboard.overview()
     dashboard.close()
