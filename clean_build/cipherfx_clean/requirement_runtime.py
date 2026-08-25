@@ -154,6 +154,7 @@ from .validation import validate_against_active_edges, validate_decision
 
 C008_TIMEFRAMES = ("1s", "5s", "15s", "M1", "M3", "M5", "M15", "M30", "H1", "H4", "D1")
 C008_TICK_WINDOW = timedelta(minutes=5)
+C106_ATTRIBUTION_WINDOW_MINUTES = 24 * 60
 
 
 def verify_c007_tick_quality(
@@ -7138,7 +7139,10 @@ def verify_c106_c112_attribution_validation(
         feature_values: list[float] = []
         filter_values: list[float] = []
         governor_values: list[float] = []
-        rows = bars[-160:]
+        # Attribution samples must cover the current full trading day.  The
+        # former 160-minute slice can contain no quiet candles for a volatile
+        # symbol, despite valid samples existing under the unchanged rule.
+        rows = bars[-C106_ATTRIBUTION_WINDOW_MINUTES:]
         for anchor_index in range(0, len(rows) - 1, 2):
             anchor = rows[anchor_index]
             future = rows[anchor_index + 1]

@@ -89,6 +89,7 @@ from .requirement_runtime import (
     verify_c085_c092_outcome_metrics,
     verify_c093_c098_edge_research,
     verify_c099_c105_outcome_libraries,
+    verify_c106_c112_attribution_validation,
     verify_c113_c120_governance_and_execution_model,
     verify_c121_c128_context_validation_and_shadow,
     verify_c129_c136_replay_monitoring_and_registry,
@@ -576,6 +577,16 @@ _LIVE_EXECUTION_FEEDBACK_CAPTURE_TARGETS = {
     "C150": "clean_build/cipherfx_clean/feedback.py",
     "C151": "clean_build/cipherfx_clean/feedback.py",
     "C152": "clean_build/cipherfx_clean/replay.py",
+}
+
+_LIVE_ATTRIBUTION_CAPTURE_TARGETS = {
+    "C106": "clean_build/cipherfx_clean/intelligence/attribution.py",
+    "C107": "clean_build/cipherfx_clean/intelligence/attribution.py",
+    "C108": "clean_build/cipherfx_clean/intelligence/attribution.py",
+    "C109": "clean_build/cipherfx_clean/intelligence/validation_full.py",
+    "C110": "clean_build/cipherfx_clean/intelligence/validation_full.py",
+    "C111": "clean_build/cipherfx_clean/intelligence/validation_full.py",
+    "C112": "clean_build/cipherfx_clean/intelligence/validation_full.py",
 }
 
 _LIVE_SIMILARITY_CAPTURE_TARGETS = {
@@ -1506,6 +1517,61 @@ def capture_live_replay_monitoring_registry_group(
     return bundles
 
 
+def capture_live_attribution_validation_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C106-C112 from a frozen full-day HFM M1 observation window."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C106",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=False,
+        include_ticks=True,
+    )
+    history_root = bridge_root.resolve()
+    for symbol in symbols:
+        history_source = history_root / f"rates_{symbol}_M1_HISTORY.csv"
+        if not history_source.is_file():
+            raise FileNotFoundError(history_source)
+        copyfile(history_source, snapshot / history_source.name)
+    verification = verify_c106_c112_attribution_validation(
+        requirement_id="C106",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+    )
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_ATTRIBUTION_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        data_subjects: tuple[Path, ...] = ()
+        if requirement_id in {"C109", "C112"}:
+            data_subjects = (
+                _bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),
+            )
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_106_validation.py",
+            output_directory=output,
+            python_executable=python_executable,
+            data_subjects=data_subjects,
+        )
+    return bundles
+
+
 def capture_live_scorecard_governance_contract_group(
     *,
     workspace_root: Path,
@@ -2087,6 +2153,7 @@ def main() -> int:
             "C077", "C078", "C079", "C080", "C081", "C082", "C083", "C084",
             "C085", "C086", "C087", "C088", "C089", "C090", "C091", "C092",
             "C093", "C094", "C095", "C096", "C097", "C098", "C099", "C100", "C101", "C102", "C103", "C104", "C105",
+            "C106", "C107", "C108", "C109", "C110", "C111", "C112",
             "C113", "C114", "C115", "C116", "C117", "C118", "C119", "C120",
             "C121", "C122", "C123", "C124", "C125", "C126", "C127", "C128",
             "C129", "C130", "C131", "C132", "C133", "C134", "C135", "C136",
@@ -2279,6 +2346,17 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
         )
+    elif args.requirement in _LIVE_ATTRIBUTION_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C106-C112")
+        bundles = capture_live_attribution_validation_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
     elif args.requirement in _LIVE_GOVERNANCE_CAPTURE_TARGETS:
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C113-C120")

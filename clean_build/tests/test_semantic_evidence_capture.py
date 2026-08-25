@@ -26,6 +26,7 @@ from cipherfx_clean.evidence_capture import (
     capture_historical_state_requirement,
     capture_live_outcome_metric_requirement,
     capture_live_research_requirement,
+    capture_live_attribution_validation_group,
     capture_live_governance_requirement,
     capture_live_context_validation_group,
     capture_live_replay_monitoring_registry_group,
@@ -951,6 +952,41 @@ def test_replay_capture_records_frozen_inputs_and_required_shadow_receipts(tmp_p
     assert all(row["verification"]["requirement_id"] == row["requirement_id"] for row in captured)
     assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C130", "C131"}
     assert {row["requirement_id"] for row in captured if row.get("shadow_subjects")} == {"C129", "C135"}
+
+
+def test_attribution_capture_uses_frozen_full_day_history_for_validation(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    for symbol in ("XAUUSD", "UK100", "USA100", "USA500", "USA30"):
+        (tmp_path / f"rates_{symbol}_M1_HISTORY.csv").write_text("time,open,high,low,close\n", encoding="utf-8")
+    frozen_bundle = tmp_path / "frozen.zip"
+    frozen_bundle.write_text("frozen", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: frozen_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c106_c112_attribution_validation",
+        lambda **_kwargs: {"requirement_id": "C106", "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_attribution_validation_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(106, 113)}
+    assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C109", "C112"}
 
 
 def test_scorecard_capture_records_frozen_inputs_and_governance_shadow(tmp_path, monkeypatch):
