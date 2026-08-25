@@ -27,6 +27,9 @@ from cipherfx_clean.evidence_capture import (
     capture_live_outcome_metric_requirement,
     capture_live_research_requirement,
     capture_live_governance_requirement,
+    capture_live_context_validation_group,
+    capture_live_replay_monitoring_registry_group,
+    capture_live_scorecard_governance_contract_group,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -869,6 +872,127 @@ def test_governance_capture_uses_frozen_execution_inputs_and_correct_evidence_ki
     assert captured["code_subject"].name == code_name
     assert bool(captured["data_subjects"]) is (evidence_kind == "DATA")
     assert bool(captured["broker_subjects"]) is (evidence_kind == "BROKER")
+
+
+def test_context_capture_reuses_one_frozen_multisession_snapshot_and_records_shadow(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    news = tmp_path / "data" / "mt5_news_calendar_archive.csv"
+    news.parent.mkdir()
+    news.write_text("timestamp_utc,currency,impact\n", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_sqlite_database", lambda _source, destination: destination.write_text("shadow", encoding="utf-8"))
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c121_c128_context_validation_and_shadow",
+        lambda **_kwargs: {"requirement_id": "C121", "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_context_validation_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(121, 129)}
+    assert len(captured) == 8
+    assert all(row["verification"]["requirement_id"] == row["requirement_id"] for row in captured)
+    c128 = next(row for row in captured if row["requirement_id"] == "C128")
+    assert c128["code_subject"].name == "shadow_runtime.py"
+    assert bool(c128["shadow_subjects"])
+    assert all(not row.get("shadow_subjects", ()) for row in captured if row["requirement_id"] != "C128")
+
+
+def test_replay_capture_records_frozen_inputs_and_required_shadow_receipts(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    frozen_bundle = tmp_path / "frozen.zip"
+    frozen_bundle.write_text("frozen", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: frozen_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c129_c136_replay_monitoring_and_registry",
+        lambda **_kwargs: {"requirement_id": "C129", "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_replay_monitoring_registry_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(129, 137)}
+    assert len(captured) == 8
+    assert all(row["verification"]["requirement_id"] == row["requirement_id"] for row in captured)
+    assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C130", "C131"}
+    assert {row["requirement_id"] for row in captured if row.get("shadow_subjects")} == {"C129", "C135"}
+
+
+def test_scorecard_capture_records_frozen_inputs_and_governance_shadow(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "inputs"
+    snapshot.mkdir()
+    (snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    frozen_bundle = tmp_path / "frozen.zip"
+    frozen_bundle.write_text("frozen", encoding="utf-8")
+    captured = []
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: snapshot)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: frozen_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c137_c144_scorecard_governance_and_contracts",
+        lambda **_kwargs: {
+            "requirement_id": "C137",
+            "status": "PASS",
+            "verified_at_utc": "2026-08-25T00:00:00+00:00",
+            "promotion": {"statuses": ["CANDIDATE", "SHADOW"]},
+            "source_policy": "READ_ONLY",
+            "no_trade_side_effects": True,
+        },
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.append(kwargs) or EvidenceBundle(tmp_path / "envelope.json", tmp_path / f"{kwargs['requirement_id']}.json", ("proof",)),
+    )
+
+    bundles = capture_live_scorecard_governance_contract_group(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert set(bundles) == {f"C{number:03d}" for number in range(137, 145)}
+    assert len(captured) == 8
+    assert all(row["verification"]["requirement_id"] == row["requirement_id"] for row in captured)
+    assert {row["requirement_id"] for row in captured if row.get("data_subjects")} == {"C138", "C140"}
+    assert {row["requirement_id"] for row in captured if row.get("shadow_subjects")} == {"C138"}
 
 
 def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):

@@ -90,6 +90,9 @@ from .requirement_runtime import (
     verify_c093_c098_edge_research,
     verify_c099_c105_outcome_libraries,
     verify_c113_c120_governance_and_execution_model,
+    verify_c121_c128_context_validation_and_shadow,
+    verify_c129_c136_replay_monitoring_and_registry,
+    verify_c137_c144_scorecard_governance_and_contracts,
 )
 
 
@@ -527,6 +530,39 @@ _LIVE_GOVERNANCE_CAPTURE_TARGETS = {
     "C118": ("clean_build/cipherfx_clean/intelligence/execution_model.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
     "C119": ("clean_build/cipherfx_clean/hfm_data.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
     "C120": ("clean_build/cipherfx_clean/slippage.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
+}
+
+_LIVE_CONTEXT_CAPTURE_TARGETS = {
+    "C121": "clean_build/cipherfx_clean/intelligence/validation_full.py",
+    "C122": "clean_build/cipherfx_clean/intelligence/session.py",
+    "C123": "clean_build/cipherfx_clean/intelligence/regime.py",
+    "C124": "clean_build/cipherfx_clean/hfm_data.py",
+    "C125": "clean_build/cipherfx_clean/intelligence/news.py",
+    "C126": "clean_build/cipherfx_clean/intelligence/planning.py",
+    "C127": "clean_build/cipherfx_clean/intelligence/planning.py",
+    "C128": "clean_build/cipherfx_clean/shadow_runtime.py",
+}
+
+_LIVE_REPLAY_CAPTURE_TARGETS = {
+    "C129": "clean_build/cipherfx_clean/intelligence/tournament.py",
+    "C130": "clean_build/cipherfx_clean/replay.py",
+    "C131": "clean_build/cipherfx_clean/replay.py",
+    "C132": "clean_build/cipherfx_clean/intelligence/monitor.py",
+    "C133": "clean_build/cipherfx_clean/intelligence/monitor.py",
+    "C134": "clean_build/cipherfx_clean/intelligence/monitor.py",
+    "C135": "clean_build/cipherfx_clean/intelligence/research.py",
+    "C136": "clean_build/cipherfx_clean/intelligence/governance.py",
+}
+
+_LIVE_SCORECARD_CAPTURE_TARGETS = {
+    "C137": "clean_build/cipherfx_clean/intelligence/governance.py",
+    "C138": "clean_build/cipherfx_clean/intelligence/governance.py",
+    "C139": "clean_build/cipherfx_clean/intelligence/governance.py",
+    "C140": "clean_build/cipherfx_clean/intelligence/monitor.py",
+    "C141": "clean_build/cipherfx_clean/intelligence/governance.py",
+    "C142": "clean_build/cipherfx_clean/intelligence/runtime_contracts.py",
+    "C143": "clean_build/cipherfx_clean/intelligence/runtime_contracts.py",
+    "C144": "clean_build/cipherfx_clean/validation.py",
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -1069,6 +1105,7 @@ def _capture_historical_hfm_inputs(
 
     root = workspace_root.resolve()
     output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
     snapshot = _snapshot_hfm_inputs(
         destination=output,
         requirement_id=requirement_id,
@@ -1334,6 +1371,184 @@ def capture_live_governance_requirement(
     )
 
 
+def capture_live_context_validation_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C121-C128 from one frozen multi-session HFM context snapshot."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C121",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1", "M5", "M15", "H1"),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    news_source = root / "data/mt5_news_calendar_archive.csv"
+    if not news_source.is_file():
+        raise FileNotFoundError(news_source)
+    news_snapshot = output / f"c125_news_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.csv"
+    copyfile(news_source, news_snapshot)
+    shadow_database = output / f"c128_shadow_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    verification = verify_c121_c128_context_validation_and_shadow(
+        requirement_id="C121",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+        news_archive=news_snapshot,
+        shadow_database=shadow_database,
+    )
+    shadow_snapshot = output / f"c128_shadow_snapshot_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(shadow_database, shadow_snapshot)
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_CONTEXT_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_121_context_shadow.py",
+            output_directory=output,
+            python_executable=python_executable,
+            shadow_subjects=(shadow_snapshot,) if requirement_id == "C128" else (),
+        )
+    return bundles
+
+
+def capture_live_replay_monitoring_registry_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C129-C136 from one frozen HFM replay input set.
+
+    The shadow receipt documents an in-memory research tournament only.  It
+    has no link to the broker execution path and is retained as the required
+    shadow evidence for tournament and registry requirements.
+    """
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C129",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=False,
+        include_ticks=True,
+    )
+    verification = verify_c129_c136_replay_monitoring_and_registry(
+        requirement_id="C129",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+    )
+    shadow_receipt = output / f"c129_shadow_tournament_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
+    _write_json(shadow_receipt, verification)
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_REPLAY_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        data_subjects: tuple[Path, ...] = ()
+        if requirement_id in {"C130", "C131"}:
+            data_subjects = (
+                _bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),
+            )
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_129_replay_registry.py",
+            output_directory=output,
+            python_executable=python_executable,
+            data_subjects=data_subjects,
+            shadow_subjects=(shadow_receipt,) if requirement_id in {"C129", "C135"} else (),
+        )
+    return bundles
+
+
+def capture_live_scorecard_governance_contract_group(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> Mapping[str, EvidenceBundle]:
+    """Capture C137-C144 from frozen HFM M5 bars and governance fixtures.
+
+    The verifier calculates reporting-only scorecards from HFM data.  Its
+    promotion fixture is captured separately as shadow governance evidence;
+    it is not a broker authorisation or an active-trading promotion.
+    """
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    output.mkdir(parents=True, exist_ok=True)
+    snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id="C137",
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M5",),
+        include_combined_m1=False,
+        include_ticks=True,
+    )
+    verification = verify_c137_c144_scorecard_governance_and_contracts(
+        requirement_id="C137",
+        bridge_root=snapshot,
+        symbols=tuple(symbols),
+    )
+    shadow_receipt = output / f"c138_shadow_governance_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.json"
+    _write_json(
+        shadow_receipt,
+        {
+            "schema_version": 1,
+            "requirement_id": "C138",
+            "verified_at_utc": verification["verified_at_utc"],
+            "promotion": verification["promotion"],
+            "source_policy": verification["source_policy"],
+            "no_trade_side_effects": verification["no_trade_side_effects"],
+        },
+    )
+    bundles: dict[str, EvidenceBundle] = {}
+    for requirement_id, code_path in _LIVE_SCORECARD_CAPTURE_TARGETS.items():
+        receipt = dict(verification)
+        receipt["requirement_id"] = requirement_id
+        data_subjects: tuple[Path, ...] = ()
+        if requirement_id in {"C138", "C140"}:
+            data_subjects = (
+                _bundle_data_subject(output, requirement_id, tuple(sorted(snapshot.iterdir()))),
+            )
+        bundles[requirement_id] = capture_verified_requirement(
+            workspace_root=root,
+            requirement_id=requirement_id,
+            verification=receipt,
+            code_subject=root / code_path,
+            test_file=root / "clean_build/tests/test_item_137_scorecard_contracts.py",
+            output_directory=output,
+            python_executable=python_executable,
+            data_subjects=data_subjects,
+            shadow_subjects=(shadow_receipt,) if requirement_id == "C138" else (),
+        )
+    return bundles
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1471,6 +1686,7 @@ def capture_verified_requirement(
     python_executable: Path,
     data_subjects: Sequence[Path] = (),
     broker_subjects: Sequence[Path] = (),
+    shadow_subjects: Sequence[Path] = (),
     test_arguments: Sequence[str] = (),
 ) -> EvidenceBundle:
     """Capture checked code, test, runtime, and optional data evidence."""
@@ -1512,6 +1728,7 @@ def capture_verified_requirement(
     ]
     subjects.extend(EvidenceSubject(EvidenceKind.DATA, path) for path in data_subjects)
     subjects.extend(EvidenceSubject(EvidenceKind.BROKER, path) for path in broker_subjects)
+    subjects.extend(EvidenceSubject(EvidenceKind.SHADOW, path) for path in shadow_subjects)
     return write_evidence_bundle(
         workspace_root=root,
         requirement_id=requirement_id,
@@ -1723,6 +1940,9 @@ def main() -> int:
             "C085", "C086", "C087", "C088", "C089", "C090", "C091", "C092",
             "C093", "C094", "C095", "C096", "C097", "C098", "C099", "C100", "C101", "C102", "C103", "C104", "C105",
             "C113", "C114", "C115", "C116", "C117", "C118", "C119", "C120",
+            "C121", "C122", "C123", "C124", "C125", "C126", "C127", "C128",
+            "C129", "C130", "C131", "C132", "C133", "C134", "C135", "C136",
+            "C137", "C138", "C139", "C140", "C141", "C142", "C143", "C144",
         ),
         default="C006",
     )
@@ -1920,6 +2140,39 @@ def main() -> int:
             python_executable=args.python_executable,
             symbols=tuple(args.symbols),
         )
+    elif args.requirement in _LIVE_CONTEXT_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C121-C128")
+        bundles = capture_live_context_validation_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
+    elif args.requirement in _LIVE_REPLAY_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C129-C136")
+        bundles = capture_live_replay_monitoring_registry_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
+    elif args.requirement in _LIVE_SCORECARD_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C137-C144")
+        bundles = capture_live_scorecard_governance_contract_group(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+        bundle = bundles[args.requirement]
     elif args.requirement in {"C011", "C012", "C013"}:
         if args.bridge_root is None or args.chart_directory is None:
             parser.error("--bridge-root and --chart-directory are required for C011-C013")

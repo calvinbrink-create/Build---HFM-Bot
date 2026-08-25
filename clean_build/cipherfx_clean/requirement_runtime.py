@@ -7580,6 +7580,8 @@ def verify_c121_c128_context_validation_and_shadow(
     requirement_id: str,
     bridge_root: Path,
     symbols: Sequence[str],
+    news_archive: Path | None = None,
+    shadow_database: Path | None = None,
 ) -> Mapping[str, object]:
     """Validate instrument/session/regime/timeframe context and shadow mode."""
 
@@ -7599,7 +7601,11 @@ def verify_c121_c128_context_validation_and_shadow(
     bars_by_symbol: dict[str, tuple[object, ...]] = {}
     for symbol in active_symbols:
         latest = adapter.latest_tick(symbol)
-        bars = tuple(adapter.read_bars(symbol, "M1", observed_at=latest.timestamp, history_mode="combined")[-128:])
+        history = adapter.read_bars(symbol, "M1", observed_at=latest.timestamp, history_mode="combined")
+        # The latest 128 minutes can sit wholly inside one market session.
+        # Use a deterministic one-day sample so session/regime validation has
+        # observed comparison groups without changing any trade path.
+        bars = tuple(history[-1440::15])
         if len(bars) < 64:
             raise ValueError(f"C121-C128 requires completed M1 history for {symbol}")
         bars_by_symbol[symbol] = bars
@@ -7702,7 +7708,7 @@ def verify_c121_c128_context_validation_and_shadow(
         raise ValueError("C124 timeframe validation is incomplete")
 
     # C125 uses the dated broker-side news archive as a research tag source.
-    news_path = Path("/opt/cipherfx_mt5/data/mt5_news_calendar_archive.csv")
+    news_path = news_archive or Path("/opt/cipherfx_mt5/data/mt5_news_calendar_archive.csv")
     news_events: list[NewsEvent] = []
     if news_path.is_file():
         for index, row in enumerate(read_csv(news_path)):
@@ -7762,7 +7768,7 @@ def verify_c121_c128_context_validation_and_shadow(
 
     # C128 creates only shadow positions.  The runner has no broker port and
     # each decision is persisted in the separate research evidence database.
-    shadow_db = Path("/opt/cipherfx_mt5/clean_build/evidence/c121_c128_shadow.sqlite3")
+    shadow_db = shadow_database or Path("/opt/cipherfx_mt5/clean_build/evidence/c121_c128_shadow.sqlite3")
     shadow_store = EvidenceStore(shadow_db)
     shadow_runner = PersistentShadowRunner(shadow_store)
     shadow_positions = []
