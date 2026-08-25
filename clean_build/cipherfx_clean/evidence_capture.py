@@ -89,6 +89,7 @@ from .requirement_runtime import (
     verify_c085_c092_outcome_metrics,
     verify_c093_c098_edge_research,
     verify_c099_c105_outcome_libraries,
+    verify_c113_c120_governance_and_execution_model,
 )
 
 
@@ -515,6 +516,17 @@ _LIVE_RESEARCH_CAPTURE_TARGETS = {
     "C103": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
     "C104": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", True),
     "C105": ("verify_c099_c105_outcome_libraries", "clean_build/cipherfx_clean/intelligence/data_library.py", "clean_build/tests/test_item_099_outcome_libraries.py", False),
+}
+
+_LIVE_GOVERNANCE_CAPTURE_TARGETS = {
+    "C113": ("clean_build/cipherfx_clean/research_pipeline.py", "clean_build/tests/test_item_113_governance_execution.py", "DATA"),
+    "C114": ("clean_build/cipherfx_clean/intelligence/research.py", "clean_build/tests/test_item_113_governance_execution.py", "DATA"),
+    "C115": ("clean_build/cipherfx_clean/store.py", "clean_build/tests/test_item_113_governance_execution.py", None),
+    "C116": ("clean_build/cipherfx_clean/intelligence/edge_validation.py", "clean_build/tests/test_item_113_governance_execution.py", "DATA"),
+    "C117": ("clean_build/cipherfx_clean/cost_evidence.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
+    "C118": ("clean_build/cipherfx_clean/intelligence/execution_model.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
+    "C119": ("clean_build/cipherfx_clean/hfm_data.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
+    "C120": ("clean_build/cipherfx_clean/slippage.py", "clean_build/tests/test_item_113_governance_execution.py", "BROKER"),
 }
 
 _HFM_SNAPSHOT_TIMEFRAMES = ("M1", "M5", "M15", "H1", "H4")
@@ -1254,6 +1266,74 @@ def capture_live_research_requirement(
     )
 
 
+def capture_live_governance_requirement(
+    *,
+    workspace_root: Path,
+    requirement_id: str,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbols: Sequence[str],
+) -> EvidenceBundle:
+    """Capture governance and execution-model evidence from frozen HFM sources."""
+
+    try:
+        code_path, test_path, evidence_kind = _LIVE_GOVERNANCE_CAPTURE_TARGETS[requirement_id]
+    except KeyError as exc:
+        raise ValueError(f"unsupported governance requirement: {requirement_id}") from exc
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    hfm_snapshot = _snapshot_hfm_inputs(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+        symbols=symbols,
+        timeframes=("M1",),
+        include_combined_m1=True,
+        include_ticks=True,
+    )
+    broker_snapshot = _snapshot_broker_exports(
+        destination=output,
+        requirement_id=requirement_id,
+        bridge_root=bridge_root.resolve(),
+    )
+    for name in ("history_orders.csv", "deals.csv"):
+        copyfile(broker_snapshot / name, hfm_snapshot / name)
+    slippage_snapshot = output / f"{requirement_id.lower()}_slippage_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    _snapshot_sqlite_database(
+        root / "clean_build/evidence/c032_slippage.sqlite3",
+        slippage_snapshot,
+    )
+    verification = verify_c113_c120_governance_and_execution_model(
+        requirement_id=requirement_id,
+        bridge_root=hfm_snapshot,
+        symbols=tuple(symbols),
+        slippage_database=slippage_snapshot,
+    )
+    evidence_bundle = _bundle_data_subject(
+        output,
+        requirement_id,
+        (*tuple(sorted(hfm_snapshot.iterdir())), slippage_snapshot),
+    )
+    data_subjects: tuple[Path, ...] = ()
+    broker_subjects: tuple[Path, ...] = ()
+    if evidence_kind == "DATA":
+        data_subjects = (evidence_bundle,)
+    elif evidence_kind == "BROKER":
+        broker_subjects = (evidence_bundle,)
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id=requirement_id,
+        verification=verification,
+        code_subject=root / code_path,
+        test_file=root / test_path,
+        output_directory=output,
+        python_executable=python_executable,
+        data_subjects=data_subjects,
+        broker_subjects=broker_subjects,
+    )
+
+
 def capture_live_broker_requirement(
     *,
     workspace_root: Path,
@@ -1642,6 +1722,7 @@ def main() -> int:
             "C077", "C078", "C079", "C080", "C081", "C082", "C083", "C084",
             "C085", "C086", "C087", "C088", "C089", "C090", "C091", "C092",
             "C093", "C094", "C095", "C096", "C097", "C098", "C099", "C100", "C101", "C102", "C103", "C104", "C105",
+            "C113", "C114", "C115", "C116", "C117", "C118", "C119", "C120",
         ),
         default="C006",
     )
@@ -1821,6 +1902,17 @@ def main() -> int:
         if args.bridge_root is None:
             parser.error("--bridge-root is required for C093-C105")
         bundle = capture_live_research_requirement(
+            workspace_root=args.workspace_root,
+            requirement_id=args.requirement,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbols=tuple(args.symbols),
+        )
+    elif args.requirement in _LIVE_GOVERNANCE_CAPTURE_TARGETS:
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C113-C120")
+        bundle = capture_live_governance_requirement(
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             bridge_root=args.bridge_root,

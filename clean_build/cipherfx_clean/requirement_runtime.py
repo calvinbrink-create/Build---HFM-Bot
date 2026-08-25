@@ -7247,6 +7247,7 @@ def verify_c113_c120_governance_and_execution_model(
     requirement_id: str,
     bridge_root: Path,
     symbols: Sequence[str],
+    slippage_database: Path | None = None,
 ) -> Mapping[str, object]:
     """Verify research governance and broker-realistic execution models.
 
@@ -7390,7 +7391,7 @@ def verify_c113_c120_governance_and_execution_model(
     # Read actual broker execution evidence collected from HFM exports.  The
     # reference quote is explicitly labelled as the live broker quote scope;
     # no historical spread is invented when it was not exported.
-    slippage_db = Path("/opt/cipherfx_mt5/clean_build/evidence/c032_slippage.sqlite3")
+    slippage_db = slippage_database or Path("/opt/cipherfx_mt5/clean_build/evidence/c032_slippage.sqlite3")
     if not slippage_db.is_file():
         raise FileNotFoundError(slippage_db)
     broker_dir = bridge_root

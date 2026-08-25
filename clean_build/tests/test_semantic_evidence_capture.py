@@ -26,6 +26,7 @@ from cipherfx_clean.evidence_capture import (
     capture_historical_state_requirement,
     capture_live_outcome_metric_requirement,
     capture_live_research_requirement,
+    capture_live_governance_requirement,
     capture_verified_requirement,
     write_evidence_bundle,
 )
@@ -803,6 +804,71 @@ def test_research_capture_binds_frozen_hfm_inputs_to_the_verified_module(
     assert captured["code_subject"].name == code_name
     assert captured["test_file"].name == test_name
     assert bool(captured["data_subjects"]) is requires_data
+
+
+@pytest.mark.parametrize(
+    ("requirement_id", "code_name", "evidence_kind"),
+    (
+        ("C113", "research_pipeline.py", "DATA"),
+        ("C114", "research.py", "DATA"),
+        ("C115", "store.py", None),
+        ("C116", "edge_validation.py", "DATA"),
+        ("C117", "cost_evidence.py", "BROKER"),
+        ("C118", "execution_model.py", "BROKER"),
+        ("C119", "hfm_data.py", "BROKER"),
+        ("C120", "slippage.py", "BROKER"),
+    ),
+)
+def test_governance_capture_uses_frozen_execution_inputs_and_correct_evidence_kind(
+    tmp_path, monkeypatch, requirement_id, code_name, evidence_kind
+):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    hfm_snapshot = tmp_path / "hfm"
+    hfm_snapshot.mkdir()
+    (hfm_snapshot / "symbols.csv").write_text("symbol\n", encoding="utf-8")
+    broker_snapshot = tmp_path / "broker"
+    broker_snapshot.mkdir()
+    for name in ("history_orders.csv", "deals.csv"):
+        (broker_snapshot / name).write_text("id\n", encoding="utf-8")
+    data_bundle = tmp_path / "inputs.zip"
+    data_bundle.write_text("frozen", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+
+    def snapshot_database(_source, destination):
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        destination.write_text("snapshot", encoding="utf-8")
+
+    monkeypatch.setattr(capture_module, "_snapshot_hfm_inputs", lambda **_kwargs: hfm_snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_broker_exports", lambda **_kwargs: broker_snapshot)
+    monkeypatch.setattr(capture_module, "_snapshot_sqlite_database", snapshot_database)
+    monkeypatch.setattr(capture_module, "_bundle_data_subject", lambda *_args: data_bundle)
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c113_c120_governance_and_execution_model",
+        lambda **kwargs: {"requirement_id": kwargs["requirement_id"], "status": "PASS"},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_live_governance_requirement(
+        workspace_root=tmp_path,
+        requirement_id=requirement_id,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["requirement_id"] == requirement_id
+    assert captured["code_subject"].name == code_name
+    assert bool(captured["data_subjects"]) is (evidence_kind == "DATA")
+    assert bool(captured["broker_subjects"]) is (evidence_kind == "BROKER")
 
 
 def test_hfm_input_snapshot_includes_combined_m1_sources_and_live_ticks(tmp_path):
