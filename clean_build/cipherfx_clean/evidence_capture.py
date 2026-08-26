@@ -28,6 +28,7 @@ from .requirement_runtime import (
     verify_c007_tick_quality,
     verify_c008_hfm_candle_builder,
     verify_c009_hfm_market_states,
+    verify_c010_hfm_snapshot_engine,
     verify_c011_hfm_live_chart,
     verify_c012_hfm_chart_pack,
     verify_c013_hfm_annotations,
@@ -790,6 +791,40 @@ def capture_c009_market_state(
         test_arguments=("-k", "c009"),
         output_directory=output_directory,
         python_executable=python_executable,
+    )
+
+
+def capture_c010_event_snapshots(
+    *,
+    workspace_root: Path,
+    bridge_root: Path,
+    output_directory: Path,
+    python_executable: Path,
+    symbol: str,
+) -> EvidenceBundle:
+    """Capture the persisted HFM-backed pre-event, entry, and post-event states."""
+
+    root = workspace_root.resolve()
+    output = output_directory.resolve()
+    _require_inside(output, root, "evidence output")
+    output.mkdir(parents=True, exist_ok=True)
+    database = output / (
+        f"c010_event_snapshots_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+    )
+    verification = verify_c010_hfm_snapshot_engine(
+        bridge_root=bridge_root.resolve(),
+        database=database,
+        symbol=symbol,
+    )
+    return capture_verified_requirement(
+        workspace_root=root,
+        requirement_id="C010",
+        verification=verification,
+        code_subject=root / "clean_build/cipherfx_clean/snapshot.py",
+        test_file=root / "clean_build/tests/test_item_030_requirement_runtime.py",
+        output_directory=output,
+        python_executable=python_executable,
+        test_arguments=("-k", "c010"),
     )
 
 
@@ -2140,7 +2175,7 @@ def main() -> int:
     parser.add_argument(
         "--requirement",
         choices=(
-            "C006", "C007", "C008", "C009", "C011", "C012", "C013", "C014",
+            "C006", "C007", "C008", "C009", "C010", "C011", "C012", "C013", "C014",
             "C015", "C016", "C017", "C018", "C019", "C020",
             "C021", "C022", "C023", "C024", "C025",
             "C026", "C027", "C028", "C029", "C030",
@@ -2214,6 +2249,16 @@ def main() -> int:
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             symbols=("XAUUSD", "UK100", "USA100", "USA500", "USA30"),
+        )
+    elif args.requirement == "C010":
+        if args.bridge_root is None:
+            parser.error("--bridge-root is required for C010")
+        bundle = capture_c010_event_snapshots(
+            workspace_root=args.workspace_root,
+            bridge_root=args.bridge_root,
+            output_directory=args.output_directory,
+            python_executable=args.python_executable,
+            symbol=args.symbol,
         )
     elif args.requirement in _LIVE_INTELLIGENCE_CAPTURE_TARGETS:
         if args.bridge_root is None:

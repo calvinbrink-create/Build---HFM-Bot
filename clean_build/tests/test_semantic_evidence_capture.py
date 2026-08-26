@@ -1345,6 +1345,38 @@ def test_c007_capture_binds_persisted_fresh_and_stale_tick_evidence(tmp_path, mo
     assert snapshot.read_text(encoding="utf-8") == "snapshot"
 
 
+def test_c010_capture_binds_hfm_event_snapshot_sequence(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c010_hfm_snapshot_engine",
+        lambda **kwargs: {"requirement_id": "C010", "status": "PASS", **kwargs},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_module.capture_c010_event_snapshots(
+        workspace_root=tmp_path,
+        bridge_root=tmp_path,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+        symbol="XAUUSD",
+    )
+
+    assert result is expected
+    assert captured["code_subject"].name == "snapshot.py"
+    assert captured["test_file"].name == "test_item_030_requirement_runtime.py"
+    assert captured["test_arguments"] == ("-k", "c010")
+    assert captured["verification"]["symbol"] == "XAUUSD"
+    assert captured["verification"]["database"].parent == tmp_path / "evidence"
+
+
 def test_c007_payload_uses_persisted_tick_quality_events(tmp_path):
     import cipherfx_clean.evidence_capture as capture_module
 
