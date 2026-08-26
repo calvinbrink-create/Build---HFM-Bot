@@ -1051,24 +1051,33 @@ def capture_live_tick_intelligence_requirement(
     *,
     workspace_root: Path,
     requirement_id: str,
-    tick_database: Path,
+    tick_database: Path | None,
     output_directory: Path,
     python_executable: Path,
+    frozen_tick_database: Path | None = None,
 ) -> EvidenceBundle:
-    """Capture tick-intelligence evidence from an immutable receiver snapshot."""
+    """Capture tick intelligence from a newly frozen or supplied immutable snapshot."""
 
     try:
         verifier_name, code_path, test_path, test_arguments = _LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS[requirement_id]
     except KeyError as exc:
         raise ValueError(f"unsupported live tick intelligence requirement: {requirement_id}") from exc
     root = workspace_root.resolve()
-    source_database = tick_database.resolve()
     output = output_directory.resolve()
-    _require_inside(source_database, root, "tick database")
     _require_inside(output, root, "evidence output")
     output.mkdir(parents=True, exist_ok=True)
-    snapshot = output / f"{requirement_id.lower()}_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
-    _snapshot_sqlite_database(source_database, snapshot)
+    if frozen_tick_database is not None:
+        snapshot = frozen_tick_database.resolve()
+        _require_inside(snapshot, root, "frozen tick database")
+        if not snapshot.is_file():
+            raise FileNotFoundError(snapshot)
+    else:
+        if tick_database is None:
+            raise ValueError("tick database is required when no frozen snapshot is supplied")
+        source_database = tick_database.resolve()
+        _require_inside(source_database, root, "tick database")
+        snapshot = output / f"{requirement_id.lower()}_ticks_{datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')}.sqlite3"
+        _snapshot_sqlite_database(source_database, snapshot)
     verification = globals()[verifier_name](snapshot)
     return capture_verified_requirement(
         workspace_root=root,
@@ -2200,6 +2209,7 @@ def main() -> int:
     )
     parser.add_argument("--bridge-root", type=Path)
     parser.add_argument("--tick-database", type=Path)
+    parser.add_argument("--frozen-tick-database", type=Path)
     parser.add_argument("--quality-database", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--chart-directory", type=Path)
@@ -2286,14 +2296,15 @@ def main() -> int:
             database=args.database,
         )
     elif args.requirement in _LIVE_TICK_INTELLIGENCE_CAPTURE_TARGETS:
-        if args.tick_database is None:
-            parser.error("--tick-database is required for C026-C030")
+        if args.tick_database is None and args.frozen_tick_database is None:
+            parser.error("--tick-database or --frozen-tick-database is required for C026-C030")
         bundle = capture_live_tick_intelligence_requirement(
             workspace_root=args.workspace_root,
             requirement_id=args.requirement,
             tick_database=args.tick_database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
+            frozen_tick_database=args.frozen_tick_database,
         )
     elif args.requirement in _LIVE_ANALYTICS_CAPTURE_TARGETS:
         if args.bridge_root is None:

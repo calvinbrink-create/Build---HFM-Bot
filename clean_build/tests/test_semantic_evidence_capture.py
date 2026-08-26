@@ -497,6 +497,43 @@ def test_live_tick_intelligence_capture_uses_an_immutable_database_snapshot(
     assert snapshot.read_text(encoding="utf-8") == "snapshot"
 
 
+def test_live_tick_intelligence_capture_reuses_existing_frozen_snapshot(tmp_path, monkeypatch):
+    import cipherfx_clean.evidence_capture as capture_module
+
+    snapshot = tmp_path / "evidence" / "c026_ticks.sqlite3"
+    snapshot.parent.mkdir(parents=True)
+    snapshot.write_text("immutable", encoding="utf-8")
+    expected = EvidenceBundle(tmp_path / "envelope.json", tmp_path / "manifest.json", ("proof",))
+    captured = {}
+    monkeypatch.setattr(
+        capture_module,
+        "_snapshot_sqlite_database",
+        lambda *_args: pytest.fail("a frozen snapshot must not be copied again"),
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "verify_c030_microstructure",
+        lambda path: {"requirement_id": "C030", "status": "PASS", "database": str(path)},
+    )
+    monkeypatch.setattr(
+        capture_module,
+        "capture_verified_requirement",
+        lambda **kwargs: captured.update(kwargs) or expected,
+    )
+
+    result = capture_module.capture_live_tick_intelligence_requirement(
+        workspace_root=tmp_path,
+        requirement_id="C030",
+        tick_database=None,
+        frozen_tick_database=snapshot,
+        output_directory=tmp_path / "evidence",
+        python_executable=Path("/python"),
+    )
+
+    assert result is expected
+    assert captured["verification"]["database"] == str(snapshot)
+
+
 @pytest.mark.parametrize(
     ("requirement_id", "verification_name", "code_name", "test_name", "test_arguments", "requires_data"),
     (
