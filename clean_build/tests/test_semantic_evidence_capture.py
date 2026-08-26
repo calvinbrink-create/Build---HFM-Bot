@@ -1330,7 +1330,7 @@ def test_c007_capture_binds_persisted_fresh_and_stale_tick_evidence(tmp_path, mo
 
     result = capture_module.capture_c007_live_tick_quality(
         workspace_root=tmp_path,
-        tick_database=source,
+        quality_database=source,
         output_directory=tmp_path / "evidence",
         python_executable=Path("/python"),
         maximum_age_seconds=60.0,

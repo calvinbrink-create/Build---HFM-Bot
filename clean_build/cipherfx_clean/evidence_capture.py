@@ -698,7 +698,7 @@ def capture_c006_live_ticks(
 def capture_c007_live_tick_quality(
     *,
     workspace_root: Path,
-    tick_database: Path,
+    quality_database: Path,
     output_directory: Path,
     python_executable: Path,
     maximum_age_seconds: float,
@@ -706,7 +706,7 @@ def capture_c007_live_tick_quality(
     """Capture genuine persisted fresh and stale tick classifications."""
 
     root = workspace_root.resolve()
-    database = tick_database.resolve()
+    database = quality_database.resolve()
     output = output_directory.resolve()
     _require_inside(database, root, "tick-quality database")
     _require_inside(output, root, "evidence output")
@@ -2165,6 +2165,7 @@ def main() -> int:
     )
     parser.add_argument("--bridge-root", type=Path)
     parser.add_argument("--tick-database", type=Path)
+    parser.add_argument("--quality-database", type=Path)
     parser.add_argument("--output-directory", type=Path, required=True)
     parser.add_argument("--chart-directory", type=Path)
     parser.add_argument("--database", type=Path)
@@ -2183,11 +2184,11 @@ def main() -> int:
             python_executable=args.python_executable,
         )
     elif args.requirement == "C007":
-        if args.tick_database is None:
-            parser.error("--tick-database is required for C007")
+        if args.quality_database is None:
+            parser.error("--quality-database is required for C007")
         bundle = capture_c007_live_tick_quality(
             workspace_root=args.workspace_root,
-            tick_database=args.tick_database,
+            quality_database=args.quality_database,
             output_directory=args.output_directory,
             python_executable=args.python_executable,
             maximum_age_seconds=60.0,
